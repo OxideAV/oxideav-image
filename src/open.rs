@@ -215,12 +215,20 @@ fn drain(
         }
         match dec.receive_frame() {
             Ok(Frame::Video(vf)) => {
-                let mut params = stream.clone();
-                if params.pixel_format.is_none() {
-                    params.pixel_format = dec.output_pixel_format();
+                // The stream's parameters are authoritative: every image
+                // demuxer declares its native layout on the stream
+                // (IMAGE_CRATE_API fleet-sweep ruling), so a missing
+                // pixel format is a demuxer defect, not something to
+                // guess from the plane count (Rgba vs Bgra vs Yuv444P are
+                // indistinguishable by geometry).
+                if stream.pixel_format.is_none() {
+                    return Err(Error::invalid(format!(
+                        "stream of codec '{}' declares no pixel format",
+                        stream.codec_id
+                    )));
                 }
                 let index = images.len();
-                images.push(Image::from_video_frame(vf, &params)?.with_index(index));
+                images.push(Image::from_video_frame(vf, stream)?.with_index(index));
             }
             Ok(_) => {}
             Err(oxideav_core::Error::NeedMore) | Err(oxideav_core::Error::Eof) => return Ok(()),
