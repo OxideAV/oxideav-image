@@ -24,11 +24,15 @@
 //! let rgba: Vec<u8> = img.to_rgba8()?;             // tightly packed, 4 bytes/pixel
 //! let (w, h, fmt) = (img.width(), img.height(), img.format());
 //!
-//! for frame in file.frames() { /* animations, bursts, pages */ }
+//! for frame in &file { let _ = (frame.delay(), frame.timestamp()); } // sequences, pages
 //!
 //! oxideav_image::save(&ctx, img, "out.png", &SaveOptions::default())?;
-//! let avif = oxideav_image::encode(&ctx, img, "avif", &SaveOptions::new().with_quality(80))?;
+//! let heic = oxideav_image::encode(&ctx, img, "heic", &SaveOptions::new().with_option("qp", "20"))?;
+//! let apng = oxideav_image::encode_frames(&ctx, file.frames(), "png", &SaveOptions::default())?;
 //! ```
+//!
+//! Resolution, the pixel-format ladder, the timing rule, limits and the
+//! error table are documented in the README.
 //!
 //! `oxideav-meta` resolves only inside the workspace, which is why the
 //! registration step is the caller's: this crate stays publishable and
