@@ -27,6 +27,9 @@ pub enum ImageError {
     /// Caller-supplied data is inconsistent (buffer length vs geometry,
     /// stream parameters without dimensions, …).
     InvalidData(String),
+    /// A caller-configured budget ([`crate::OpenOptions::max_pixels`])
+    /// would be exceeded; nothing past the budget was decoded.
+    LimitExceeded(String),
 }
 
 /// Crate-local alias, so signatures read `Result<T, Error>`.
@@ -44,6 +47,7 @@ impl fmt::Display for ImageError {
             ImageError::UnknownFormat(s) => write!(f, "unknown format: {s}"),
             ImageError::Unsupported(s) => write!(f, "unsupported: {s}"),
             ImageError::InvalidData(s) => write!(f, "invalid data: {s}"),
+            ImageError::LimitExceeded(s) => write!(f, "limit exceeded: {s}"),
         }
     }
 }
@@ -77,5 +81,9 @@ impl ImageError {
 
     pub(crate) fn invalid(msg: impl Into<String>) -> Self {
         ImageError::InvalidData(msg.into())
+    }
+
+    pub(crate) fn limit(msg: impl Into<String>) -> Self {
+        ImageError::LimitExceeded(msg.into())
     }
 }

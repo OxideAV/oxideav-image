@@ -121,6 +121,61 @@ impl Image {
         })
     }
 
+    /// Build an image from planes in `format`'s plane order. Each plane
+    /// must have `stride >= ` its tight row length and enough data for
+    /// its rows (`PixelFormat::plane_dimensions` /
+    /// `plane_row_bytes`); the plane count must match. Side-channel
+    /// records (palette, colour signal) attached to the planes are kept.
+    pub fn from_planes(
+        width: u32,
+        height: u32,
+        format: PixelFormat,
+        planes: Vec<VideoPlane>,
+    ) -> Result<Self> {
+        if width == 0 || height == 0 {
+            return Err(Error::invalid(format!(
+                "image geometry {width}x{height} has a zero side"
+            )));
+        }
+        let frame = VideoFrame { pts: None, planes };
+        let n = frame.image_plane_count();
+        if n != format.plane_count() {
+            return Err(Error::invalid(format!(
+                "{n} image plane(s) supplied but {format:?} has {}",
+                format.plane_count()
+            )));
+        }
+        for (p, plane) in frame.image_planes().iter().enumerate() {
+            let row = format
+                .plane_row_bytes(p, width)
+                .ok_or_else(|| Error::invalid("plane geometry overflows usize"))?;
+            let (_, rows) = format
+                .plane_dimensions(p, width, height)
+                .ok_or_else(|| Error::invalid("plane index out of range"))?;
+            if plane.stride < row {
+                return Err(Error::invalid(format!(
+                    "plane {p}: stride {} is below the {row}-byte row of a {width}-pixel {format:?} row",
+                    plane.stride
+                )));
+            }
+            let need = (rows as usize - 1)
+                .checked_mul(plane.stride)
+                .and_then(|v| v.checked_add(row))
+                .ok_or_else(|| Error::invalid("plane geometry overflows usize"))?;
+            if plane.data.len() < need {
+                return Err(Error::invalid(format!(
+                    "plane {p}: {} bytes supplied, {need} needed for {rows} rows",
+                    plane.data.len()
+                )));
+            }
+        }
+        let mut params = CodecParameters::video(CodecId::new("rawvideo"));
+        params.width = Some(width);
+        params.height = Some(height);
+        params.pixel_format = Some(format);
+        Self::from_video_frame(frame, &params)
+    }
+
     /// Packed `Rgb24`, three bytes per pixel, row-major.
     pub fn from_rgb8(width: u32, height: u32, rgb: Vec<u8>) -> Result<Self> {
         Self::from_raw(width, height, PixelFormat::Rgb24, rgb)
@@ -292,6 +347,12 @@ impl Image {
         })
     }
 
+    /// Tightly packed `Gray8` bytes (`width × height`): luma of colour
+    /// sources, palette expanded first.
+    pub fn to_gray8(&self) -> Result<Vec<u8>> {
+        self.packed_bytes(PixelFormat::Gray8)
+    }
+
     /// Tightly packed `Rgb24` bytes (`width × height × 3`).
     pub fn to_rgb8(&self) -> Result<Vec<u8>> {
         self.packed_bytes(PixelFormat::Rgb24)
@@ -326,6 +387,94 @@ impl Image {
             .first()
             .ok_or_else(|| Error::invalid("converted frame has no plane"))?;
         Ok(tight_rows(plane, row, img.height() as usize))
+    }
+
+    /// The `w × h` window at `(x, y)` as a new image in the same layout,
+    /// with the palette, colour signal and significant-bits records
+    /// carried over. Works on every layout `PixelFormat` describes with
+    /// whole bytes per sample position; for chroma-subsampled layouts
+    /// `x` and `y` must sit on the chroma grid (even for 4:2:0), else
+    /// `Unsupported`. Bit-packed mono and packed 4:2:2 macropixel
+    /// layouts are `Unsupported` (convert first). A window outside the
+    /// picture is `InvalidData`.
+    pub fn crop(&self, x: u32, y: u32, w: u32, h: u32) -> Result<Image> {
+        let (width, height, format) = (self.width(), self.height(), self.format());
+        if w == 0 || h == 0 {
+            return Err(Error::invalid("crop window has a zero side"));
+        }
+        let (Some(xe), Some(ye)) = (x.checked_add(w), y.checked_add(h)) else {
+            return Err(Error::invalid("crop window overflows u32"));
+        };
+        if xe > width || ye > height {
+            return Err(Error::invalid(format!(
+                "crop {w}x{h}+{x}+{y} exceeds the {width}x{height} picture"
+            )));
+        }
+        if format.bits_per_pixel_approx() < 8
+            || matches!(format, PixelFormat::Yuyv422 | PixelFormat::Uyvy422)
+        {
+            return Err(Error::unsupported(format!(
+                "crop of {format:?} (sub-byte samples or macropixels); convert first"
+            )));
+        }
+        let sub = format.chroma_subsampling();
+        if let Some((ssx, ssy)) = sub {
+            if x % (1 << ssx) != 0 || y % (1 << ssy) != 0 {
+                return Err(Error::unsupported(format!(
+                    "crop origin ({x}, {y}) is not on the chroma grid of {format:?} \
+                     ({}x{} pixels)",
+                    1 << ssx,
+                    1 << ssy
+                )));
+            }
+        }
+        let mut planes = Vec::with_capacity(format.plane_count());
+        for (p, plane) in self.frame.image_planes().iter().enumerate() {
+            let (ssx, ssy) = match (sub, p) {
+                (Some(f), 1 | 2) => f,
+                _ => (0, 0),
+            };
+            // Bytes per sample position: one position wide at this
+            // plane's horizontal subsampling.
+            let bpp = format
+                .plane_row_bytes(p, 1 << ssx)
+                .ok_or_else(|| Error::invalid("plane index out of range"))?;
+            let px = (x >> ssx) as usize;
+            let py = (y >> ssy) as usize;
+            let pw = w.div_ceil(1 << ssx) as usize;
+            let ph = h.div_ceil(1 << ssy) as usize;
+            let row = pw * bpp;
+            let mut data = Vec::with_capacity(row * ph);
+            for r in 0..ph {
+                let start = (py + r) * plane.stride + px * bpp;
+                let src = plane.data.get(start..start + row).ok_or_else(|| {
+                    Error::invalid(format!("plane {p} is too short for the crop window"))
+                })?;
+                data.extend_from_slice(src);
+            }
+            planes.push(VideoPlane { stride: row, data });
+        }
+        let mut frame = VideoFrame {
+            pts: self.frame.pts,
+            planes,
+        };
+        if let Some(pal) = self.frame.palette() {
+            frame.set_palette(pal.to_vec());
+        }
+        if let Some(bits) = self.frame.significant_bits() {
+            frame.set_significant_bits(bits.to_vec());
+        }
+        if let Some(sig) = self.frame.color_signal() {
+            frame.set_color_signal(sig);
+        }
+        let mut params = self.params.clone();
+        params.width = Some(w);
+        params.height = Some(h);
+        Ok(Image {
+            frame,
+            params,
+            ..self.clone_timing()
+        })
     }
 
     /// The single plane's bytes when the layout is packed and the rows

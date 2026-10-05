@@ -32,6 +32,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   registered, else a short exception table (`jpeg` → `mjpeg`, `dcx` →
   `pcx`, `ani` / `cur` → `ico`, `svgz` → `svg`, `iff_*` → `ilbm`).
 - `Image::with_color_signal`.
+- `Image::crop(x, y, w, h)` on every layout `PixelFormat` describes with
+  whole bytes per sample position (chroma-subsampled layouts need the
+  origin on the chroma grid; bit-packed mono and packed 4:2:2 are
+  `Unsupported`), carrying the palette, colour-signal and
+  significant-bits records over; `Image::to_gray8`;
+  `Image::from_planes(width, height, format, planes)` validating plane
+  count, stride and length against the format's geometry.
+- `ImageFile::frames_mut` / `iter` and `IntoIterator` for `ImageFile`
+  and `&ImageFile`.
+- `OpenOptions::with_decoder_option(s)` (forwarded through
+  `CodecParameters::options`) and `OpenOptions::with_max_pixels`, a
+  budget over the decoded pixels of the whole file checked from the
+  stream geometry before a decoder exists and again before each picture
+  is kept; `ImageError::LimitExceeded` reports it.
+- `decode_vec` / `decode_vec_with` take the buffer without copying;
+  `decode_bytes(&[u8])` copies once because the demuxer needs an owned
+  seekable reader.
 - Frame timing from the stream: `Image::delay` follows a documented rule
   (the packet's `duration` in the stream time base; else the gap to the
   next picture of the same stream; the last picture without a duration

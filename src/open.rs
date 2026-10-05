@@ -54,6 +54,17 @@ impl ImageFile {
         self.images.swap_remove(0)
     }
 
+    /// Every decoded picture, mutably (set delays before re-encoding,
+    /// replace a frame, …).
+    pub fn frames_mut(&mut self) -> &mut [Image] {
+        &mut self.images
+    }
+
+    /// Iterate the pictures in file order.
+    pub fn iter(&self) -> std::slice::Iter<'_, Image> {
+        self.images.iter()
+    }
+
     /// Number of decoded pictures (always at least one).
     pub fn len(&self) -> usize {
         self.images.len()
@@ -62,6 +73,22 @@ impl ImageFile {
     /// Never true: an `ImageFile` always holds at least one picture.
     pub fn is_empty(&self) -> bool {
         self.images.is_empty()
+    }
+}
+
+impl IntoIterator for ImageFile {
+    type Item = Image;
+    type IntoIter = std::vec::IntoIter<Image>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.images.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a ImageFile {
+    type Item = &'a Image;
+    type IntoIter = std::slice::Iter<'a, Image>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.images.iter()
     }
 }
 
@@ -77,6 +104,16 @@ pub struct OpenOptions {
     /// File-extension hint for the container probe (without the dot).
     /// [`open`] fills it from the path.
     pub ext_hint: Option<String>,
+    /// Options handed to the decoder through `CodecParameters::options`
+    /// (names from the codec's declared decoder schema; unknown names
+    /// fail inside the decoder).
+    pub decoder_options: Vec<(String, String)>,
+    /// Budget of decoded pixels over the whole file (every kept picture's
+    /// `width × height` summed). Checked from the stream geometry before
+    /// a decoder is created and again before each picture is kept, so an
+    /// oversized file fails with [`crate::ImageError::LimitExceeded`]
+    /// before its pixels are decoded. `None` = unlimited.
+    pub max_pixels: Option<u64>,
 }
 
 impl OpenOptions {
@@ -94,6 +131,28 @@ impl OpenOptions {
     /// Hint the container probe with a file extension.
     pub fn with_ext_hint(mut self, ext: impl Into<String>) -> Self {
         self.ext_hint = Some(ext.into());
+        self
+    }
+
+    /// Add one decoder option.
+    pub fn with_decoder_option(
+        mut self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.decoder_options.push((name.into(), value.into()));
+        self
+    }
+
+    /// Replace the decoder options.
+    pub fn with_decoder_options(mut self, options: Vec<(String, String)>) -> Self {
+        self.decoder_options = options;
+        self
+    }
+
+    /// Cap the decoded pixels (see the field).
+    pub fn with_max_pixels(mut self, n: u64) -> Self {
+        self.max_pixels = Some(n);
         self
     }
 }
@@ -122,7 +181,8 @@ pub fn open_with(
     decode_reader(ctx, Box::new(BufReader::new(file)), &opts)
 }
 
-/// Decode an in-memory file.
+/// Decode an in-memory file. The demuxer needs an owned seekable
+/// reader, so the slice is copied once; [`decode_vec`] avoids that.
 pub fn decode_bytes(ctx: &RuntimeContext, bytes: &[u8]) -> Result<ImageFile> {
     decode_bytes_with(ctx, bytes, &OpenOptions::default())
 }
@@ -133,7 +193,21 @@ pub fn decode_bytes_with(
     bytes: &[u8],
     opts: &OpenOptions,
 ) -> Result<ImageFile> {
-    decode_reader(ctx, Box::new(Cursor::new(bytes.to_vec())), opts)
+    decode_vec_with(ctx, bytes.to_vec(), opts)
+}
+
+/// Decode an in-memory file without copying it.
+pub fn decode_vec(ctx: &RuntimeContext, bytes: Vec<u8>) -> Result<ImageFile> {
+    decode_vec_with(ctx, bytes, &OpenOptions::default())
+}
+
+/// [`decode_vec`] with options.
+pub fn decode_vec_with(
+    ctx: &RuntimeContext,
+    bytes: Vec<u8>,
+    opts: &OpenOptions,
+) -> Result<ImageFile> {
+    decode_reader(ctx, Box::new(Cursor::new(bytes)), opts)
 }
 
 /// Decode from any seekable reader: probe the container, open its
@@ -160,10 +234,24 @@ pub fn decode_reader(
     let metadata = demuxer.metadata().to_vec();
 
     // One decoder per video stream; other streams are skipped.
+    let budget = opts.max_pixels.unwrap_or(u64::MAX);
     let mut decoders: Vec<Option<Box<dyn Decoder>>> = Vec::with_capacity(streams.len());
     for s in &streams {
         let dec = if s.params.media_type == oxideav_core::MediaType::Video {
-            ctx.codecs.first_decoder(&s.params).ok()
+            let px = pixels_of(&s.params);
+            if px > budget {
+                return Err(Error::limit(format!(
+                    "stream {} is {}x{} = {px} pixels, over the {budget}-pixel budget",
+                    s.index,
+                    s.params.width.unwrap_or(0),
+                    s.params.height.unwrap_or(0)
+                )));
+            }
+            let mut params = s.params.clone();
+            for (k, v) in &opts.decoder_options {
+                params.options = params.options.set(k.clone(), v.clone());
+            }
+            ctx.codecs.first_decoder(&params).ok()
         } else {
             None
         };
@@ -178,6 +266,7 @@ pub fn decode_reader(
     // At least the primary picture: `Some(0)` behaves like `Some(1)`.
     let limit = opts.max_frames.unwrap_or(usize::MAX).max(1);
     let mut images = Vec::new();
+    let mut spent: u64 = 0;
     // Packet timing per stream, consumed as frames come out: the
     // decoders of image codecs are one-in/one-out, and a frame that
     // carries its own `pts` is matched to the packet with that `pts`.
@@ -200,6 +289,7 @@ pub fn decode_reader(
                         &mut timing[idx],
                         &mut images,
                         limit,
+                        (&mut spent, budget),
                     )?;
                 }
             }
@@ -214,6 +304,7 @@ pub fn decode_reader(
                             &mut timing[i],
                             &mut images,
                             limit,
+                            (&mut spent, budget),
                         )?;
                     }
                 }
@@ -243,6 +334,7 @@ fn drain(
     timing: &mut VecDeque<(Option<i64>, Option<i64>)>,
     images: &mut Vec<Image>,
     limit: usize,
+    (spent, budget): (&mut u64, u64),
 ) -> Result<()> {
     let stream = &info.params;
     loop {
@@ -251,6 +343,16 @@ fn drain(
         }
         match dec.receive_frame() {
             Ok(Frame::Video(vf)) => {
+                let px = pixels_of(stream);
+                if spent.saturating_add(px) > budget {
+                    return Err(Error::limit(format!(
+                        "picture {} would bring the decoded total to {} pixels, over the \
+                         {budget}-pixel budget",
+                        images.len(),
+                        spent.saturating_add(px)
+                    )));
+                }
+                *spent += px;
                 // The packet this frame came from: by pts when the
                 // decoder preserved it, else the oldest unmatched one.
                 let matched = vf
@@ -336,4 +438,9 @@ fn resolve_delays(images: &mut [Image], streams: usize) {
             prev = delay;
         }
     }
+}
+
+/// `width × height` of a stream, saturating.
+fn pixels_of(p: &oxideav_core::CodecParameters) -> u64 {
+    u64::from(p.width.unwrap_or(0)) * u64::from(p.height.unwrap_or(0))
 }

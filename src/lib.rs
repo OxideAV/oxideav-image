@@ -50,7 +50,8 @@ mod tests;
 pub use error::{Error, ImageError, Result};
 pub use image::Image;
 pub use open::{
-    decode_bytes, decode_bytes_with, decode_reader, open, open_with, ImageFile, OpenOptions,
+    decode_bytes, decode_bytes_with, decode_reader, decode_vec, decode_vec_with, open, open_with,
+    ImageFile, OpenOptions,
 };
 pub use save::{encode, encode_frames, save, SaveOptions, DEFAULT_DELAY};
 
