@@ -42,6 +42,11 @@ mod image;
 mod open;
 mod save;
 
+#[cfg(test)]
+mod fixture;
+#[cfg(test)]
+mod tests;
+
 pub use error::{Error, ImageError, Result};
 pub use image::Image;
 pub use open::{

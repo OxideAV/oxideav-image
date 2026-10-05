@@ -136,6 +136,15 @@ impl Image {
         })
     }
 
+    /// Attach (or replace) the frame-level colour description, which
+    /// [`color_signal`](Self::color_signal) then reports and encoders
+    /// receive.
+    pub fn with_color_signal(mut self, signal: ColorSignal) -> Self {
+        self.frame.set_color_signal(signal);
+        self.params.color_signal = signal;
+        self
+    }
+
     /// Attached palette (packed RGB triplets) for indexed layouts.
     pub fn palette(&self) -> Option<&[u8]> {
         self.frame.palette()

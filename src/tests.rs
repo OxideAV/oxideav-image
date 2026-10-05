@@ -1,0 +1,362 @@
+//! Gateway tests against the synthetic OXIM container + codec pair in
+//! [`crate::fixture`]. No file I/O except where marked `not(miri)`.
+
+use oxideav_core::PixelFormat;
+
+use crate::fixture::{self, Fixture, FORMATS};
+use crate::{
+    decode_bytes, decode_bytes_with, encode, encode_frames, Image, ImageError, OpenOptions,
+    SaveOptions,
+};
+
+fn still(format: PixelFormat) -> Fixture {
+    let mut fx = Fixture::new(5, 3, format);
+    fx.push_gradient(0, 1);
+    fx
+}
+
+fn planes_of(img: &Image) -> Vec<Vec<u8>> {
+    img.frame()
+        .image_planes()
+        .iter()
+        .map(|p| p.data.clone())
+        .collect()
+}
+
+fn is_packed(f: PixelFormat) -> bool {
+    f.plane_count() == 1
+}
+
+#[test]
+fn probe_by_magic_without_hint() {
+    let ctx = fixture::ctx();
+    let file = decode_bytes(&ctx, &still(PixelFormat::Rgba).encode()).unwrap();
+    assert_eq!(file.container(), fixture::CONTAINER);
+    assert_eq!(file.len(), 1);
+    assert_eq!(file.primary().format(), PixelFormat::Rgba);
+    assert_eq!((file.primary().width(), file.primary().height()), (5, 3));
+}
+
+#[test]
+fn extension_hint_selects_a_sibling_container() {
+    let ctx = fixture::ctx();
+    let bytes = still(PixelFormat::Rgb24).encode();
+    let file =
+        decode_bytes_with(&ctx, &bytes, &OpenOptions::new().with_ext_hint("oximrgb")).unwrap();
+    assert_eq!(file.container(), fixture::CONTAINER_RGB_ONLY);
+    // An unrelated hint does not stop the magic from winning.
+    let file = decode_bytes_with(&ctx, &bytes, &OpenOptions::new().with_ext_hint("txt")).unwrap();
+    assert_eq!(file.container(), fixture::CONTAINER);
+}
+
+#[test]
+fn garbage_is_unknown_format() {
+    let ctx = fixture::ctx();
+    match decode_bytes(&ctx, b"not an image at all, really not") {
+        Err(ImageError::UnknownFormat(_)) => {}
+        other => panic!("expected UnknownFormat, got {other:?}"),
+    }
+}
+
+#[test]
+fn every_packed_layout_decodes_to_its_tight_plane() {
+    let ctx = fixture::ctx();
+    for &f in FORMATS.iter().filter(|f| is_packed(**f)) {
+        let fx = still(f);
+        let file = decode_bytes(&ctx, &fx.encode()).unwrap_or_else(|e| panic!("{f:?}: {e}"));
+        let img = file.primary();
+        assert_eq!(img.format(), f, "{f:?}");
+        assert_eq!(
+            img.as_packed(),
+            Some(fx.frames[0].planes[0].data.as_slice()),
+            "{f:?}: as_packed"
+        );
+        let rgba = img
+            .to_rgba8()
+            .unwrap_or_else(|e| panic!("{f:?}: to_rgba8: {e}"));
+        assert_eq!(rgba.len(), 5 * 3 * 4, "{f:?}");
+        let rgb = img.to_rgb8().unwrap();
+        assert_eq!(rgb.len(), 5 * 3 * 3, "{f:?}");
+    }
+}
+
+#[test]
+fn planar_layouts_decode_and_convert() {
+    let ctx = fixture::ctx();
+    for &f in FORMATS.iter().filter(|f| !is_packed(**f)) {
+        let fx = still(f);
+        let file = decode_bytes(&ctx, &fx.encode()).unwrap_or_else(|e| panic!("{f:?}: {e}"));
+        let img = file.primary().clone();
+        assert_eq!(img.format(), f);
+        assert!(img.as_packed().is_none(), "{f:?} is planar");
+        let expected: Vec<u8> = fx.frames[0]
+            .planes
+            .iter()
+            .flat_map(|p| p.data.iter().copied())
+            .collect();
+        assert_eq!(img.to_rgba8().unwrap().len(), 5 * 3 * 4, "{f:?}");
+        assert_eq!(img.into_raw(), expected, "{f:?}: into_raw");
+    }
+}
+
+#[test]
+fn pal8_carries_its_palette_and_expands_through_it() {
+    let ctx = fixture::ctx();
+    let fx = still(PixelFormat::Pal8);
+    let file = decode_bytes(&ctx, &fx.encode()).unwrap();
+    let img = file.primary();
+    let pal = fx.frames[0].palette.as_deref().unwrap();
+    assert_eq!(img.palette(), Some(pal));
+    let rgb = img.to_rgb8().unwrap();
+    let idx = fx.frames[0].planes[0].data[0] as usize;
+    assert_eq!(&rgb[..3], &pal[idx * 3..idx * 3 + 3]);
+}
+
+#[test]
+fn multi_frame_files_and_max_frames() {
+    let ctx = fixture::ctx();
+    let mut fx = Fixture::new(4, 4, PixelFormat::Rgb24);
+    fx.push_gradient(40, 1)
+        .push_gradient(80, 2)
+        .push_gradient(120, 3);
+    let bytes = fx.encode();
+    let file = decode_bytes(&ctx, &bytes).unwrap();
+    assert_eq!(file.len(), 3);
+    for (i, img) in file.frames().iter().enumerate() {
+        assert_eq!(img.index(), i);
+        assert_eq!(
+            img.as_packed(),
+            Some(fx.frames[i].planes[0].data.as_slice())
+        );
+    }
+    let one = decode_bytes_with(&ctx, &bytes, &OpenOptions::new().with_max_frames(1)).unwrap();
+    assert_eq!(one.len(), 1);
+    // Zero is clamped: a file always yields its primary picture.
+    let zero = decode_bytes_with(&ctx, &bytes, &OpenOptions::new().with_max_frames(0)).unwrap();
+    assert_eq!(zero.len(), 1);
+    let two = decode_bytes_with(&ctx, &bytes, &OpenOptions::new().with_max_frames(2)).unwrap();
+    assert_eq!(two.into_frames().len(), 2);
+}
+
+#[test]
+fn metadata_passes_through() {
+    let ctx = fixture::ctx();
+    let mut fx = still(PixelFormat::Gray8);
+    fx.metadata = vec![
+        ("title".into(), "gateway".into()),
+        ("author".into(), "oxim".into()),
+    ];
+    let file = decode_bytes(&ctx, &fx.encode()).unwrap();
+    assert_eq!(file.metadata(), fx.metadata.as_slice());
+}
+
+#[test]
+fn encode_round_trips_every_layout() {
+    let ctx = fixture::ctx();
+    for &f in FORMATS {
+        let fx = still(f);
+        let img = decode_bytes(&ctx, &fx.encode()).unwrap().into_primary();
+        let bytes = encode(&ctx, &img, "oxim", &SaveOptions::default())
+            .unwrap_or_else(|e| panic!("{f:?}: encode: {e}"));
+        let back = decode_bytes(&ctx, &bytes).unwrap().into_primary();
+        assert_eq!(back.format(), f, "{f:?}: format kept");
+        assert_eq!(planes_of(&back), planes_of(&img), "{f:?}: planes");
+        assert_eq!(back.palette(), img.palette(), "{f:?}: palette");
+    }
+}
+
+#[test]
+fn encode_by_extension_and_dotted_name() {
+    let ctx = fixture::ctx();
+    let img = Image::from_rgb8(2, 2, vec![9; 12]).unwrap();
+    for name in ["oxim", ".oxim", "OXIM"] {
+        let bytes = encode(&ctx, &img, name, &SaveOptions::default())
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(
+            decode_bytes(&ctx, &bytes).unwrap().primary().as_packed(),
+            Some(&[9u8; 12][..])
+        );
+    }
+}
+
+#[test]
+fn ladder_steps_to_a_layout_the_codec_accepts() {
+    let ctx = fixture::ctx();
+    let rgba: Vec<u8> = (0..4 * 4 * 4).map(|i| (i * 3) as u8).collect();
+    let img = Image::from_rgba8(4, 4, rgba).unwrap();
+    let bytes = encode(
+        &ctx,
+        &img,
+        "oxim",
+        &SaveOptions::new().with_codec(fixture::CODEC_YUV_ONLY),
+    )
+    .unwrap();
+    let back = decode_bytes(&ctx, &bytes).unwrap().into_primary();
+    assert_eq!(back.format(), PixelFormat::Yuv420P);
+    assert_eq!(back.to_rgba8().unwrap().len(), 64);
+}
+
+#[test]
+fn ladder_steps_when_the_muxer_refuses_a_layout() {
+    let ctx = fixture::ctx();
+    let rgba: Vec<u8> = (0..3 * 2 * 4).map(|i| (i * 5) as u8).collect();
+    let img = Image::from_rgba8(3, 2, rgba.clone()).unwrap();
+    // The container's payload codec has another name, so it is named.
+    let bytes = encode(
+        &ctx,
+        &img,
+        "oximrgb",
+        &SaveOptions::new().with_codec(fixture::CODEC),
+    )
+    .unwrap();
+    let back = decode_bytes_with(&ctx, &bytes, &OpenOptions::new().with_ext_hint("oximrgb"))
+        .unwrap()
+        .into_primary();
+    assert_eq!(back.format(), PixelFormat::Rgb24);
+    let rgb: Vec<u8> = rgba.chunks(4).flat_map(|p| p[..3].to_vec()).collect();
+    assert_eq!(back.as_packed(), Some(rgb.as_slice()));
+}
+
+#[test]
+fn forced_pixel_format_is_the_only_candidate() {
+    let ctx = fixture::ctx();
+    let img = Image::from_rgba8(2, 2, vec![200; 16]).unwrap();
+    let bytes = encode(
+        &ctx,
+        &img,
+        "oxim",
+        &SaveOptions::new().with_pixel_format(PixelFormat::Gray8),
+    )
+    .unwrap();
+    assert_eq!(
+        decode_bytes(&ctx, &bytes).unwrap().primary().format(),
+        PixelFormat::Gray8
+    );
+    // Forcing a layout the codec refuses fails instead of stepping.
+    let err = encode(
+        &ctx,
+        &img,
+        "oxim",
+        &SaveOptions::new()
+            .with_codec(fixture::CODEC_YUV_ONLY)
+            .with_pixel_format(PixelFormat::Rgba),
+    )
+    .unwrap_err();
+    assert!(matches!(err, ImageError::Core(_)), "{err:?}");
+}
+
+#[test]
+fn error_paths_have_their_variants() {
+    let ctx = fixture::ctx();
+    let img = Image::from_rgb8(2, 2, vec![0; 12]).unwrap();
+    assert!(matches!(
+        encode(&ctx, &img, "nope", &SaveOptions::default()),
+        Err(ImageError::UnknownFormat(_))
+    ));
+    // A container with a demuxer but no muxer.
+    assert!(matches!(
+        encode(&ctx, &img, "oximnodec", &SaveOptions::default()),
+        Err(ImageError::UnknownFormat(_))
+    ));
+    assert!(matches!(
+        encode(
+            &ctx,
+            &img,
+            "oxim",
+            &SaveOptions::new().with_codec("no_such_codec")
+        ),
+        Err(ImageError::Unsupported(_))
+    ));
+    assert!(matches!(
+        encode_frames(&ctx, &[], "oxim", &SaveOptions::default()),
+        Err(ImageError::InvalidData(_))
+    ));
+    let other = Image::from_rgb8(3, 2, vec![0; 18]).unwrap();
+    assert!(matches!(
+        encode_frames(&ctx, &[img.clone(), other], "oxim", &SaveOptions::default()),
+        Err(ImageError::InvalidData(_))
+    ));
+    // A stream whose codec nobody decodes.
+    let bytes = still(PixelFormat::Rgb24).encode();
+    assert!(matches!(
+        decode_bytes_with(&ctx, &bytes, &OpenOptions::new().with_ext_hint("oximnodec")),
+        Err(ImageError::NoImage(_))
+    ));
+    // A file with no pictures at all.
+    let empty = Fixture::new(2, 2, PixelFormat::Rgb24).encode();
+    assert!(matches!(
+        decode_bytes(&ctx, &empty),
+        Err(ImageError::NoImage(_))
+    ));
+    // Truncated payload surfaces the decoder's error.
+    let mut cut = still(PixelFormat::Rgb24).encode();
+    cut.truncate(cut.len() - 4);
+    assert!(matches!(decode_bytes(&ctx, &cut), Err(ImageError::Core(_))));
+}
+
+#[test]
+fn encode_frames_keeps_every_picture() {
+    let ctx = fixture::ctx();
+    let frames: Vec<Image> = (0..3u8)
+        .map(|i| Image::from_rgb8(2, 2, vec![i * 40; 12]).unwrap())
+        .collect();
+    let bytes = encode_frames(&ctx, &frames, "oxim", &SaveOptions::default()).unwrap();
+    let back = decode_bytes(&ctx, &bytes).unwrap();
+    assert_eq!(back.len(), 3);
+    for (a, b) in back.frames().iter().zip(&frames) {
+        assert_eq!(a.as_packed(), b.as_packed());
+    }
+}
+
+#[test]
+fn color_signal_prefers_the_frame_then_the_stream() {
+    use oxideav_core::{
+        ColorPrimaries, ColorRange, ColorSignal, MatrixCoefficients, TransferCharacteristics,
+    };
+    let ctx = fixture::ctx();
+    let bytes = still(PixelFormat::Yuv420P).encode();
+    let plain = decode_bytes(&ctx, &bytes).unwrap().into_primary();
+    assert_eq!(plain.color_signal(), None);
+    let sig = ColorSignal::new(
+        ColorRange::Full,
+        ColorPrimaries(1),
+        TransferCharacteristics(13),
+        MatrixCoefficients(5),
+    );
+    let img = plain.clone().with_color_signal(sig);
+    assert_eq!(img.color_signal(), Some(sig));
+    assert_eq!(img.frame().color_signal(), Some(sig));
+}
+
+#[cfg(not(miri))]
+#[test]
+fn save_and_open_round_trip_through_files() {
+    let ctx = fixture::ctx();
+    let dir = std::env::temp_dir().join(format!(
+        "oxideav-image-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("picture.OXIM");
+    let img = Image::from_rgba8(3, 3, (0..36).collect()).unwrap();
+    crate::save(&ctx, &img, &path, &SaveOptions::default()).unwrap();
+    let file = crate::open(&ctx, &path).unwrap();
+    assert_eq!(file.container(), fixture::CONTAINER);
+    assert_eq!(file.primary().as_packed(), img.as_packed());
+    // No extension → UnknownFormat before anything is written.
+    let bare = dir.join("picture");
+    assert!(matches!(
+        crate::save(&ctx, &img, &bare, &SaveOptions::default()),
+        Err(ImageError::UnknownFormat(_))
+    ));
+    assert!(!bare.exists());
+    assert!(matches!(
+        crate::open(&ctx, dir.join("missing.oxim")),
+        Err(ImageError::Io(_))
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+}

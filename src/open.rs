@@ -68,6 +68,8 @@ impl ImageFile {
 pub struct OpenOptions {
     /// Stop after this many pictures (`Some(1)` decodes only the
     /// primary image of an animation); `None` decodes everything.
+    /// `Some(0)` is treated as `Some(1)`: a file always yields its
+    /// primary picture.
     pub max_frames: Option<usize>,
     /// File-extension hint for the container probe (without the dot).
     /// [`open`] fills it from the path.
@@ -141,7 +143,13 @@ pub fn decode_reader(
 ) -> Result<ImageFile> {
     let container = ctx
         .containers
-        .probe_input(reader.as_mut(), opts.ext_hint.as_deref())?;
+        .probe_input(reader.as_mut(), opts.ext_hint.as_deref())
+        .map_err(|e| match e {
+            oxideav_core::Error::FormatNotFound(msg) => {
+                Error::UnknownFormat(codec_only_hint(ctx, opts.ext_hint.as_deref(), msg))
+            }
+            other => Error::Core(other),
+        })?;
     let mut demuxer = ctx
         .containers
         .open_demuxer(&container, reader, &ctx.codecs)?;
@@ -164,7 +172,8 @@ pub fn decode_reader(
         )));
     }
 
-    let limit = opts.max_frames.unwrap_or(usize::MAX);
+    // At least the primary picture: `Some(0)` behaves like `Some(1)`.
+    let limit = opts.max_frames.unwrap_or(usize::MAX).max(1);
     let mut images = Vec::new();
     'pump: loop {
         if images.len() >= limit {
@@ -235,4 +244,23 @@ fn drain(
             Err(e) => return Err(e.into()),
         }
     }
+}
+
+/// Some image crates register a codec and an extension but no
+/// container (their decoder takes the whole file as one packet). The
+/// gateway cannot open those through the registry yet — say so instead
+/// of a bare "no format matched".
+fn codec_only_hint(ctx: &RuntimeContext, ext: Option<&str>, msg: String) -> String {
+    let Some(ext) = ext else { return msg };
+    let Some(name) = ctx.containers.container_for_extension(ext) else {
+        return msg;
+    };
+    let id = oxideav_core::CodecId::new(name);
+    if ctx.containers.demuxer_names().any(|n| n == name) || !ctx.codecs.has_decoder(&id) {
+        return msg;
+    }
+    format!(
+        "{msg}; '{ext}' is registered as codec '{name}' without a container demuxer, \
+         which the gateway cannot open through the registry"
+    )
 }
