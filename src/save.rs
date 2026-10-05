@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use oxideav_core::{
-    CodecId, CodecParameters, Frame, MediaType, Packet, PixelFormat, RuntimeContext, StreamInfo,
-    TimeBase,
+    CodecId, CodecParameters, Frame, MediaType, OptionField, Packet, PixelFormat, RuntimeContext,
+    StreamInfo, TimeBase,
 };
 use oxideav_pixfmt::supports;
 
@@ -19,15 +19,19 @@ use crate::image::{duration_to_ticks, Image};
 #[derive(Clone, Debug, Default)]
 #[non_exhaustive]
 pub struct SaveOptions {
-    /// Advisory quality `0..=100`, passed to encoders that read a
-    /// `"quality"` option.
+    /// Advisory quality `0..=100`, handed to the encoder as its
+    /// `"quality"` option when its declared schema has one
+    /// ([`encoder_options`]) and ignored otherwise — lossless encoders
+    /// have no such knob and would reject an unknown option.
     pub quality: Option<u8>,
     /// Force the layout handed to the encoder. `None` tries the image's
     /// own layout first and then a ladder of common ones.
     pub pixel_format: Option<PixelFormat>,
     /// Force a codec id instead of the container's default.
     pub codec: Option<String>,
-    /// Extra encoder options as `(name, value)` pairs.
+    /// Extra encoder options as `(name, value)` pairs, forwarded
+    /// verbatim; names come from [`encoder_options`], and an encoder
+    /// rejects names it does not declare.
     pub options: Vec<(String, String)>,
     /// Time base of the written stream and its packets. `None` picks
     /// milliseconds, except for containers whose muxer defines its own
@@ -84,6 +88,34 @@ impl SaveOptions {
 /// Default delay for a picture without one in a multi-picture encode.
 pub const DEFAULT_DELAY: Duration = Duration::from_millis(100);
 
+/// The option schema of the encoder [`encode`] would use for `format`
+/// (with `SaveOptions::codec` honoured): the names
+/// [`SaveOptions::with_option`] accepts, with kinds, defaults and help
+/// text. Empty when the encoder declares none.
+pub fn encoder_options(
+    ctx: &RuntimeContext,
+    format: &str,
+    opts: &SaveOptions,
+) -> Result<&'static [OptionField]> {
+    let target = resolve_target(ctx, format)?;
+    let codec_id = codec_for(ctx, &target, opts);
+    if !ctx.codecs.has_encoder(&codec_id) {
+        return Err(Error::unsupported(format!(
+            "no registered encoder for codec '{codec_id}' ({target})"
+        )));
+    }
+    Ok(ctx.codecs.encoder_options_schema(&codec_id).unwrap_or(&[]))
+}
+
+/// The codec [`encode`] uses for a resolved target.
+fn codec_for(ctx: &RuntimeContext, target: &Target, opts: &SaveOptions) -> CodecId {
+    CodecId::new(match (&opts.codec, target) {
+        (Some(c), _) => c.clone(),
+        (None, Target::Container(c)) => default_codec_for_container(ctx, c),
+        (None, Target::CodecOnly(id)) => id.clone(),
+    })
+}
+
 /// Encode one picture as `format` (a registered container name or a
 /// file extension such as `"png"`, `"jpg"`, `"heic"`).
 pub fn encode(
@@ -117,12 +149,7 @@ pub fn encode_frames(
         .first()
         .ok_or_else(|| Error::invalid("encode_frames: no image"))?;
     let target = resolve_target(ctx, format)?;
-    let codec_name = match (&opts.codec, &target) {
-        (Some(c), _) => c.clone(),
-        (None, Target::Container(c)) => default_codec_for_container(ctx, c),
-        (None, Target::CodecOnly(id)) => id.clone(),
-    };
-    let codec_id = CodecId::new(codec_name);
+    let codec_id = codec_for(ctx, &target, opts);
     if !ctx.codecs.has_encoder(&codec_id) {
         return Err(Error::unsupported(format!(
             "no registered encoder for codec '{codec_id}' ({target})"
@@ -272,7 +299,13 @@ fn encode_attempt(
         params.color_signal = sig;
     }
     if let Some(q) = opts.quality {
-        params.options = params.options.set("quality", q.to_string());
+        let declared = ctx
+            .codecs
+            .encoder_options_schema(codec_id)
+            .is_some_and(|schema| schema.iter().any(|f| f.name == "quality"));
+        if declared {
+            params.options = params.options.set("quality", q.to_string());
+        }
     }
     for (k, v) in &opts.options {
         params.options = params.options.set(k.clone(), v.clone());

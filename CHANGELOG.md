@@ -32,6 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   registered, else a short exception table (`jpeg` → `mjpeg`, `dcx` →
   `pcx`, `ani` / `cur` → `ico`, `svgz` → `svg`, `iff_*` → `ilbm`).
 - `Image::with_color_signal`.
+- `SaveOptions::quality` reaches the encoder only when its declared
+  option schema has a `quality` field (encoders parse options strictly,
+  so a lossless encoder would otherwise fail on the unknown name);
+  `encoder_options(&ctx, format, &opts)` returns the schema of the
+  encoder `encode` would use, for discovering `with_option` names.
 - `Image::crop(x, y, w, h)` on every layout `PixelFormat` describes with
   whole bytes per sample position (chroma-subsampled layouts need the
   origin on the chroma grid; bit-packed mono and packed 4:2:2 are

@@ -24,10 +24,11 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use oxideav_core::{
-    CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecResolver, Decoder, Demuxer,
-    Encoder, Error, Frame, MediaType, Muxer, Packet, PixelFormat, ProbeData, ProbeScore, ReadSeek,
-    Result, RuntimeContext, StreamInfo, TimeBase, VideoFrame, VideoPlane, WriteSeek,
-    MAX_PROBE_SCORE, PROBE_SCORE_EXTENSION,
+    parse_options, CodecCapabilities, CodecId, CodecInfo, CodecOptionsStruct, CodecParameters,
+    CodecResolver, Decoder, Demuxer, Encoder, Error, Frame, MediaType, Muxer, OptionField,
+    OptionKind, OptionValue, Packet, PixelFormat, ProbeData, ProbeScore, ReadSeek, Result,
+    RuntimeContext, StreamInfo, TimeBase, VideoFrame, VideoPlane, WriteSeek, MAX_PROBE_SCORE,
+    PROBE_SCORE_EXTENSION,
 };
 
 pub(crate) const CONTAINER: &str = "oxim";
@@ -284,6 +285,29 @@ impl Decoder for OximDecoder {
     }
 }
 
+/// Declared encoder options of codec `oxim`, parsed strictly the way
+/// real encoders do (`parse_options` rejects unknown names).
+#[derive(Default)]
+pub(crate) struct OximEncOpts {
+    pub quality: u32,
+}
+
+impl CodecOptionsStruct for OximEncOpts {
+    const SCHEMA: &'static [OptionField] = &[OptionField {
+        name: "quality",
+        kind: OptionKind::U32,
+        default: OptionValue::U32(0),
+        help: "advisory quality 0..=100 (recorded, never applied)",
+    }];
+
+    fn apply(&mut self, key: &str, value: &OptionValue) -> Result<()> {
+        if key == "quality" {
+            self.quality = value.as_u32()?;
+        }
+        Ok(())
+    }
+}
+
 struct OximEncoder {
     id: CodecId,
     out_params: CodecParameters,
@@ -307,6 +331,21 @@ fn make_encoder_for(
     let mut out_params = params.clone();
     out_params.codec_id = CodecId::new(id);
     out_params.media_type = MediaType::Video;
+    // Options: `oxim` declares a schema and parses strictly; `oxim_yuv`
+    // declares none and refuses every option, like an encoder without
+    // an options struct. What was understood is echoed on the output
+    // parameters (the muxer writes them as file metadata).
+    out_params.options = oxideav_core::CodecOptions::new();
+    if id == CODEC {
+        let parsed: OximEncOpts = parse_options(&params.options)?;
+        if params.options.get("quality").is_some() {
+            out_params.options = out_params
+                .options
+                .set("quality", parsed.quality.to_string());
+        }
+    } else if let Some((k, _)) = params.options.iter().next() {
+        return Err(Error::invalid(format!("unknown option '{k}'")));
+    }
     Ok(Box::new(OximEncoder {
         id: CodecId::new(id),
         out_params,
@@ -602,9 +641,12 @@ impl Muxer for OximMuxer {
         out.push(tag_of(p.pixel_format.unwrap_or(PixelFormat::Rgba)).expect("checked at open"));
         out.push(FLAG_DURATIONS);
         out.extend_from_slice(&(self.packets.len() as u32).to_le_bytes());
-        let meta = b"muxer=oxim\n";
+        let mut meta = format!("muxer={}\n", self.name).into_bytes();
+        for (k, v) in p.options.iter() {
+            meta.extend_from_slice(format!("{k}={v}\n").as_bytes());
+        }
         out.extend_from_slice(&(meta.len() as u16).to_le_bytes());
-        out.extend_from_slice(meta);
+        out.extend_from_slice(&meta);
         // Delays: the packet's duration in its own time base, else the
         // gap to the next packet, else 0 — rescaled to milliseconds.
         for (i, pkt) in self.packets.iter().enumerate() {
@@ -674,7 +716,8 @@ pub(crate) fn register(ctx: &mut RuntimeContext) {
                     .with_pixel_formats(FORMATS.to_vec()),
             )
             .decoder(make_decoder)
-            .encoder(make_encoder),
+            .encoder(make_encoder)
+            .encoder_options::<OximEncOpts>(),
     );
     ctx.codecs.register(
         CodecInfo::new(CodecId::new(CODEC_YUV_ONLY))

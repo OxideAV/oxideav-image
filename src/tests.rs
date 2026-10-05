@@ -7,8 +7,8 @@ use oxideav_core::{PixelFormat, TimeBase, VideoPlane};
 
 use crate::fixture::{self, Fixture, FORMATS};
 use crate::{
-    decode_bytes, decode_bytes_with, decode_vec, encode, encode_frames, Image, ImageError,
-    OpenOptions, SaveOptions,
+    decode_bytes, decode_bytes_with, decode_vec, encode, encode_frames, encoder_options, Image,
+    ImageError, OpenOptions, SaveOptions,
 };
 
 fn still(format: PixelFormat) -> Fixture {
@@ -709,4 +709,64 @@ fn decode_vec_matches_decode_bytes() {
     let b = decode_vec(&ctx, bytes).unwrap().into_primary();
     assert_eq!(a.as_packed(), b.as_packed());
     assert_eq!(a.format(), b.format());
+}
+
+#[test]
+fn quality_reaches_only_encoders_that_declare_it() {
+    let ctx = fixture::ctx();
+    let img = Image::from_rgba8(2, 2, vec![3; 16]).unwrap();
+    let meta_of = |bytes: &[u8]| decode_bytes(&ctx, bytes).unwrap().metadata().to_vec();
+    // `oxim` declares "quality".
+    let bytes = encode(&ctx, &img, "oxim", &SaveOptions::new().with_quality(80)).unwrap();
+    assert!(meta_of(&bytes).contains(&("quality".to_string(), "80".to_string())));
+    assert!(meta_of(&bytes).contains(&("muxer".to_string(), "oxim".to_string())));
+    // Clamped to 100.
+    let bytes = encode(&ctx, &img, "oxim", &SaveOptions::new().with_quality(250)).unwrap();
+    assert!(meta_of(&bytes).contains(&("quality".to_string(), "100".to_string())));
+    // No quality asked: nothing forwarded.
+    let bytes = encode(&ctx, &img, "oxim", &SaveOptions::default()).unwrap();
+    assert!(!meta_of(&bytes).iter().any(|(k, _)| k == "quality"));
+    // `oxim_yuv` declares nothing: quality is dropped, not an error.
+    let bytes = encode(
+        &ctx,
+        &img,
+        "oxim",
+        &SaveOptions::new()
+            .with_codec(fixture::CODEC_YUV_ONLY)
+            .with_quality(80),
+    )
+    .unwrap();
+    assert!(!meta_of(&bytes).iter().any(|(k, _)| k == "quality"));
+    // Explicit options are verbatim and the encoder's strictness shows.
+    let err = encode(
+        &ctx,
+        &img,
+        "oxim",
+        &SaveOptions::new().with_option("bogus", "1"),
+    )
+    .unwrap_err();
+    assert!(matches!(err, ImageError::Core(_)), "{err:?}");
+    let bytes = encode(
+        &ctx,
+        &img,
+        "oxim",
+        &SaveOptions::new().with_option("quality", "42"),
+    )
+    .unwrap();
+    assert!(meta_of(&bytes).contains(&("quality".to_string(), "42".to_string())));
+    // Discovery.
+    let schema = encoder_options(&ctx, "oxim", &SaveOptions::default()).unwrap();
+    assert_eq!(schema.len(), 1);
+    assert_eq!(schema[0].name, "quality");
+    let none = encoder_options(
+        &ctx,
+        "oxim",
+        &SaveOptions::new().with_codec(fixture::CODEC_YUV_ONLY),
+    )
+    .unwrap();
+    assert!(none.is_empty());
+    assert!(matches!(
+        encoder_options(&ctx, "nope", &SaveOptions::default()),
+        Err(ImageError::UnknownFormat(_))
+    ));
 }
