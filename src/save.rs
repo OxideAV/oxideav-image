@@ -111,7 +111,7 @@ pub fn encoder_options(
 fn codec_for(ctx: &RuntimeContext, target: &Target, opts: &SaveOptions) -> CodecId {
     CodecId::new(match (&opts.codec, target) {
         (Some(c), _) => c.clone(),
-        (None, Target::Container(c)) => default_codec_for_container(ctx, c),
+        (None, Target::Container(c)) => default_codec_for_container(ctx, c, opts),
         (None, Target::CodecOnly(id)) => {
             if ctx.codecs.has_encoder(&CodecId::new(id)) {
                 id.clone()
@@ -317,9 +317,15 @@ fn resolve_target(ctx: &RuntimeContext, format: &str) -> Result<Target> {
 /// The payload codec a container carries by default: the few containers
 /// whose codec is named differently (when that encoder is registered),
 /// else the codec of the same name (png, bmp, tiff, heif, …).
-fn default_codec_for_container(ctx: &RuntimeContext, container: &str) -> String {
+fn default_codec_for_container(
+    ctx: &RuntimeContext,
+    container: &str,
+    opts: &SaveOptions,
+) -> String {
     let known = match container {
         "jpeg" | "jpg" | "mjpeg" | "mjpeg-raw" => Some("mjpeg"),
+        "jp2" | "jph" => Some("jpeg2000"),
+        "jxs" => Some("jpegxs"),
         "dcx" => Some("pcx"),
         "ani" | "cur" => Some("ico"),
         "svgz" => Some("svg"),
@@ -330,6 +336,12 @@ fn default_codec_for_container(ctx: &RuntimeContext, container: &str) -> String 
     match known {
         // A tag-only `jpeg` id from another crate must not shadow mjpeg.
         Some(c) if ctx.codecs.has_encoder(&CodecId::new(c)) => c.to_string(),
+        // No encoder named like the container: a `<container>_<variant>`
+        // family (webp → webp_vp8l / webp_vp8) picks lossless unless a
+        // quality was asked for.
+        _ if !ctx.codecs.has_encoder(&CodecId::new(container)) => {
+            pick_prefixed_encoder(ctx, container, opts).unwrap_or_else(|| container.to_string())
+        }
         _ => container.to_string(),
     }
 }

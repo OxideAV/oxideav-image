@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `encode` / `save` to a container whose encoder family is prefixed (`webp` → `webp_vp8l` / `webp_vp8`) or named differently (`jp2` / `jph` → `jpeg2000`, `jxs` → `jpegxs`) no longer needs `SaveOptions::codec`.
 - Pictures on a `1/1` time base (the untimed-stream convention used by HEIF bursts, EXR parts, ICER bands, TIFF pages) report `delay() == None` instead of a one-second delay.
 
 ### Added
