@@ -112,8 +112,11 @@ Delays are read from the stream, never from a format table:
   when the demuxer set one; else the gap to the next picture of the
   same stream; the last picture without a duration repeats the previous
   delay. A stream with a single picture is a still and has no delay,
-  whatever nominal duration its demuxer stamped. `Image::timestamp()`
-  is the presentation time from the stream start.
+  whatever nominal duration its demuxer stamped. A stream on a `1/1`
+  time base is untimed by convention (HEIF bursts, EXR parts, ICER
+  bands, TIFF pages): its pictures are indexed, not scheduled, and
+  report no delay. `Image::timestamp()` is the presentation time from
+  the stream start.
 - `encode_frames` rescales every picture's delay (or
   `SaveOptions::default_delay`, 100 ms) to `SaveOptions::time_base`
   (milliseconds by default; 1/100 s for `png`, the APNG delay unit),

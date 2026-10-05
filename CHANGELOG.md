@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Pictures on a `1/1` time base (the untimed-stream convention used by HEIF bursts, EXR parts, ICER bands, TIFF pages) report `delay() == None` instead of a one-second delay.
+
 ### Added
 
 - Layer 2 of the image-crate API (`IMAGE_CRATE_API.md` in the workspace):

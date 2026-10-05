@@ -432,6 +432,17 @@ fn resolve_delays(images: &mut [Image], streams: usize) {
         if idx.len() < 2 {
             continue;
         }
+        // A 1/1 time base is the convention for untimed multi-image
+        // streams (HEIF bursts, EXR parts, ICER bands, TIFF pages): the
+        // pictures are indexed, not scheduled, so they carry no delay —
+        // a tick of one second would be an invention.
+        let tb = images[idx[0]].time_base();
+        if tb.0.num == tb.0.den {
+            for &i in &idx {
+                images[i].set_delay(None);
+            }
+            continue;
+        }
         let mut prev: Option<std::time::Duration> = None;
         for (k, &i) in idx.iter().enumerate() {
             let tb = images[i].time_base();
@@ -453,4 +464,37 @@ fn resolve_delays(images: &mut [Image], streams: usize) {
 /// `width × height` of a stream, saturating.
 fn pixels_of(p: &oxideav_core::CodecParameters) -> u64 {
     u64::from(p.width.unwrap_or(0)) * u64::from(p.height.unwrap_or(0))
+}
+
+#[cfg(test)]
+mod delay_tests {
+    use super::*;
+    use oxideav_core::TimeBase;
+
+    fn pic(stream: usize, tb: TimeBase, pts: i64, dur: Option<i64>) -> Image {
+        let mut img = Image::from_rgb8(1, 1, vec![0, 0, 0]).unwrap();
+        img.set_timing(stream, tb, 0, Some(pts), dur);
+        img
+    }
+
+    #[test]
+    fn untimed_one_over_one_streams_have_no_delay() {
+        let tb = TimeBase::new(1, 1);
+        let mut imgs = vec![
+            pic(0, tb, 0, Some(1)),
+            pic(0, tb, 1, Some(1)),
+            pic(0, tb, 2, Some(1)),
+        ];
+        resolve_delays(&mut imgs, 1);
+        assert!(imgs.iter().all(|i| i.delay().is_none()));
+    }
+
+    #[test]
+    fn timed_streams_keep_their_durations() {
+        let tb = TimeBase::new(1, 1000);
+        let mut imgs = vec![pic(0, tb, 0, Some(100)), pic(0, tb, 100, Some(250))];
+        resolve_delays(&mut imgs, 1);
+        assert_eq!(imgs[0].delay(), Some(std::time::Duration::from_millis(100)));
+        assert_eq!(imgs[1].delay(), Some(std::time::Duration::from_millis(250)));
+    }
 }
