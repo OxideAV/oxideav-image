@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use oxideav_core::{
-    CodecId, CodecParameters, ColorSignal, MediaType, PixelFormat, VideoFrame, VideoPlane,
+    CodecId, CodecParameters, ColorSignal, MediaType, PixelFormat, TimeBase, VideoFrame, VideoPlane,
 };
 use oxideav_pixfmt::{convert, ConvertOptions, FrameInfo};
 
@@ -27,6 +27,15 @@ pub struct Image {
     params: CodecParameters,
     delay: Option<Duration>,
     index: usize,
+    stream: usize,
+    /// Presentation timestamp and duration in `time_base` ticks, as the
+    /// container's packet carried them (`None` when it did not).
+    pts: Option<i64>,
+    duration: Option<i64>,
+    time_base: TimeBase,
+    /// The stream's `start_time`, subtracted from `pts` for
+    /// [`timestamp`](Self::timestamp).
+    start: i64,
 }
 
 impl Image {
@@ -60,6 +69,11 @@ impl Image {
             params: params.clone(),
             delay: None,
             index: 0,
+            stream: 0,
+            pts: None,
+            duration: None,
+            time_base: TimeBase::MILLIS,
+            start: 0,
         })
     }
 
@@ -99,6 +113,11 @@ impl Image {
             params,
             delay: None,
             index: 0,
+            stream: 0,
+            pts: None,
+            duration: None,
+            time_base: TimeBase::MILLIS,
+            start: 0,
         })
     }
 
@@ -150,10 +169,77 @@ impl Image {
         self.frame.palette()
     }
 
-    /// Display delay for this picture inside a sequence or animation,
-    /// when the container said so.
+    /// Display delay for this picture inside a sequence or animation.
+    ///
+    /// The rule, applied by [`crate::open`] and friends from the
+    /// stream's timing (packet `duration` and `pts` in the stream
+    /// `time_base`): the packet's own `duration` when the demuxer set
+    /// one; else the gap to the next picture of the same stream; for the
+    /// last picture without a duration, the previous picture's delay.
+    /// A still (one picture, no duration) has `None`.
     pub fn delay(&self) -> Option<Duration> {
         self.delay
+    }
+
+    /// Presentation time of this picture from the start of its stream,
+    /// when the container timestamped it.
+    pub fn timestamp(&self) -> Option<Duration> {
+        let pts = self.pts?;
+        ticks_to_duration(pts.saturating_sub(self.start), self.time_base)
+    }
+
+    /// Index of the container stream this picture came from (0 for
+    /// stills and for caller-built images).
+    pub fn stream(&self) -> usize {
+        self.stream
+    }
+
+    /// Raw timing as decoded: `(pts, duration)` in
+    /// [`time_base`](Self::time_base) ticks.
+    pub fn raw_timing(&self) -> (Option<i64>, Option<i64>) {
+        (self.pts, self.duration)
+    }
+
+    /// Time base of [`raw_timing`](Self::raw_timing).
+    pub fn time_base(&self) -> TimeBase {
+        self.time_base
+    }
+
+    pub(crate) fn set_timing(
+        &mut self,
+        stream: usize,
+        time_base: TimeBase,
+        start: i64,
+        pts: Option<i64>,
+        duration: Option<i64>,
+    ) {
+        self.stream = stream;
+        self.time_base = time_base;
+        self.start = start;
+        self.pts = pts;
+        self.duration = duration;
+    }
+
+    pub(crate) fn set_delay(&mut self, delay: Option<Duration>) {
+        self.delay = delay;
+    }
+
+    /// Everything but the frame and its parameters.
+    fn clone_timing(&self) -> Image {
+        Image {
+            frame: VideoFrame {
+                pts: None,
+                planes: Vec::new(),
+            },
+            params: CodecParameters::video(CodecId::new("rawvideo")),
+            delay: self.delay,
+            index: self.index,
+            stream: self.stream,
+            pts: self.pts,
+            duration: self.duration,
+            time_base: self.time_base,
+            start: self.start,
+        }
     }
 
     /// Set the display delay (used by [`crate::encode_frames`]).
@@ -202,8 +288,7 @@ impl Image {
         Ok(Image {
             frame: converted,
             params,
-            delay: self.delay,
-            index: self.index,
+            ..self.clone_timing()
         })
     }
 
@@ -272,6 +357,32 @@ impl Image {
             out.extend_from_slice(&p.data);
         }
         out
+    }
+}
+
+/// `ticks` of `tb` as a `Duration`; `None` for negative ticks or an
+/// invalid time base.
+pub(crate) fn ticks_to_duration(ticks: i64, tb: TimeBase) -> Option<Duration> {
+    if ticks < 0 || tb.num() <= 0 || tb.den() <= 0 {
+        return None;
+    }
+    let nanos = (ticks as i128) * (tb.num() as i128) * 1_000_000_000 / (tb.den() as i128);
+    Some(Duration::from_nanos(nanos.try_into().ok()?))
+}
+
+/// `d` in `tb` ticks, rounded to nearest; at least 1 for a non-zero
+/// duration so no picture collapses onto the next.
+pub(crate) fn duration_to_ticks(d: Duration, tb: TimeBase) -> i64 {
+    if tb.num() <= 0 || tb.den() <= 0 {
+        return 0;
+    }
+    let num = tb.num() as i128 * 1_000_000_000;
+    let ticks = (d.as_nanos() as i128 * tb.den() as i128 + num / 2) / num;
+    let ticks = ticks.clamp(0, i64::MAX as i128) as i64;
+    if ticks == 0 && !d.is_zero() {
+        1
+    } else {
+        ticks
     }
 }
 
@@ -355,6 +466,28 @@ mod tests {
     fn into_raw_returns_the_plane() {
         let img = Image::from_rgba8(1, 2, vec![1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
         assert_eq!(img.into_raw(), vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn tick_conversions_round_trip() {
+        let ms = TimeBase::new(1, 1000);
+        assert_eq!(
+            ticks_to_duration(1500, ms),
+            Some(Duration::from_millis(1500))
+        );
+        assert_eq!(ticks_to_duration(-1, ms), None);
+        assert_eq!(duration_to_ticks(Duration::from_millis(70), ms), 70);
+        let cs = TimeBase::new(1, 100);
+        assert_eq!(duration_to_ticks(Duration::from_millis(70), cs), 7);
+        assert_eq!(duration_to_ticks(Duration::from_millis(74), cs), 7);
+        assert_eq!(duration_to_ticks(Duration::from_millis(75), cs), 8);
+        assert_eq!(duration_to_ticks(Duration::from_millis(1), cs), 1);
+        assert_eq!(duration_to_ticks(Duration::ZERO, cs), 0);
+        let ntsc = TimeBase::new(1001, 30000);
+        assert_eq!(
+            duration_to_ticks(ticks_to_duration(3, ntsc).unwrap(), ntsc),
+            3
+        );
     }
 
     #[test]

@@ -1,10 +1,13 @@
 //! Opening: probe → demuxer → decoder through the registries.
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufReader, Cursor};
 use std::path::Path;
 
-use oxideav_core::{CodecParameters, Decoder, Frame, ReadSeek, RuntimeContext, StreamInfo};
+use oxideav_core::{Decoder, Frame, ReadSeek, RuntimeContext, StreamInfo};
+
+use crate::image::ticks_to_duration;
 
 use crate::error::{Error, Result};
 use crate::image::Image;
@@ -175,6 +178,11 @@ pub fn decode_reader(
     // At least the primary picture: `Some(0)` behaves like `Some(1)`.
     let limit = opts.max_frames.unwrap_or(usize::MAX).max(1);
     let mut images = Vec::new();
+    // Packet timing per stream, consumed as frames come out: the
+    // decoders of image codecs are one-in/one-out, and a frame that
+    // carries its own `pts` is matched to the packet with that `pts`.
+    let mut timing: Vec<VecDeque<(Option<i64>, Option<i64>)>> =
+        (0..streams.len()).map(|_| VecDeque::new()).collect();
     'pump: loop {
         if images.len() >= limit {
             break;
@@ -183,15 +191,30 @@ pub fn decode_reader(
             Ok(pkt) => {
                 let idx = pkt.stream_index as usize;
                 if let Some(Some(dec)) = decoders.get_mut(idx) {
+                    timing[idx].push_back((pkt.pts, pkt.duration));
                     dec.send_packet(&pkt)?;
-                    drain(dec.as_mut(), &streams[idx].params, &mut images, limit)?;
+                    drain(
+                        dec.as_mut(),
+                        &streams[idx],
+                        idx,
+                        &mut timing[idx],
+                        &mut images,
+                        limit,
+                    )?;
                 }
             }
             Err(oxideav_core::Error::Eof) => {
                 for (i, slot) in decoders.iter_mut().enumerate() {
                     if let Some(dec) = slot {
                         let _ = dec.flush();
-                        drain(dec.as_mut(), &streams[i].params, &mut images, limit)?;
+                        drain(
+                            dec.as_mut(),
+                            &streams[i],
+                            i,
+                            &mut timing[i],
+                            &mut images,
+                            limit,
+                        )?;
                     }
                 }
                 break 'pump;
@@ -204,6 +227,7 @@ pub fn decode_reader(
             "container '{container}' decoded no picture"
         )));
     }
+    resolve_delays(&mut images, streams.len());
     Ok(ImageFile {
         container,
         metadata,
@@ -214,16 +238,30 @@ pub fn decode_reader(
 /// Pull every ready frame out of a decoder.
 fn drain(
     dec: &mut dyn Decoder,
-    stream: &CodecParameters,
+    info: &StreamInfo,
+    stream_index: usize,
+    timing: &mut VecDeque<(Option<i64>, Option<i64>)>,
     images: &mut Vec<Image>,
     limit: usize,
 ) -> Result<()> {
+    let stream = &info.params;
     loop {
         if images.len() >= limit {
             return Ok(());
         }
         match dec.receive_frame() {
             Ok(Frame::Video(vf)) => {
+                // The packet this frame came from: by pts when the
+                // decoder preserved it, else the oldest unmatched one.
+                let matched = vf
+                    .pts
+                    .and_then(|p| timing.iter().position(|(q, _)| *q == Some(p)))
+                    .and_then(|i| timing.remove(i))
+                    .or_else(|| timing.pop_front());
+                let (pts, duration) = match matched {
+                    Some((p, d)) => (p.or(vf.pts), d),
+                    None => (vf.pts, None),
+                };
                 // The stream's parameters are authoritative: every image
                 // demuxer declares its native layout on the stream
                 // (IMAGE_CRATE_API fleet-sweep ruling), so a missing
@@ -237,7 +275,15 @@ fn drain(
                     )));
                 }
                 let index = images.len();
-                images.push(Image::from_video_frame(vf, stream)?.with_index(index));
+                let mut img = Image::from_video_frame(vf, stream)?.with_index(index);
+                img.set_timing(
+                    stream_index,
+                    info.time_base,
+                    info.start_time.unwrap_or(0),
+                    pts,
+                    duration,
+                );
+                images.push(img);
             }
             Ok(_) => {}
             Err(oxideav_core::Error::NeedMore) | Err(oxideav_core::Error::Eof) => return Ok(()),
@@ -263,4 +309,31 @@ fn codec_only_hint(ctx: &RuntimeContext, ext: Option<&str>, msg: String) -> Stri
         "{msg}; '{ext}' is registered as codec '{name}' without a container demuxer, \
          which the gateway cannot open through the registry"
     )
+}
+
+/// Apply the delay rule documented on [`Image::delay`] to the pictures
+/// of each stream, in decode order: own duration, else gap to the next
+/// picture, else (last picture) the previous delay. A lone picture with
+/// no duration stays `None`.
+fn resolve_delays(images: &mut [Image], streams: usize) {
+    for s in 0..streams {
+        let idx: Vec<usize> = (0..images.len())
+            .filter(|&i| images[i].stream() == s)
+            .collect();
+        let mut prev: Option<std::time::Duration> = None;
+        for (k, &i) in idx.iter().enumerate() {
+            let tb = images[i].time_base();
+            let (pts, dur) = images[i].raw_timing();
+            let next_pts = idx.get(k + 1).and_then(|&j| images[j].raw_timing().0);
+            // A non-positive duration says nothing (stills are often
+            // stamped 0); fall through to the pts gap.
+            let ticks = dur.filter(|d| *d > 0).or_else(|| match (pts, next_pts) {
+                (Some(a), Some(b)) if b > a => Some(b - a),
+                _ => None,
+            });
+            let delay = ticks.and_then(|t| ticks_to_duration(t, tb)).or(prev);
+            images[i].set_delay(delay);
+            prev = delay;
+        }
+    }
 }

@@ -4,6 +4,7 @@
 use std::io::{Cursor, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use oxideav_core::{
     CodecId, CodecParameters, Frame, MediaType, Packet, PixelFormat, RuntimeContext, StreamInfo,
@@ -12,7 +13,7 @@ use oxideav_core::{
 use oxideav_pixfmt::supports;
 
 use crate::error::{Error, Result};
-use crate::image::Image;
+use crate::image::{duration_to_ticks, Image};
 
 /// Knobs for [`encode`] / [`encode_frames`] / [`save`].
 #[derive(Clone, Debug, Default)]
@@ -28,6 +29,13 @@ pub struct SaveOptions {
     pub codec: Option<String>,
     /// Extra encoder options as `(name, value)` pairs.
     pub options: Vec<(String, String)>,
+    /// Time base of the written stream and its packets. `None` picks
+    /// milliseconds, except for containers whose muxer defines its own
+    /// tick (APNG: 1/100 s).
+    pub time_base: Option<TimeBase>,
+    /// Delay used for a picture that carries none in a multi-picture
+    /// encode (`None` = 100 ms).
+    pub default_delay: Option<Duration>,
 }
 
 impl SaveOptions {
@@ -59,7 +67,22 @@ impl SaveOptions {
         self.options.push((name.into(), value.into()));
         self
     }
+
+    /// Time base for the written stream (see the field).
+    pub fn with_time_base(mut self, tb: TimeBase) -> Self {
+        self.time_base = Some(tb);
+        self
+    }
+
+    /// Delay for pictures that carry none (see the field).
+    pub fn with_default_delay(mut self, d: Duration) -> Self {
+        self.default_delay = Some(d);
+        self
+    }
 }
+
+/// Default delay for a picture without one in a multi-picture encode.
+pub const DEFAULT_DELAY: Duration = Duration::from_millis(100);
 
 /// Encode one picture as `format` (a registered container name or a
 /// file extension such as `"png"`, `"jpg"`, `"heic"`).
@@ -73,8 +96,17 @@ pub fn encode(
 }
 
 /// Encode several pictures into one file (animation, burst, sequence or
-/// pages, as the container defines). Picture delays become packet
-/// timestamps in milliseconds.
+/// pages, as the container defines).
+///
+/// Timing: every picture's [`Image::delay`] (or
+/// [`SaveOptions::default_delay`]) is rescaled to the stream time base
+/// ([`SaveOptions::time_base`], default milliseconds; 1/100 s for
+/// `png`, the APNG delay unit); frame `pts` are the cumulative delays.
+/// When the encoder returns exactly one packet per picture, the gateway
+/// stamps `pts` / `dts` / `duration` / `time_base` on the packets so
+/// that `decode(encode_frames(..))` reports the same delays regardless
+/// of what the codec did with the frame `pts`; otherwise the encoder's
+/// packet timing is kept.
 pub fn encode_frames(
     ctx: &RuntimeContext,
     images: &[Image],
@@ -246,10 +278,16 @@ fn encode_attempt(
         params.options = params.options.set(k.clone(), v.clone());
     }
 
-    let time_base = TimeBase::new(1, 1000);
+    let time_base = opts.time_base.unwrap_or_else(|| match target {
+        // The APNG muxer reads `duration` in its 1/100 s delay unit.
+        Target::Container(c) if c == "png" || c == "apng" => TimeBase::new(1, 100),
+        _ => TimeBase::MILLIS,
+    });
+    let default_delay = opts.default_delay.unwrap_or(DEFAULT_DELAY);
     let mut encoder = ctx.codecs.first_encoder(&params)?;
     let mut packets: Vec<Packet> = Vec::new();
     let mut pts: i64 = 0;
+    let mut ticks: Vec<(i64, i64)> = Vec::with_capacity(images.len());
     for img in images {
         if (img.width(), img.height()) != (first.width(), first.height()) {
             return Err(Error::invalid(format!(
@@ -264,11 +302,14 @@ fn encode_attempt(
         let converted = img.to_format(dst)?;
         let (mut frame, _) = converted.into_video_frame();
         frame.pts = Some(pts);
-        pts += img
-            .delay()
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(40)
-            .max(1);
+        let delay = if images.len() == 1 {
+            img.delay().unwrap_or(Duration::ZERO)
+        } else {
+            img.delay().unwrap_or(default_delay)
+        };
+        let d = duration_to_ticks(delay, time_base);
+        ticks.push((pts, d));
+        pts += d;
         encoder.send_frame(&Frame::Video(frame))?;
         drain_packets(encoder.as_mut(), &mut packets)?;
     }
@@ -278,6 +319,14 @@ fn encode_attempt(
         return Err(Error::unsupported(format!(
             "encoder '{codec_id}' produced no packets for {dst:?} input"
         )));
+    }
+    if packets.len() == images.len() {
+        for (pkt, (p, d)) in packets.iter_mut().zip(&ticks) {
+            pkt.time_base = time_base;
+            pkt.pts = Some(*p);
+            pkt.dts = Some(*p);
+            pkt.duration = (*d > 0 || images.len() > 1).then_some(*d);
+        }
     }
 
     let container = match target {

@@ -32,6 +32,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   registered, else a short exception table (`jpeg` → `mjpeg`, `dcx` →
   `pcx`, `ani` / `cur` → `ico`, `svgz` → `svg`, `iff_*` → `ilbm`).
 - `Image::with_color_signal`.
+- Frame timing from the stream: `Image::delay` follows a documented rule
+  (the packet's `duration` in the stream time base; else the gap to the
+  next picture of the same stream; the last picture without a duration
+  repeats the previous delay; a lone still has none), plus
+  `Image::timestamp` (presentation time from the stream start),
+  `Image::stream`, `raw_timing` and `time_base`. `encode_frames` maps
+  delays back: pictures get cumulative `pts` in `SaveOptions::time_base`
+  (default milliseconds; 1/100 s for `png`, the APNG delay unit) and,
+  when the encoder returns one packet per picture, the packets are
+  stamped with `pts` / `dts` / `duration` / `time_base`, so
+  `decode(encode_frames(..))` reports the same delays. Pictures without a
+  delay use `SaveOptions::default_delay` (`DEFAULT_DELAY` = 100 ms); a
+  single still is written without a duration.
 - A synthetic `OXIM` container + codec pair under `#[cfg(test)]`,
   registered like a sibling crate, exercising probe by magic and by
   extension hint, every packed and planar layout, `Pal8` + palette,

@@ -1,7 +1,9 @@
 //! Gateway tests against the synthetic OXIM container + codec pair in
 //! [`crate::fixture`]. No file I/O except where marked `not(miri)`.
 
-use oxideav_core::PixelFormat;
+use std::time::Duration;
+
+use oxideav_core::{PixelFormat, TimeBase};
 
 use crate::fixture::{self, Fixture, FORMATS};
 use crate::{
@@ -359,4 +361,103 @@ fn save_and_open_round_trip_through_files() {
         Err(ImageError::Io(_))
     ));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn anim(flags: u8) -> Fixture {
+    let mut fx = Fixture::new(2, 2, PixelFormat::Rgb24);
+    fx.flags = flags;
+    fx.push_gradient(30, 1)
+        .push_gradient(70, 2)
+        .push_gradient(20, 3);
+    fx
+}
+
+fn ms(v: u64) -> Option<Duration> {
+    Some(Duration::from_millis(v))
+}
+
+#[test]
+fn delays_come_from_packet_durations() {
+    let ctx = fixture::ctx();
+    let file = decode_bytes(&ctx, &anim(fixture::FLAG_DURATIONS).encode()).unwrap();
+    let delays: Vec<_> = file.frames().iter().map(Image::delay).collect();
+    assert_eq!(delays, vec![ms(30), ms(70), ms(20)]);
+    let stamps: Vec<_> = file.frames().iter().map(Image::timestamp).collect();
+    assert_eq!(stamps, vec![ms(0), ms(30), ms(100)]);
+    assert!(file.frames().iter().all(|i| i.stream() == 0));
+    assert_eq!(file.primary().time_base(), fixture::TIME_BASE);
+    assert_eq!(file.primary().raw_timing(), (Some(0), Some(30)));
+}
+
+#[test]
+fn delays_fall_back_to_pts_deltas_and_the_last_repeats() {
+    let ctx = fixture::ctx();
+    let file = decode_bytes(&ctx, &anim(0).encode()).unwrap();
+    let delays: Vec<_> = file.frames().iter().map(Image::delay).collect();
+    // No durations: 30 → 100 is a 70 ms gap... the first gap is 30,
+    // the second 70, and the last picture repeats the previous delay.
+    assert_eq!(delays, vec![ms(30), ms(70), ms(70)]);
+}
+
+#[test]
+fn no_timing_at_all_means_no_delay() {
+    let ctx = fixture::ctx();
+    let file = decode_bytes(&ctx, &anim(fixture::FLAG_NO_PTS).encode()).unwrap();
+    assert!(file.frames().iter().all(|i| i.delay().is_none()));
+    assert!(file.frames().iter().all(|i| i.timestamp().is_none()));
+    // A still never has a delay, with or without a duration.
+    let still = decode_bytes(&ctx, &still(PixelFormat::Gray8).encode()).unwrap();
+    assert_eq!(still.primary().delay(), None);
+    let mut fx = Fixture::new(2, 2, PixelFormat::Gray8);
+    fx.push_gradient(500, 1);
+    let timed = decode_bytes(&ctx, &fx.encode()).unwrap();
+    assert_eq!(timed.primary().delay(), ms(500));
+}
+
+#[test]
+fn encode_frames_round_trips_delays() {
+    let ctx = fixture::ctx();
+    let frames: Vec<Image> = [30u64, 70, 20]
+        .iter()
+        .enumerate()
+        .map(|(i, d)| {
+            Image::from_rgb8(2, 2, vec![i as u8 * 40; 12])
+                .unwrap()
+                .with_delay(ms(*d))
+        })
+        .collect();
+    for tb in [
+        None,
+        Some(TimeBase::new(1, 100)),
+        Some(TimeBase::new(1, 90_000)),
+    ] {
+        let mut opts = SaveOptions::default();
+        if let Some(tb) = tb {
+            opts = opts.with_time_base(tb);
+        }
+        let bytes = encode_frames(&ctx, &frames, "oxim", &opts).unwrap();
+        let back = decode_bytes(&ctx, &bytes).unwrap();
+        let delays: Vec<_> = back.frames().iter().map(Image::delay).collect();
+        assert_eq!(delays, vec![ms(30), ms(70), ms(20)], "{tb:?}");
+    }
+    // Pictures without a delay take the default (or the caller's).
+    let plain: Vec<Image> = frames.iter().map(|f| f.clone().with_delay(None)).collect();
+    let bytes = encode_frames(&ctx, &plain, "oxim", &SaveOptions::default()).unwrap();
+    let back = decode_bytes(&ctx, &bytes).unwrap();
+    assert!(back
+        .frames()
+        .iter()
+        .all(|i| i.delay() == Some(crate::DEFAULT_DELAY)));
+    let bytes = encode_frames(
+        &ctx,
+        &plain,
+        "oxim",
+        &SaveOptions::new().with_default_delay(Duration::from_millis(16)),
+    )
+    .unwrap();
+    let back = decode_bytes(&ctx, &bytes).unwrap();
+    assert!(back.frames().iter().all(|i| i.delay() == ms(16)));
+    // A single still is written without a duration.
+    let one = encode(&ctx, &plain[0], "oxim", &SaveOptions::default()).unwrap();
+    assert_eq!(decode_bytes(&ctx, &one).unwrap().primary().delay(), None);
 }

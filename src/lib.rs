@@ -52,7 +52,7 @@ pub use image::Image;
 pub use open::{
     decode_bytes, decode_bytes_with, decode_reader, open, open_with, ImageFile, OpenOptions,
 };
-pub use save::{encode, encode_frames, save, SaveOptions};
+pub use save::{encode, encode_frames, save, SaveOptions, DEFAULT_DELAY};
 
 /// Re-exported for convenience: the framework's pixel layouts and colour
 /// description, which [`Image`] reports.
