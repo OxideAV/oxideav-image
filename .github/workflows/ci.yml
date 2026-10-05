@@ -1,0 +1,21 @@
+name: CI
+
+# Thin shim around the OxideAV org-level reusable workflow (build + test
+# on the three desktop targets, rustfmt + clippy, miri). oxideav-image is
+# a framework consumer — it depends on oxideav-core and oxideav-pixfmt and
+# on nothing format-specific — so there is no standalone leg.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  ci:
+    uses: OxideAV/.github/.github/workflows/crate-ci.yml@master
+    secrets: inherit

@@ -1,0 +1,23 @@
+[package]
+name = "oxideav-image"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/OxideAV/oxideav-image"
+homepage = "https://github.com/OxideAV/oxideav-image"
+authors = ["Mark Karpeles"]
+description = "Image gateway for the oxideav framework — open, decode, convert and save still images and image sequences through the registered format crates, raw RGB / RGBA Vec<u8> in and out"
+readme = "README.md"
+# crates.io caps packages at 10 MiB; fixtures and fuzz corpora stay out.
+exclude = ["/tests", "/fuzz"]
+keywords = ["multimedia", "image", "png", "jpeg", "pure-rust"]
+categories = ["multimedia::encoding", "multimedia::images"]
+
+[dependencies]
+# The gateway consumes the registries an application populated (normally
+# `oxideav_meta::register_all`) and never depends on a format crate, so
+# it stays publishable on its own.
+oxideav-core = "0.1"
+# Every pixel-layout conversion `Image::to_*` offers.
+oxideav-pixfmt = "0.1"
