@@ -32,6 +32,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   registered, else a short exception table (`jpeg` → `mjpeg`, `dcx` →
   `pcx`, `ani` / `cur` → `ico`, `svgz` → `svg`, `iff_*` → `ilbm`).
 - `Image::with_color_signal`.
+- `Image::to_format` (and every `to_*`) hands the stream-level colour
+  signal to `oxideav-pixfmt` when the frame carries no record of its
+  own, so YCbCr frames from a video codec inside a container (HEIF
+  sequence tracks) convert with the container's matrix and range.
+- Codec-only formats whose encoders are prefixed variants (`webp` →
+  `webp_vp8l` / `webp_vp8`) resolve: the lossless one by default, a
+  lossy one when a quality is asked for.
+- When every layout of the ladder fails for the same reason the original
+  error is returned unchanged; otherwise `Unsupported` lists what each
+  attempt hit. Packets are drained leniently between frames (some image
+  encoders answer `receive_packet` before `flush` with an error other
+  than `NeedMore`); after `flush` an error following at least one
+  delivered packet ends the stream, an error before any packet is fatal.
+- Multi-picture encode re-encodes one picture per encoder instance when
+  the encoder folded them into a single packet and the container has a
+  muxer (png → APNG with per-picture delays through the muxer).
 - `SaveOptions::quality` reaches the encoder only when its declared
   option schema has a `quality` field (encoders parse options strictly,
   so a lossless encoder would otherwise fail on the unknown name);
@@ -79,3 +95,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - A probe miss is `UnknownFormat` (was `Core(FormatNotFound)`);
   `OpenOptions::max_frames(0)` behaves like `1`.
+- A stream with a single picture never reports a delay, whatever
+  nominal duration its demuxer stamped.

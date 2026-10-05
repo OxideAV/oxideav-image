@@ -405,13 +405,14 @@ fn no_timing_at_all_means_no_delay() {
     let file = decode_bytes(&ctx, &anim(fixture::FLAG_NO_PTS).encode()).unwrap();
     assert!(file.frames().iter().all(|i| i.delay().is_none()));
     assert!(file.frames().iter().all(|i| i.timestamp().is_none()));
-    // A still never has a delay, with or without a duration.
+    // A still never has a delay, with or without a stamped duration.
     let still = decode_bytes(&ctx, &still(PixelFormat::Gray8).encode()).unwrap();
     assert_eq!(still.primary().delay(), None);
     let mut fx = Fixture::new(2, 2, PixelFormat::Gray8);
     fx.push_gradient(500, 1);
     let timed = decode_bytes(&ctx, &fx.encode()).unwrap();
-    assert_eq!(timed.primary().delay(), ms(500));
+    assert_eq!(timed.primary().delay(), None);
+    assert_eq!(timed.primary().raw_timing(), (Some(0), Some(500)));
 }
 
 #[test]

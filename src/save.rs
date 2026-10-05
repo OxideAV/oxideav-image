@@ -112,8 +112,48 @@ fn codec_for(ctx: &RuntimeContext, target: &Target, opts: &SaveOptions) -> Codec
     CodecId::new(match (&opts.codec, target) {
         (Some(c), _) => c.clone(),
         (None, Target::Container(c)) => default_codec_for_container(ctx, c),
-        (None, Target::CodecOnly(id)) => id.clone(),
+        (None, Target::CodecOnly(id)) => {
+            if ctx.codecs.has_encoder(&CodecId::new(id)) {
+                id.clone()
+            } else {
+                pick_prefixed_encoder(ctx, id, opts).unwrap_or_else(|| id.clone())
+            }
+        }
     })
+}
+
+/// Encoder ids of the form `<name>_<variant>`, sorted.
+fn prefixed_encoders(ctx: &RuntimeContext, name: &str) -> Vec<String> {
+    let prefix = format!("{name}_");
+    let mut v: Vec<String> = ctx
+        .codecs
+        .encoder_ids()
+        .filter(|id| id.as_str().starts_with(&prefix))
+        .map(|id| id.as_str().to_string())
+        .collect();
+    v.sort();
+    v
+}
+
+/// Among `<name>_*` encoders: the lossless one unless a quality was
+/// asked for (then a lossy one), else the first by name.
+fn pick_prefixed_encoder(ctx: &RuntimeContext, name: &str, opts: &SaveOptions) -> Option<String> {
+    let ids = prefixed_encoders(ctx, name);
+    let want_lossy = opts.quality.is_some();
+    let flagged = ids.iter().find(|id| {
+        ctx.codecs
+            .implementations(&CodecId::new(id.as_str()))
+            .iter()
+            .any(|i| {
+                i.make_encoder.is_some()
+                    && if want_lossy {
+                        i.caps.lossy && !i.caps.lossless
+                    } else {
+                        i.caps.lossless
+                    }
+            })
+    });
+    flagged.or(ids.first()).cloned()
 }
 
 /// Encode one picture as `format` (a registered container name or a
@@ -156,15 +196,47 @@ pub fn encode_frames(
         )));
     }
 
+    for img in images {
+        if (img.width(), img.height()) != (first.width(), first.height()) {
+            return Err(Error::invalid(format!(
+                "frame {} is {}x{} but the sequence is {}x{}",
+                img.index(),
+                img.width(),
+                img.height(),
+                first.width(),
+                first.height()
+            )));
+        }
+    }
+
     let candidates = candidates(first.format(), opts);
-    let mut last_err: Option<Error> = None;
+    let mut first_err: Option<Error> = None;
+    let mut same = true;
+    let mut attempts: Vec<String> = Vec::new();
     for dst in candidates {
         match encode_attempt(ctx, images, &target, &codec_id, dst, opts) {
             Ok(bytes) => return Ok(bytes),
-            Err(e) => last_err = Some(e),
+            Err(e) => {
+                let text = e.to_string();
+                if let Some(f) = &first_err {
+                    same &= f.to_string() == text;
+                }
+                attempts.push(format!("{dst:?}: {text}"));
+                first_err.get_or_insert(e);
+            }
         }
     }
-    Err(last_err.unwrap_or_else(|| Error::unsupported("no pixel-format candidate to encode")))
+    let first_err = first_err.unwrap_or_else(|| Error::unsupported("no input layout to try"));
+    if same {
+        // One cause, whatever the layout (unknown option, muxer refusing
+        // the stream, …): keep it as is.
+        return Err(first_err);
+    }
+    // Every layout of the ladder failed differently: say what each hit.
+    Err(Error::unsupported(format!(
+        "no input layout was accepted by encoder '{codec_id}' + {target} — {}",
+        attempts.join("; ")
+    )))
 }
 
 /// Encode one picture and write it to `path`; the extension picks the
@@ -222,9 +294,13 @@ fn resolve_target(ctx: &RuntimeContext, format: &str) -> Result<Target> {
     }
     // A codec registered without a container: the format's crate hands
     // whole files to its codec, so the encoder's packet is the file.
+    // The encoder may be the codec itself (`qoi`) or a prefixed
+    // variant (`webp` decodes, `webp_vp8l` / `webp_vp8` encode).
     for name in by_ext.into_iter().chain(std::iter::once(lower.as_str())) {
-        let id = CodecId::new(name);
-        if !ctx.containers.demuxer_names().any(|n| n == name) && ctx.codecs.has_encoder(&id) {
+        if ctx.containers.demuxer_names().any(|n| n == name) {
+            continue;
+        }
+        if ctx.codecs.has_encoder(&CodecId::new(name)) || !prefixed_encoders(ctx, name).is_empty() {
             return Ok(Target::CodecOnly(name.to_string()));
         }
     }
@@ -238,23 +314,24 @@ fn resolve_target(ctx: &RuntimeContext, format: &str) -> Result<Target> {
     )))
 }
 
-/// The payload codec a container carries by default: the encoder of
-/// the same name when one is registered (png, bmp, tiff, heif, …), else
-/// the few containers whose codec is named differently.
+/// The payload codec a container carries by default: the few containers
+/// whose codec is named differently (when that encoder is registered),
+/// else the codec of the same name (png, bmp, tiff, heif, …).
 fn default_codec_for_container(ctx: &RuntimeContext, container: &str) -> String {
-    if ctx.codecs.has_encoder(&CodecId::new(container)) {
-        return container.to_string();
+    let known = match container {
+        "jpeg" | "jpg" | "mjpeg" | "mjpeg-raw" => Some("mjpeg"),
+        "dcx" => Some("pcx"),
+        "ani" | "cur" => Some("ico"),
+        "svgz" => Some("svg"),
+        "y4m" => Some("rawvideo"),
+        other if other.starts_with("iff_") => Some("ilbm"),
+        _ => None,
+    };
+    match known {
+        // A tag-only `jpeg` id from another crate must not shadow mjpeg.
+        Some(c) if ctx.codecs.has_encoder(&CodecId::new(c)) => c.to_string(),
+        _ => container.to_string(),
     }
-    match container {
-        "jpeg" | "jpg" | "mjpeg" | "mjpeg-raw" => "mjpeg",
-        "dcx" => "pcx",
-        "ani" | "cur" => "ico",
-        "svgz" => "svg",
-        "y4m" => "rawvideo",
-        other if other.starts_with("iff_") => "ilbm",
-        other => other,
-    }
-    .to_string()
 }
 
 /// Encoder input layouts to try, in order: the forced one, else the
@@ -322,16 +399,6 @@ fn encode_attempt(
     let mut pts: i64 = 0;
     let mut ticks: Vec<(i64, i64)> = Vec::with_capacity(images.len());
     for img in images {
-        if (img.width(), img.height()) != (first.width(), first.height()) {
-            return Err(Error::invalid(format!(
-                "frame {} is {}x{} but the sequence is {}x{}",
-                img.index(),
-                img.width(),
-                img.height(),
-                first.width(),
-                first.height()
-            )));
-        }
         let converted = img.to_format(dst)?;
         let (mut frame, _) = converted.into_video_frame();
         frame.pts = Some(pts);
@@ -344,7 +411,7 @@ fn encode_attempt(
         ticks.push((pts, d));
         pts += d;
         encoder.send_frame(&Frame::Video(frame))?;
-        drain_packets(encoder.as_mut(), &mut packets)?;
+        drain_packets_between_frames(encoder.as_mut(), &mut packets);
     }
     encoder.flush()?;
     drain_packets(encoder.as_mut(), &mut packets)?;
@@ -352,6 +419,29 @@ fn encode_attempt(
         return Err(Error::unsupported(format!(
             "encoder '{codec_id}' produced no packets for {dst:?} input"
         )));
+    }
+    if packets.len() == 1 && images.len() > 1 && matches!(target, Target::Container(_)) {
+        // The encoder folded every picture into one packet (png writes
+        // an APNG itself with a uniform delay). Containers whose muxer
+        // assembles the multi-picture file from one packet per picture
+        // need exactly that, so encode each picture on its own encoder
+        // and let the muxer do the assembly with our timing.
+        packets.clear();
+        for img in images {
+            let mut enc = ctx.codecs.first_encoder(&params)?;
+            let (mut frame, _) = img.to_format(dst)?.into_video_frame();
+            frame.pts = Some(0);
+            enc.send_frame(&Frame::Video(frame))?;
+            enc.flush()?;
+            let before = packets.len();
+            drain_packets(enc.as_mut(), &mut packets)?;
+            if packets.len() != before + 1 {
+                return Err(Error::unsupported(format!(
+                    "encoder '{codec_id}' produced {} packet(s) for one picture",
+                    packets.len() - before
+                )));
+            }
+        }
     }
     if packets.len() == images.len() {
         for (pkt, (p, d)) in packets.iter_mut().zip(&ticks) {
@@ -442,11 +532,27 @@ impl Seek for SharedCursor {
     }
 }
 
+/// Collect what an encoder has ready between two frames. Errors here
+/// are not fatal: some image encoders answer `receive_packet` before
+/// `flush` with an error other than `NeedMore` (they queue nothing
+/// until the end), and anything real surfaces again after `flush`.
+fn drain_packets_between_frames(enc: &mut dyn oxideav_core::Encoder, out: &mut Vec<Packet>) {
+    while let Ok(p) = enc.receive_packet() {
+        out.push(p);
+    }
+}
+
+/// Collect everything a flushed encoder has. `NeedMore` / `Eof` end
+/// the stream; any other error ends it too once the encode has
+/// delivered at least one packet (an encoder that errors instead of
+/// saying `Eof` after its last packet has still produced its output),
+/// and is fatal when nothing came out at all.
 fn drain_packets(enc: &mut dyn oxideav_core::Encoder, out: &mut Vec<Packet>) -> Result<()> {
     loop {
         match enc.receive_packet() {
             Ok(p) => out.push(p),
             Err(oxideav_core::Error::NeedMore) | Err(oxideav_core::Error::Eof) => return Ok(()),
+            Err(_) if !out.is_empty() => return Ok(()),
             Err(e) => return Err(e.into()),
         }
     }

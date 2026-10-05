@@ -229,7 +229,15 @@ pub fn decode_reader(
         })?;
     let mut demuxer = ctx
         .containers
-        .open_demuxer(&container, reader, &ctx.codecs)?;
+        .open_demuxer(&container, reader, &ctx.codecs)
+        .map_err(|e| match e {
+            // An extension registered by a codec-only crate probes to a
+            // container name that has no demuxer.
+            oxideav_core::Error::FormatNotFound(msg) => {
+                Error::UnknownFormat(codec_only_hint(ctx, Some(&container), msg))
+            }
+            other => Error::Core(other),
+        })?;
     let streams: Vec<StreamInfo> = demuxer.streams().to_vec();
     let metadata = demuxer.metadata().to_vec();
 
@@ -400,9 +408,7 @@ fn drain(
 /// of a bare "no format matched".
 fn codec_only_hint(ctx: &RuntimeContext, ext: Option<&str>, msg: String) -> String {
     let Some(ext) = ext else { return msg };
-    let Some(name) = ctx.containers.container_for_extension(ext) else {
-        return msg;
-    };
+    let name = ctx.containers.container_for_extension(ext).unwrap_or(ext);
     let id = oxideav_core::CodecId::new(name);
     if ctx.containers.demuxer_names().any(|n| n == name) || !ctx.codecs.has_decoder(&id) {
         return msg;
@@ -415,13 +421,17 @@ fn codec_only_hint(ctx: &RuntimeContext, ext: Option<&str>, msg: String) -> Stri
 
 /// Apply the delay rule documented on [`Image::delay`] to the pictures
 /// of each stream, in decode order: own duration, else gap to the next
-/// picture, else (last picture) the previous delay. A lone picture with
-/// no duration stays `None`.
+/// picture, else (last picture) the previous delay. A stream with a
+/// single picture is a still: no delay, whatever duration the demuxer
+/// stamped (JPEG's frame-rate tick, HEIF's `1`, …).
 fn resolve_delays(images: &mut [Image], streams: usize) {
     for s in 0..streams {
         let idx: Vec<usize> = (0..images.len())
             .filter(|&i| images[i].stream() == s)
             .collect();
+        if idx.len() < 2 {
+            continue;
+        }
         let mut prev: Option<std::time::Duration> = None;
         for (k, &i) in idx.iter().enumerate() {
             let tb = images[i].time_base();

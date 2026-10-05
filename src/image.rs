@@ -6,7 +6,7 @@ use std::time::Duration;
 use oxideav_core::{
     CodecId, CodecParameters, ColorSignal, MediaType, PixelFormat, TimeBase, VideoFrame, VideoPlane,
 };
-use oxideav_pixfmt::{convert, ConvertOptions, FrameInfo};
+use oxideav_pixfmt::{convert_with, ConvertContext, ConvertOptions, FrameInfo};
 
 use crate::error::{Error, Result};
 
@@ -231,7 +231,8 @@ impl Image {
     /// `time_base`): the packet's own `duration` when the demuxer set
     /// one; else the gap to the next picture of the same stream; for the
     /// last picture without a duration, the previous picture's delay.
-    /// A still (one picture, no duration) has `None`.
+    /// A stream with a single picture is a still and has `None`, even
+    /// when its demuxer stamped a nominal duration.
     pub fn delay(&self) -> Option<Duration> {
         self.delay
     }
@@ -329,14 +330,23 @@ impl Image {
     }
 
     /// Convert to another layout through `oxideav-pixfmt`. Same format
-    /// returns a clone.
+    /// returns a clone. The colour signal used for YCbCr ↔ RGB is the
+    /// frame's own record, else the stream-level one from the container
+    /// (what [`color_signal`](Self::color_signal) reports), else
+    /// pixfmt's defaults.
     pub fn to_format(&self, dst: PixelFormat) -> Result<Image> {
         let src = self.format();
         if src == dst {
             return Ok(self.clone());
         }
         let info = FrameInfo::new(src, self.width(), self.height());
-        let converted = convert(&self.frame, info, dst, &ConvertOptions::default())?;
+        let mut cx = ConvertContext::new();
+        if self.frame.color_signal().is_none() {
+            if let Some(sig) = self.color_signal() {
+                cx = cx.with_signal(sig);
+            }
+        }
+        let converted = convert_with(&self.frame, info, dst, &ConvertOptions::default(), &cx)?;
         let mut params = self.params.clone();
         params.pixel_format = Some(dst);
         params.media_type = MediaType::Video;
