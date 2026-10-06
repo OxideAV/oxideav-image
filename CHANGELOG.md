@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.2](https://github.com/OxideAV/oxideav-image/compare/v0.0.1...v0.0.2) - 2026-10-05
+
+### Other
+
+- container default codec follows prefixed encoder families and wrapper names
+- pictures on a 1/1 time base are untimed and carry no delay
+- README in the contract's spirit: usage, API table, format resolution, ladder, options, timing rule, limits, error table, deliberate non-goals
+- Fixes surfaced by the umbrella suite: stream colour signal into pixfmt, lone-picture delay, prefixed codec-only encoders, per-picture APNG retry, tolerant drains, UnknownFormat on demuxer-less extensions
+- :quality is schema-gated; encoder_options() exposes the encoder's declared options
+- Image API completion: crop on every byte-granular layout, to_gray8, from_planes, ImageFile iteration, decoder options, max_pixels budget, decode_vec
+- Frame timing: delays from packet duration / pts deltas in the stream time base; encode_frames stamps pts, dts, duration back
+- Synthetic OXIM registry fixture + 17 gateway tests; codec-only encode path; default-codec rule from the registry
+
 ### Fixed
 
 - `encode` / `save` to a container whose encoder family is prefixed (`webp` → `webp_vp8l` / `webp_vp8`) or named differently (`jp2` / `jph` → `jpeg2000`, `jxs` → `jpegxs`) no longer needs `SaveOptions::codec`.
