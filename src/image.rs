@@ -6,7 +6,7 @@ use std::time::Duration;
 use oxideav_core::{
     CodecId, CodecParameters, ColorSignal, MediaType, PixelFormat, TimeBase, VideoFrame, VideoPlane,
 };
-use oxideav_pixfmt::{convert_with, ConvertContext, ConvertOptions, FrameInfo};
+use oxideav_pixfmt::{convert_with, supports_direct, ConvertContext, ConvertOptions, FrameInfo};
 
 use crate::error::{Error, Result};
 
@@ -339,14 +339,33 @@ impl Image {
         if src == dst {
             return Ok(self.clone());
         }
-        let info = FrameInfo::new(src, self.width(), self.height());
         let mut cx = ConvertContext::new();
         if self.frame.color_signal().is_none() {
             if let Some(sig) = self.color_signal() {
                 cx = cx.with_signal(sig);
             }
         }
-        let converted = convert_with(&self.frame, info, dst, &ConvertOptions::default(), &cx)?;
+        // A deep source asked for a 16-bit view walks the deep pivots
+        // when pixfmt has no single-step route, so no hop narrows to
+        // eight bits (pixfmt's own staging would pivot through Gray8 for
+        // Gray16Le → Rgb48Le, say).
+        let hops = deep_route(src, dst).unwrap_or_default();
+        let (w, h) = (self.width(), self.height());
+        let mut cur = src;
+        let mut converted: Option<VideoFrame> = None;
+        for next in hops.into_iter().chain(std::iter::once(dst)) {
+            let info = FrameInfo::new(cur, w, h);
+            let from = converted.as_ref().unwrap_or(&self.frame);
+            converted = Some(convert_with(
+                from,
+                info,
+                next,
+                &ConvertOptions::default(),
+                &cx,
+            )?);
+            cur = next;
+        }
+        let converted = converted.ok_or_else(|| Error::invalid("conversion produced no frame"))?;
         let mut params = self.params.clone();
         params.pixel_format = Some(dst);
         params.media_type = MediaType::Video;
@@ -375,9 +394,34 @@ impl Image {
     }
 
     /// Tightly packed `Rgba64Le` bytes (`width × height × 8`,
-    /// little-endian 16-bit samples).
+    /// little-endian 16-bit samples); see [`to_rgb16`](Self::to_rgb16)
+    /// for the depth rule. Alpha is opaque (`65535`) when the source has
+    /// none.
     pub fn to_rgba16(&self) -> Result<Vec<u8>> {
         self.packed_bytes(PixelFormat::Rgba64Le)
+    }
+
+    /// Tightly packed `Rgb48Le` bytes (`width × height × 6`,
+    /// little-endian 16-bit samples): the lossless 16-bit view for
+    /// texture consumers.
+    ///
+    /// Depth rule (shared by [`to_rgba16`](Self::to_rgba16) and
+    /// [`to_gray16`](Self::to_gray16)): a 16-bit source is returned
+    /// exactly (same samples, converted between layouts without
+    /// requantising); an 8-bit sample `s` widens to `s × 257` (`0 → 0`,
+    /// `255 → 65535`, every value exactly representable back); 10- and
+    /// 12-bit sources scale to the 16-bit full range the same way
+    /// (`s × 65535 / max`). YCbCr sources go through the colour matrix
+    /// at 16-bit precision. Nothing here is ever narrowed.
+    pub fn to_rgb16(&self) -> Result<Vec<u8>> {
+        self.packed_bytes(PixelFormat::Rgb48Le)
+    }
+
+    /// Tightly packed `Gray16Le` bytes (`width × height × 2`): luma of
+    /// colour sources, palette expanded first; depth rule as
+    /// [`to_rgb16`](Self::to_rgb16).
+    pub fn to_gray16(&self) -> Result<Vec<u8>> {
+        self.packed_bytes(PixelFormat::Gray16Le)
     }
 
     /// Convert to a packed layout and return its bytes without row
@@ -519,6 +563,52 @@ impl Image {
     }
 }
 
+/// The 16-bit packed views and their alpha / grey relatives: the pivots
+/// a deep-to-deep conversion may stage through without narrowing.
+const DEEP_PIVOTS: [PixelFormat; 4] = [
+    PixelFormat::Gray16Le,
+    PixelFormat::Ya16Le,
+    PixelFormat::Rgba64Le,
+    PixelFormat::Rgb48Le,
+];
+
+/// Intermediate hops for `src → dst` when `dst` is a 16-bit packed view,
+/// `src` is deep and pixfmt has no direct route: the shortest chain of
+/// direct conversions through [`DEEP_PIVOTS`] (breadth-first, at most
+/// three hops). `None` leaves the conversion to pixfmt's own staging.
+fn deep_route(src: PixelFormat, dst: PixelFormat) -> Option<Vec<PixelFormat>> {
+    if src == dst
+        || !DEEP_PIVOTS.contains(&dst)
+        || !crate::ladder::is_deep(src)
+        || supports_direct(src, dst)
+    {
+        return None;
+    }
+    let mut paths: Vec<Vec<PixelFormat>> = vec![vec![]];
+    for _ in 0..3 {
+        let mut next = Vec::new();
+        for path in &paths {
+            let last = path.last().copied().unwrap_or(src);
+            for &p in &DEEP_PIVOTS {
+                if p == dst || path.contains(&p) || !supports_direct(last, p) {
+                    continue;
+                }
+                let mut ext = path.clone();
+                ext.push(p);
+                if supports_direct(p, dst) {
+                    return Some(ext);
+                }
+                next.push(ext);
+            }
+        }
+        if next.is_empty() {
+            return None;
+        }
+        paths = next;
+    }
+    None
+}
+
 /// `ticks` of `tb` as a `Duration`; `None` for negative ticks or an
 /// invalid time base.
 pub(crate) fn ticks_to_duration(ticks: i64, tb: TimeBase) -> Option<Duration> {
@@ -619,6 +709,52 @@ mod tests {
         assert_eq!(wide.len(), 8);
         assert_eq!(&wide[..2], &[255, 255]);
         assert_eq!(&wide[2..4], &[0, 0]);
+    }
+
+    #[test]
+    fn sixteen_bit_views_are_exact_or_widen_by_257() {
+        // 8-bit → 16-bit: s × 257, so 128 → 32896 = 0x8080.
+        let img = Image::from_rgb8(1, 1, vec![255, 0, 128]).unwrap();
+        assert_eq!(img.to_rgb16().unwrap(), vec![255, 255, 0, 0, 0x80, 0x80]);
+        assert_eq!(
+            img.to_rgba16().unwrap(),
+            vec![255, 255, 0, 0, 0x80, 0x80, 255, 255]
+        );
+        let grey = Image::from_raw(2, 1, PixelFormat::Gray8, vec![0, 200]).unwrap();
+        assert_eq!(grey.to_gray16().unwrap(), vec![0, 0, 200, 200]);
+        // 16-bit sources come back exactly, whatever the layout hop.
+        let rgb16: Vec<u8> = vec![0x34, 0x12, 0x78, 0x56, 0xbc, 0x9a];
+        let deep = Image::from_raw(1, 1, PixelFormat::Rgb48Le, rgb16.clone()).unwrap();
+        assert_eq!(deep.to_rgb16().unwrap(), rgb16);
+        assert_eq!(
+            deep.to_rgba16().unwrap(),
+            vec![0x34, 0x12, 0x78, 0x56, 0xbc, 0x9a, 0xff, 0xff]
+        );
+        let g16 = Image::from_raw(1, 1, PixelFormat::Gray16Le, vec![0xcd, 0xab]).unwrap();
+        assert_eq!(g16.to_gray16().unwrap(), vec![0xcd, 0xab]);
+        assert_eq!(
+            g16.to_rgb16().unwrap(),
+            vec![0xcd, 0xab, 0xcd, 0xab, 0xcd, 0xab]
+        );
+        let rgba16 =
+            Image::from_raw(1, 1, PixelFormat::Rgba64Le, vec![1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        assert_eq!(rgba16.to_rgb16().unwrap(), vec![1, 2, 3, 4, 5, 6]);
+        // Widening then narrowing is the identity on 8-bit data.
+        let wide = Image::from_raw(1, 1, PixelFormat::Rgb48Le, img.to_rgb16().unwrap()).unwrap();
+        assert_eq!(wide.to_rgb8().unwrap(), vec![255, 0, 128]);
+    }
+
+    #[test]
+    fn deep_routes_only_where_pixfmt_has_no_direct_step() {
+        use PixelFormat as P;
+        assert_eq!(deep_route(P::Gray16Le, P::Gray16Le), None);
+        assert_eq!(deep_route(P::Rgb24, P::Rgb48Le), None);
+        assert_eq!(deep_route(P::Rgb48Le, P::Rgba64Le), None);
+        assert_eq!(deep_route(P::Rgb48Le, P::Gray8), None);
+        let r = deep_route(P::Gray16Le, P::Rgb48Le).unwrap();
+        assert!(!r.is_empty() && r.len() <= 3);
+        assert!(r.iter().all(|f| DEEP_PIVOTS.contains(f)));
+        assert!(deep_route(P::Rgb48Le, P::Gray16Le).is_some());
     }
 
     #[test]

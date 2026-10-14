@@ -79,6 +79,8 @@ fn every_packed_layout_decodes_to_its_tight_plane() {
         assert_eq!(rgba.len(), 5 * 3 * 4, "{f:?}");
         let rgb = img.to_rgb8().unwrap();
         assert_eq!(rgb.len(), 5 * 3 * 3, "{f:?}");
+        assert_eq!(img.to_rgb16().unwrap().len(), 5 * 3 * 6, "{f:?}: rgb16");
+        assert_eq!(img.to_gray16().unwrap().len(), 5 * 3 * 2, "{f:?}: gray16");
     }
 }
 
@@ -97,6 +99,7 @@ fn planar_layouts_decode_and_convert() {
             .flat_map(|p| p.data.iter().copied())
             .collect();
         assert_eq!(img.to_rgba8().unwrap().len(), 5 * 3 * 4, "{f:?}");
+        assert_eq!(img.to_rgb16().unwrap().len(), 5 * 3 * 6, "{f:?}: rgb16");
         assert_eq!(img.into_raw(), expected, "{f:?}: into_raw");
     }
 }

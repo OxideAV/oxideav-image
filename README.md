@@ -50,7 +50,7 @@ let apng = encode_frames(&ctx, file.frames(), "png", &SaveOptions::default())?;
 | `open(&ctx, path)` / `open_with(.., &OpenOptions)` | Probe the file (extension as hint), open its demuxer, decode every video stream → `ImageFile`. |
 | `decode_bytes(&ctx, &[u8])` / `decode_vec(&ctx, Vec<u8>)` / `decode_reader(&ctx, Box<dyn ReadSeek>, &OpenOptions)` | Same from memory (`decode_vec` without a copy) or any seekable reader. `*_with` variants take `OpenOptions`. |
 | `ImageFile` | `container()`, `metadata()`, `primary()`, `frames()`, `frames_mut()`, `iter()`, `into_frames()`, `into_primary()`, `len()`; `IntoIterator` for `ImageFile` and `&ImageFile`. |
-| `Image` | A `VideoFrame` + `CodecParameters`: `width` / `height` / `format` / `color_signal` / `palette`; `delay`, `timestamp`, `stream`, `index`, `raw_timing`, `time_base`; `to_format(PixelFormat)`, `to_gray8`, `to_rgb8`, `to_rgba8`, `to_rgba16`, `to_packed`, `as_packed`, `into_raw`, `crop`, `with_delay`, `with_color_signal`, `frame`, `params`, `into_video_frame`. |
+| `Image` | A `VideoFrame` + `CodecParameters`: `width` / `height` / `format` / `color_signal` / `palette`; `delay`, `timestamp`, `stream`, `index`, `raw_timing`, `time_base`; `to_format(PixelFormat)`, `to_gray8`, `to_rgb8`, `to_rgba8`, `to_gray16`, `to_rgb16`, `to_rgba16`, `to_packed`, `as_packed`, `into_raw`, `crop`, `with_delay`, `with_color_signal`, `frame`, `params`, `into_video_frame`. |
 | `Image::from_rgb8` / `from_rgba8` / `from_raw` / `from_planes` / `from_video_frame` | Fallible constructors: geometry, plane count, stride and length are validated. |
 | `encode(&ctx, &Image, "png", &SaveOptions)` / `encode_frames(&ctx, &[Image], ..)` / `save(&ctx, &Image, path, ..)` | Encoder + muxer by container name or extension; see *Format resolution* and *Pixel-format ladder*. |
 | `encoder_options(&ctx, format, &SaveOptions)` | The option schema of the encoder `encode` would use (names for `SaveOptions::with_option`). |
@@ -60,9 +60,22 @@ let apng = encode_frames(&ctx, file.frames(), "png", &SaveOptions::default())?;
 | `ImageError` (`Error`) | `#[non_exhaustive]`: see *Errors*. |
 
 All conversions go through `oxideav-pixfmt`; `to_gray8` / `to_rgb8` /
-`to_rgba8` / `to_rgba16` return rows without padding. The colour signal
-used for YCbCr ↔ RGB is the frame's own record, else the stream-level
-one from the container, else pixfmt's defaults.
+`to_rgba8` / `to_gray16` / `to_rgb16` / `to_rgba16` return rows without
+padding. The colour signal used for YCbCr ↔ RGB is the frame's own
+record, else the stream-level one from the container, else pixfmt's
+defaults.
+
+**16-bit views (`to_gray16` / `to_rgb16` / `to_rgba16`)** are the
+lossless path for texture consumers. The depth rule: a 16-bit source is
+returned exactly (its samples are never requantised, whatever the
+layout hop — grey ↔ RGB ↔ RGBA at 16 bits stage only through 16-bit
+pivots, never through an 8-bit one); an 8-bit sample `s` widens to
+`s × 257` (`0 → 0`, `255 → 65535`, every value exactly representable
+back); 10- / 12-bit samples scale to the 16-bit full range the same
+way; deep YCbCr goes through the colour matrix at 16-bit precision.
+Grey of a colour source is pixfmt's grey derivation (the rounded mean
+of R, G, B) at the view's depth. Alpha is opaque (`65535`) when the
+source has none.
 
 ### Format resolution
 
@@ -208,7 +221,8 @@ of parsing the header itself.
 
 Unit tests run against a synthetic `OXIM` container + codec pair
 registered exactly like a sibling crate (probe by magic and by extension
-hint, 14 packed and planar layouts, `Pal8` with its palette, multi-frame
+hint, 14 packed and planar layouts, `Pal8` with its palette, exact
+16-bit views, multi-frame
 timing in every mode, allow / deny lists, the ladder against a layout-refusing codec, an encoder that declares
 no layouts (colour before grey) and a layout-refusing muxer, options, limits, every error variant). The
 umbrella's `crates/oxideav-tests/tests/image_gateway.rs` runs the gateway

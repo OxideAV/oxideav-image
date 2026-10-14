@@ -33,7 +33,7 @@ fn family(f: PixelFormat) -> Family {
 }
 
 /// More than eight bits per sample (integer deep tiers and float).
-fn is_deep(f: PixelFormat) -> bool {
+pub(crate) fn is_deep(f: PixelFormat) -> bool {
     if f.is_float() {
         return true;
     }

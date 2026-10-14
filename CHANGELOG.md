@@ -23,6 +23,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ImageError::Restricted`. The field shapes mirror `oxideav-io`'s
   (`Option<Vec<String>>` allow = any when `None`, `Vec<String>` deny,
   case-insensitive) so io can hand its lists through.
+- `Image::to_rgb16` (`Rgb48Le`) and `Image::to_gray16` (`Gray16Le`)
+  beside `to_rgba16`: the lossless 16-bit views for texture consumers.
+  Rule: 16-bit sources come back exactly, 8-bit samples widen as
+  `s × 257`, 10- / 12-bit scale to full range, deep YCbCr goes through
+  the 16-bit matrix. `Image::to_format` now stages a deep source asked
+  for a 16-bit view through 16-bit pivots when pixfmt has no direct
+  step (pixfmt's own staging pivots `Gray16Le → Rgb48Le` and
+  `Rgb48Le → Gray16Le` through `Gray8`, which narrowed).
 
 ### Fixed
 
