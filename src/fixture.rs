@@ -36,6 +36,9 @@ pub(crate) const CONTAINER_RGB_ONLY: &str = "oximrgb";
 pub(crate) const CONTAINER_NO_DECODER: &str = "oximnodec";
 pub(crate) const CODEC: &str = "oxim";
 pub(crate) const CODEC_YUV_ONLY: &str = "oxim_yuv";
+/// Declares no accepted layouts (like a video codec) but takes only
+/// 4:2:0 / 4:4:4 YCbCr and 4:0:0 grey.
+pub(crate) const CODEC_UNDECLARED: &str = "oxim_undeclared";
 pub(crate) const CODEC_NO_DECODER: &str = "oxim_nodec";
 const MAGIC: &[u8; 4] = b"OXIM";
 pub(crate) const FLAG_DURATIONS: u8 = 1;
@@ -360,6 +363,18 @@ fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
 
 fn make_encoder_yuv(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     make_encoder_for(CODEC_YUV_ONLY, &[PixelFormat::Yuv420P], params)
+}
+
+fn make_encoder_undeclared(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+    make_encoder_for(
+        CODEC_UNDECLARED,
+        &[
+            PixelFormat::Yuv420P,
+            PixelFormat::Yuv444P,
+            PixelFormat::Gray8,
+        ],
+        params,
+    )
 }
 
 impl Encoder for OximEncoder {
@@ -728,6 +743,12 @@ pub(crate) fn register(ctx: &mut RuntimeContext) {
             )
             .decoder(make_decoder)
             .encoder(make_encoder_yuv),
+    );
+    ctx.codecs.register(
+        CodecInfo::new(CodecId::new(CODEC_UNDECLARED))
+            .capabilities(CodecCapabilities::video("oxim_undeclared_sw").with_intra_only(true))
+            .decoder(make_decoder)
+            .encoder(make_encoder_undeclared),
     );
     let c = &mut ctx.containers;
     c.register_demuxer(CONTAINER, open_demuxer);

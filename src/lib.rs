@@ -43,6 +43,7 @@
 
 mod error;
 mod image;
+mod ladder;
 mod open;
 mod save;
 

@@ -199,6 +199,45 @@ fn ladder_steps_to_a_layout_the_codec_accepts() {
 }
 
 #[test]
+fn ladder_offers_colour_before_grey_to_an_undeclared_encoder() {
+    // r474 ruling: an RGB picture sent to an encoder that declares no
+    // accepted layouts (and takes YCbCr or grey) must not arrive grey.
+    let ctx = fixture::ctx();
+    let rgb: Vec<u8> = (0..4 * 4 * 3).map(|i| (i * 7) as u8).collect();
+    let img = Image::from_rgb8(4, 4, rgb).unwrap();
+    let opts = SaveOptions::new().with_codec(fixture::CODEC_UNDECLARED);
+    let bytes = encode(&ctx, &img, "oxim", &opts).unwrap();
+    let back = decode_bytes(&ctx, &bytes).unwrap().into_primary();
+    assert_eq!(
+        back.format(),
+        PixelFormat::Yuv444P,
+        "highest-fidelity colour rung"
+    );
+    // The same with alpha: still colour, still 4:4:4.
+    let rgba = Image::from_rgba8(4, 4, (0..64).collect()).unwrap();
+    let bytes = encode(&ctx, &rgba, "oxim", &opts).unwrap();
+    assert_eq!(
+        decode_bytes(&ctx, &bytes).unwrap().primary().format(),
+        PixelFormat::Yuv444P
+    );
+    // A 4:2:0 source stays 4:2:0; a grey source stays grey.
+    let yuv = decode_bytes(&ctx, &still(PixelFormat::Yuv420P).encode())
+        .unwrap()
+        .into_primary();
+    let bytes = encode(&ctx, &yuv, "oxim", &opts).unwrap();
+    assert_eq!(
+        decode_bytes(&ctx, &bytes).unwrap().primary().format(),
+        PixelFormat::Yuv420P
+    );
+    let grey = Image::from_raw(4, 4, PixelFormat::Gray8, vec![9; 16]).unwrap();
+    let bytes = encode(&ctx, &grey, "oxim", &opts).unwrap();
+    assert_eq!(
+        decode_bytes(&ctx, &bytes).unwrap().primary().format(),
+        PixelFormat::Gray8
+    );
+}
+
+#[test]
 fn ladder_steps_when_the_muxer_refuses_a_layout() {
     let ctx = fixture::ctx();
     let rgba: Vec<u8> = (0..3 * 2 * 4).map(|i| (i * 5) as u8).collect();

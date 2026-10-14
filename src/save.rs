@@ -6,14 +6,13 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::error::{Error, Result};
+use crate::image::{duration_to_ticks, Image};
+use crate::ladder;
 use oxideav_core::{
     CodecId, CodecParameters, Frame, MediaType, OptionField, Packet, PixelFormat, RuntimeContext,
     StreamInfo, TimeBase,
 };
-use oxideav_pixfmt::supports;
-
-use crate::error::{Error, Result};
-use crate::image::{duration_to_ticks, Image};
 
 /// Knobs for [`encode`] / [`encode_frames`] / [`save`].
 #[derive(Clone, Debug, Default)]
@@ -209,7 +208,7 @@ pub fn encode_frames(
         }
     }
 
-    let candidates = candidates(first.format(), opts);
+    let candidates = candidates(ctx, &codec_id, first.format(), opts);
     let mut first_err: Option<Error> = None;
     let mut same = true;
     let mut attempts: Vec<String> = Vec::new();
@@ -347,26 +346,29 @@ fn default_codec_for_container(
 }
 
 /// Encoder input layouts to try, in order: the forced one, else the
-/// image's own layout followed by the common packed and planar
-/// fallbacks the converter can reach from it.
-fn candidates(src: PixelFormat, opts: &SaveOptions) -> Vec<PixelFormat> {
+/// ladder of [`crate::ladder`] for the picture's own layout and the
+/// encoder's declared accepted set.
+fn candidates(
+    ctx: &RuntimeContext,
+    codec_id: &CodecId,
+    src: PixelFormat,
+    opts: &SaveOptions,
+) -> Vec<PixelFormat> {
     if let Some(f) = opts.pixel_format {
         return vec![f];
     }
-    let mut out = vec![src];
-    for f in [
-        PixelFormat::Rgba,
-        PixelFormat::Rgb24,
-        PixelFormat::Gray8,
-        PixelFormat::Yuv444P,
-        PixelFormat::Yuv420P,
-        PixelFormat::Rgba64Le,
-    ] {
-        if !out.contains(&f) && supports(src, f) {
-            out.push(f);
-        }
-    }
-    out
+    ladder::ladder(src, &declared_formats(ctx, codec_id))
+}
+
+/// The accepted input layouts the encoder `first_encoder` picks for
+/// `codec_id` declares (empty = undeclared).
+fn declared_formats(ctx: &RuntimeContext, codec_id: &CodecId) -> Vec<PixelFormat> {
+    ctx.codecs
+        .implementations(codec_id)
+        .iter()
+        .find(|i| i.make_encoder.is_some())
+        .map(|i| i.caps.accepted_pixel_formats.clone())
+        .unwrap_or_default()
 }
 
 /// One attempt in a fixed layout: convert every picture, encode, mux

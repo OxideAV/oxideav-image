@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Pixel-format ladder: colour before grey (`IMAGE_CRATE_API.md` round-474
+  ruling). An encoder that declares no accepted layouts is offered the
+  source's own colour family, then the other colour family (`Yuv444P` /
+  `Yuv422P` / `Yuv420P` for RGB sources), and `Gray8` only last; an RGB
+  picture no longer arrives grey at a YCbCr-or-grey video encoder. An
+  encoder that declares its layouts is offered exactly those, sorted by
+  the same rule (source layout, own family by decreasing fidelity, other
+  colour family, grey). The rule is stated in the README.
+
 ## [0.0.2](https://github.com/OxideAV/oxideav-image/compare/v0.0.1...v0.0.2) - 2026-10-05
 
 ### Other

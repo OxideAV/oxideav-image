@@ -87,13 +87,32 @@ one from the container, else pixfmt's defaults.
 
 ### Pixel-format ladder
 
-`encode` hands the encoder the picture's own layout first, then — when
-the encoder or the muxer refuses it — the common layouts pixfmt can
-reach from it, in order: `Rgba`, `Rgb24`, `Gray8`, `Yuv444P`,
-`Yuv420P`, `Rgba64Le`. `SaveOptions::pixel_format` replaces the ladder
-by a single layout. When every rung fails for the same reason (an
-unknown option, a muxer refusing the stream) that error is returned
-unchanged; otherwise `Unsupported` lists what each rung hit.
+`encode` hands the encoder the picture's own layout first and, when the
+encoder or the muxer refuses it, steps through other layouts pixfmt
+can reach from it. The order is a rule, not a table:
+
+1. the source layout;
+2. the colour layouts of the source's own family (RGB or YCbCr), in the
+   source's bit tier first, alpha kept when the source has it; YCbCr
+   rungs at or below the source by decreasing chroma fidelity, then
+   above it, closest first (a 4:2:0 source offers 4:2:2 before 4:4:4);
+3. the other colour family the same way;
+4. grey (`Gray8` / `Gray16Le` / `Ya8`) **last** — only when the source
+   is grey (then it comes first, followed by RGB, which is exact for
+   grey) or when nothing colour was accepted.
+
+An encoder that declares its accepted layouts
+(`CodecCapabilities::accepted_pixel_formats`) is offered exactly those,
+sorted by the same rule (the source itself only when it is declared).
+One that declares nothing — a video codec taking 4:2:0 / 4:4:4 / 4:0:0,
+say — gets the fixed rungs `Rgba`, `Rgb24`, `Rgba64Le`, `Rgb48Le`,
+`Yuva444P`, `Yuva420P`, `Yuv444P`, `Yuv422P`, `Yuv420P`, `Yuv444P10Le`,
+`Yuv420P10Le`, `Yuv444P16Le`, `Ya8`, `Gray8`, `Gray16Le`, sorted the same
+way; an RGB picture therefore reaches such an encoder as 4:4:4 YCbCr,
+never as grey. `SaveOptions::pixel_format` replaces the ladder by a
+single layout. When every rung fails for the same reason (an unknown
+option, a muxer refusing the stream) that error is returned unchanged;
+otherwise `Unsupported` lists what each rung hit.
 
 ### Options
 
@@ -170,8 +189,8 @@ the budget has to cover. `decode_bytes(&[u8])` copies the slice once
 Unit tests run against a synthetic `OXIM` container + codec pair
 registered exactly like a sibling crate (probe by magic and by extension
 hint, 14 packed and planar layouts, `Pal8` with its palette, multi-frame
-timing in every mode, the ladder against a layout-refusing codec and a
-layout-refusing muxer, options, limits, every error variant). The
+timing in every mode, the ladder against a layout-refusing codec, an encoder that declares
+no layouts (colour before grey) and a layout-refusing muxer, options, limits, every error variant). The
 umbrella's `crates/oxideav-tests/tests/image_gateway.rs` runs the gateway
 over the real format crates through `oxideav_meta::register_all`.
 
