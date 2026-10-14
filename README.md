@@ -52,7 +52,7 @@ let apng = encode_frames(&ctx, file.frames(), "png", &SaveOptions::default())?;
 | `ImageFile` | `container()`, `metadata()`, `primary()`, `frames()`, `frames_mut()`, `iter()`, `into_frames()`, `into_primary()`, `len()`; `IntoIterator` for `ImageFile` and `&ImageFile`. |
 | `Image` | A `VideoFrame` + `CodecParameters`: `width` / `height` / `format` / `color_signal` / `palette`; `delay`, `timestamp`, `stream`, `index`, `raw_timing`, `time_base`; `to_format(PixelFormat)`, `to_gray8`, `to_rgb8`, `to_rgba8`, `to_gray16`, `to_rgb16`, `to_rgba16`, `to_packed`, `as_packed`, `into_raw`, `crop`, `with_delay`, `with_color_signal`, `frame`, `params`, `into_video_frame`. |
 | `Image::from_rgb8` / `from_rgba8` / `from_raw` / `from_planes` / `from_video_frame` | Fallible constructors: geometry, plane count, stride and length are validated. |
-| `encode(&ctx, &Image, "png", &SaveOptions)` / `encode_frames(&ctx, &[Image], ..)` / `save(&ctx, &Image, path, ..)` | Encoder + muxer by container name or extension; see *Format resolution* and *Pixel-format ladder*. |
+| `encode(&ctx, &Image, "png", &SaveOptions)` / `encode_frames(&ctx, &[Image], ..)` / `save(&ctx, &Image, path, ..)` | Encoder + muxer by container name or extension; see *Format resolution*, *Pixel-format ladder* and *Geometry*. |
 | `encoder_options(&ctx, format, &SaveOptions)` | The option schema of the encoder `encode` would use (names for `SaveOptions::with_option`). |
 | `can_encode(&ctx, format)` / `resolve_target(&ctx, format, &SaveOptions)` | "Will this save?" before decoding: `can_encode` is a yes / no; `resolve_target` returns the `EncodeTarget` (`format()`, `container()` / `is_codec_only()`, `codec()`, `accepted_pixel_formats()`, `options()`, `ladder(src, &opts)`) or the error `encode` would return before looking at a picture. |
 | `OpenOptions` | `max_frames`, `ext_hint`, `decoder_options`, `max_pixels`, `allow_containers` / `deny_containers` / `allow_codecs` / `deny_codecs`. |
@@ -143,6 +143,19 @@ options strictly; a lossless encoder would reject the unknown name).
 come from `encoder_options`. `OpenOptions::with_decoder_option` does the
 same on the decoding side.
 
+### Geometry
+
+`encode_frames` never resizes. Pictures of one size share an output
+stream; every distinct size, in first-appearance order, is a further
+video stream of its own — the shape ICO entries and EXR parts take
+through the framework. A container whose muxer takes several streams
+(ico, exr) writes the set; one whose muxer takes a single geometry
+refuses it, and the gateway reports that as `Unsupported` naming the
+geometries (`"container 'png' refused 2 picture geometries (16x16,
+32x32): …"`). A codec-only format (one packet, no muxer) refuses mixed
+geometries before anything is encoded. `Image::stream()` on the decoded
+side tells which stream each picture came from.
+
 ### Timing
 
 Delays are read from the stream, never from a format table:
@@ -195,8 +208,8 @@ of parsing the header itself.
 | `Io` | File or stream I/O failed. |
 | `UnknownFormat` | No container probed the input, the name / extension matches nothing with a muxer, or the extension belongs to a codec-only crate with no demuxer. |
 | `NoImage` | A container matched but holds no video stream with a registered decoder, or decoded no picture. |
-| `Unsupported` | No encoder for the codec, no layout of the ladder accepted, a planar layout asked for as packed bytes, a `crop` origin off the chroma grid or on a bit-packed layout. |
-| `InvalidData` | Caller data inconsistent with its geometry (buffer length, plane count, stride), a crop window outside the picture, mixed geometries in `encode_frames`, a stream without a pixel format. |
+| `Unsupported` | No encoder for the codec, no layout of the ladder accepted, mixed geometries into a one-geometry container or a codec-only format, a planar layout asked for as packed bytes, a `crop` origin off the chroma grid or on a bit-packed layout. |
+| `InvalidData` | Caller data inconsistent with its geometry (buffer length, plane count, stride), a crop window outside the picture, a stream without a pixel format. |
 | `LimitExceeded` | `max_pixels` would be exceeded. |
 | `Restricted` | The probed container or a video stream's codec is refused by the allow / deny lists; nothing was decoded. |
 | `Core` | A registry, demuxer, decoder, muxer or encoder error, unchanged. |
@@ -224,7 +237,8 @@ registered exactly like a sibling crate (probe by magic and by extension
 hint, 14 packed and planar layouts, `Pal8` with its palette, exact
 16-bit views, multi-frame
 timing in every mode, allow / deny lists, the ladder against a layout-refusing codec, an encoder that declares
-no layouts (colour before grey) and a layout-refusing muxer, options, limits, every error variant). The
+no layouts (colour before grey) and a layout-refusing muxer, mixed
+geometries into a multi-stream container and into a one-geometry one, options, limits, every error variant). The
 umbrella's `crates/oxideav-tests/tests/image_gateway.rs` runs the gateway
 over the real format crates through `oxideav_meta::register_all`.
 

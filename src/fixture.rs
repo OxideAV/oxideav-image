@@ -34,6 +34,9 @@ use oxideav_core::{
 pub(crate) const CONTAINER: &str = "oxim";
 pub(crate) const CONTAINER_RGB_ONLY: &str = "oximrgb";
 pub(crate) const CONTAINER_NO_DECODER: &str = "oximnodec";
+/// Several OXIM blocks back to back: one video stream per block, so the
+/// muxer takes any number of geometries (the ICO / EXR shape).
+pub(crate) const CONTAINER_MULTI: &str = "oximmulti";
 pub(crate) const CODEC: &str = "oxim";
 pub(crate) const CODEC_YUV_ONLY: &str = "oxim_yuv";
 /// Declares no accepted layouts (like a video codec) but takes only
@@ -451,9 +454,11 @@ struct OximDemuxer {
     name: &'static str,
     streams: Vec<StreamInfo>,
     metadata: Vec<(String, String)>,
-    frames: std::collections::VecDeque<(u32, Vec<u8>)>,
+    /// `(stream, delay_ms, payload)` in file order.
+    frames: std::collections::VecDeque<(u32, u32, Vec<u8>)>,
     flags: u8,
-    pts: i64,
+    /// Running pts per stream.
+    pts: Vec<i64>,
 }
 
 struct Header {
@@ -500,64 +505,114 @@ fn parse_header(buf: &[u8]) -> Result<Header> {
     })
 }
 
-fn open_demuxer_named(
-    name: &'static str,
-    codec: &str,
-    mut input: Box<dyn ReadSeek>,
-) -> Result<Box<dyn Demuxer>> {
-    input.seek(SeekFrom::Start(0))?;
-    let mut buf = Vec::new();
-    input.read_to_end(&mut buf)?;
-    let hdr = parse_header(&buf)?;
-    let mut at = hdr.body;
-    let mut frames = std::collections::VecDeque::new();
+/// One parsed OXIM block: its stream, metadata, frames, flags and where
+/// the next block starts.
+struct Block {
+    info: StreamInfo,
+    metadata: Vec<(String, String)>,
+    frames: Vec<(u32, u32, Vec<u8>)>,
+    flags: u8,
+    next: usize,
+}
+
+/// Parse one OXIM block at `at`.
+fn parse_block(buf: &[u8], at: usize, stream: u32, codec: &str) -> Result<Block> {
+    let hdr = parse_header(&buf[at..])?;
+    let mut pos = at + hdr.body;
+    let mut frames = Vec::new();
     for _ in 0..hdr.frames {
-        let delay = rd_u32(&buf, at)?;
-        let len = rd_u32(&buf, at + 4)? as usize;
+        let delay = rd_u32(buf, pos)?;
+        let len = rd_u32(buf, pos + 4)? as usize;
         let payload = buf
-            .get(at + 8..at + 8 + len)
+            .get(pos + 8..pos + 8 + len)
             .ok_or_else(|| Error::invalid("oxim: truncated frame"))?
             .to_vec();
-        at += 8 + len;
-        frames.push_back((delay, payload));
+        pos += 8 + len;
+        frames.push((stream, delay, payload));
     }
     let mut params = CodecParameters::video(CodecId::new(codec));
     params.width = Some(hdr.width);
     params.height = Some(hdr.height);
     params.pixel_format = Some(hdr.format);
-    let total: i64 = frames.iter().map(|(d, _)| *d as i64).sum();
-    Ok(Box::new(OximDemuxer {
-        name,
-        streams: vec![StreamInfo {
-            index: 0,
-            time_base: TIME_BASE,
-            duration: Some(total),
-            start_time: Some(0),
-            params,
-        }],
+    let total: i64 = frames.iter().map(|(_, d, _)| *d as i64).sum();
+    let info = StreamInfo {
+        index: stream,
+        time_base: TIME_BASE,
+        duration: Some(total),
+        start_time: Some(0),
+        params,
+    };
+    Ok(Block {
+        info,
         metadata: hdr.metadata,
         frames,
         flags: hdr.flags,
-        pts: 0,
+        next: pos,
+    })
+}
+
+fn open_demuxer_named(
+    name: &'static str,
+    codec: &str,
+    multi: bool,
+    mut input: Box<dyn ReadSeek>,
+) -> Result<Box<dyn Demuxer>> {
+    input.seek(SeekFrom::Start(0))?;
+    let mut buf = Vec::new();
+    input.read_to_end(&mut buf)?;
+    let mut streams = Vec::new();
+    let mut metadata = Vec::new();
+    let mut frames = std::collections::VecDeque::new();
+    let mut flags = None;
+    let mut at = 0;
+    loop {
+        let block = parse_block(&buf, at, streams.len() as u32, codec)?;
+        streams.push(block.info);
+        if metadata.is_empty() {
+            metadata = block.metadata;
+        }
+        frames.extend(block.frames);
+        flags.get_or_insert(block.flags);
+        at = block.next;
+        if !multi || at >= buf.len() {
+            break;
+        }
+    }
+    let flags = flags.unwrap_or(0);
+    let n = streams.len();
+    Ok(Box::new(OximDemuxer {
+        name,
+        streams,
+        metadata,
+        frames,
+        flags,
+        pts: vec![0; n],
     }))
 }
 
 fn open_demuxer(input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
-    open_demuxer_named(CONTAINER, CODEC, input)
+    open_demuxer_named(CONTAINER, CODEC, false, input)
+}
+
+fn open_demuxer_multi(
+    input: Box<dyn ReadSeek>,
+    _codecs: &dyn CodecResolver,
+) -> Result<Box<dyn Demuxer>> {
+    open_demuxer_named(CONTAINER_MULTI, CODEC, true, input)
 }
 
 fn open_demuxer_rgb(
     input: Box<dyn ReadSeek>,
     _codecs: &dyn CodecResolver,
 ) -> Result<Box<dyn Demuxer>> {
-    open_demuxer_named(CONTAINER_RGB_ONLY, CODEC, input)
+    open_demuxer_named(CONTAINER_RGB_ONLY, CODEC, false, input)
 }
 
 fn open_demuxer_nodec(
     input: Box<dyn ReadSeek>,
     _codecs: &dyn CodecResolver,
 ) -> Result<Box<dyn Demuxer>> {
-    open_demuxer_named(CONTAINER_NO_DECODER, CODEC_NO_DECODER, input)
+    open_demuxer_named(CONTAINER_NO_DECODER, CODEC_NO_DECODER, false, input)
 }
 
 impl Demuxer for OximDemuxer {
@@ -574,17 +629,18 @@ impl Demuxer for OximDemuxer {
     }
 
     fn next_packet(&mut self) -> Result<Packet> {
-        let (delay, payload) = self.frames.pop_front().ok_or(Error::Eof)?;
-        let mut pkt = Packet::new(0, TIME_BASE, payload);
+        let (stream, delay, payload) = self.frames.pop_front().ok_or(Error::Eof)?;
+        let mut pkt = Packet::new(stream, TIME_BASE, payload);
+        let pts = &mut self.pts[stream as usize];
         if self.flags & FLAG_NO_PTS == 0 {
-            pkt.pts = Some(self.pts);
-            pkt.dts = Some(self.pts);
+            pkt.pts = Some(*pts);
+            pkt.dts = Some(*pts);
         }
         if self.flags & FLAG_DURATIONS != 0 {
             pkt.duration = Some(delay as i64);
         }
         pkt.flags.keyframe = true;
-        self.pts += delay as i64;
+        *pts += delay as i64;
         Ok(pkt)
     }
 }
@@ -592,45 +648,58 @@ impl Demuxer for OximDemuxer {
 struct OximMuxer {
     name: &'static str,
     output: Box<dyn WriteSeek>,
-    stream: StreamInfo,
+    streams: Vec<StreamInfo>,
     packets: Vec<Packet>,
 }
 
 fn open_muxer_named(
     name: &'static str,
     rgb_only: bool,
+    multi: bool,
     output: Box<dyn WriteSeek>,
     streams: &[StreamInfo],
 ) -> Result<Box<dyn Muxer>> {
-    if streams.len() != 1 || streams[0].params.media_type != MediaType::Video {
-        return Err(Error::invalid("oxim muxer: exactly one video stream"));
-    }
-    let f = streams[0]
-        .params
-        .pixel_format
-        .ok_or_else(|| Error::invalid("oxim muxer: stream has no pixel format"))?;
-    if rgb_only && f != PixelFormat::Rgb24 {
-        return Err(Error::unsupported(format!(
-            "oximrgb muxer accepts Rgb24 streams only, not {f:?}"
+    if streams.is_empty() || (!multi && streams.len() != 1) {
+        return Err(Error::invalid(format!(
+            "{name} muxer: exactly one video stream, {} given",
+            streams.len()
         )));
     }
-    if tag_of(f).is_none() {
-        return Err(Error::unsupported(format!("oxim muxer: no tag for {f:?}")));
+    for s in streams {
+        if s.params.media_type != MediaType::Video {
+            return Err(Error::invalid("oxim muxer: video streams only"));
+        }
+        let f = s
+            .params
+            .pixel_format
+            .ok_or_else(|| Error::invalid("oxim muxer: stream has no pixel format"))?;
+        if rgb_only && f != PixelFormat::Rgb24 {
+            return Err(Error::unsupported(format!(
+                "oximrgb muxer accepts Rgb24 streams only, not {f:?}"
+            )));
+        }
+        if tag_of(f).is_none() {
+            return Err(Error::unsupported(format!("oxim muxer: no tag for {f:?}")));
+        }
     }
     Ok(Box::new(OximMuxer {
         name,
         output,
-        stream: streams[0].clone(),
+        streams: streams.to_vec(),
         packets: Vec::new(),
     }))
 }
 
 fn open_muxer(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<dyn Muxer>> {
-    open_muxer_named(CONTAINER, false, output, streams)
+    open_muxer_named(CONTAINER, false, false, output, streams)
 }
 
 fn open_muxer_rgb(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<dyn Muxer>> {
-    open_muxer_named(CONTAINER_RGB_ONLY, true, output, streams)
+    open_muxer_named(CONTAINER_RGB_ONLY, true, false, output, streams)
+}
+
+fn open_muxer_multi(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<dyn Muxer>> {
+    open_muxer_named(CONTAINER_MULTI, false, true, output, streams)
 }
 
 impl Muxer for OximMuxer {
@@ -648,34 +717,41 @@ impl Muxer for OximMuxer {
     }
 
     fn write_trailer(&mut self) -> Result<()> {
-        let p = &self.stream.params;
         let mut out = Vec::new();
-        out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&p.width.unwrap_or(0).to_le_bytes());
-        out.extend_from_slice(&p.height.unwrap_or(0).to_le_bytes());
-        out.push(tag_of(p.pixel_format.unwrap_or(PixelFormat::Rgba)).expect("checked at open"));
-        out.push(FLAG_DURATIONS);
-        out.extend_from_slice(&(self.packets.len() as u32).to_le_bytes());
-        let mut meta = format!("muxer={}\n", self.name).into_bytes();
-        for (k, v) in p.options.iter() {
-            meta.extend_from_slice(format!("{k}={v}\n").as_bytes());
-        }
-        out.extend_from_slice(&(meta.len() as u16).to_le_bytes());
-        out.extend_from_slice(&meta);
-        // Delays: the packet's duration in its own time base, else the
-        // gap to the next packet, else 0 — rescaled to milliseconds.
-        for (i, pkt) in self.packets.iter().enumerate() {
-            let dur = pkt.duration.or_else(|| {
-                let next = self.packets.get(i + 1)?.pts?;
-                Some(next - pkt.pts?)
-            });
-            let delay_ms = dur
-                .map(|d| pkt.time_base.rescale(d, TIME_BASE))
-                .unwrap_or(0)
-                .max(0) as u32;
-            out.extend_from_slice(&delay_ms.to_le_bytes());
-            out.extend_from_slice(&(pkt.data.len() as u32).to_le_bytes());
-            out.extend_from_slice(&pkt.data);
+        for (si, stream) in self.streams.iter().enumerate() {
+            let p = &stream.params;
+            out.extend_from_slice(MAGIC);
+            out.extend_from_slice(&p.width.unwrap_or(0).to_le_bytes());
+            out.extend_from_slice(&p.height.unwrap_or(0).to_le_bytes());
+            out.push(tag_of(p.pixel_format.unwrap_or(PixelFormat::Rgba)).expect("checked at open"));
+            out.push(FLAG_DURATIONS);
+            let packets: Vec<&Packet> = self
+                .packets
+                .iter()
+                .filter(|pkt| pkt.stream_index as usize == si)
+                .collect();
+            out.extend_from_slice(&(packets.len() as u32).to_le_bytes());
+            let mut meta = format!("muxer={}\n", self.name).into_bytes();
+            for (k, v) in p.options.iter() {
+                meta.extend_from_slice(format!("{k}={v}\n").as_bytes());
+            }
+            out.extend_from_slice(&(meta.len() as u16).to_le_bytes());
+            out.extend_from_slice(&meta);
+            // Delays: the packet's duration in its own time base, else the
+            // gap to the next packet, else 0 — rescaled to milliseconds.
+            for (i, pkt) in packets.iter().enumerate() {
+                let dur = pkt.duration.or_else(|| {
+                    let next = packets.get(i + 1)?.pts?;
+                    Some(next - pkt.pts?)
+                });
+                let delay_ms = dur
+                    .map(|d| pkt.time_base.rescale(d, TIME_BASE))
+                    .unwrap_or(0)
+                    .max(0) as u32;
+                out.extend_from_slice(&delay_ms.to_le_bytes());
+                out.extend_from_slice(&(pkt.data.len() as u32).to_le_bytes());
+                out.extend_from_slice(&pkt.data);
+            }
         }
         self.output.write_all(&out)?;
         self.output.flush()?;
@@ -717,6 +793,10 @@ fn probe_rgb(data: &ProbeData) -> ProbeScore {
 
 fn probe_nodec(data: &ProbeData) -> ProbeScore {
     probe_sibling(data, "oximnodec")
+}
+
+fn probe_multi(data: &ProbeData) -> ProbeScore {
+    probe_sibling(data, "oximmulti")
 }
 
 /// Register the synthetic codec and containers into `ctx`, the way a
@@ -762,6 +842,10 @@ pub(crate) fn register(ctx: &mut RuntimeContext) {
     c.register_demuxer(CONTAINER_NO_DECODER, open_demuxer_nodec);
     c.register_extension("oximnodec", CONTAINER_NO_DECODER);
     c.register_probe(CONTAINER_NO_DECODER, probe_nodec);
+    c.register_demuxer(CONTAINER_MULTI, open_demuxer_multi);
+    c.register_muxer(CONTAINER_MULTI, open_muxer_multi);
+    c.register_extension("oximmulti", CONTAINER_MULTI);
+    c.register_probe(CONTAINER_MULTI, probe_multi);
 }
 
 /// A context with only the synthetic pair registered.

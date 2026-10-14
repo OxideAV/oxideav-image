@@ -264,15 +264,22 @@ pub fn encode(
 /// Encode several pictures into one file (animation, burst, sequence or
 /// pages, as the container defines).
 ///
+/// Geometry: pictures of one size share an output stream; every
+/// distinct size (in first-appearance order) is a further stream of
+/// its own, which a multi-geometry container (ICO entries, EXR parts)
+/// accepts and a single-geometry one refuses — the refusal is
+/// `Unsupported` naming the geometries, never a resize. A codec-only
+/// format (one packet, no muxer) refuses mixed geometries the same way.
+///
 /// Timing: every picture's [`Image::delay`] (or
 /// [`SaveOptions::default_delay`]) is rescaled to the stream time base
 /// ([`SaveOptions::time_base`], default milliseconds; 1/100 s for
-/// `png`, the APNG delay unit); frame `pts` are the cumulative delays.
-/// When the encoder returns exactly one packet per picture, the gateway
-/// stamps `pts` / `dts` / `duration` / `time_base` on the packets so
-/// that `decode(encode_frames(..))` reports the same delays regardless
-/// of what the codec did with the frame `pts`; otherwise the encoder's
-/// packet timing is kept.
+/// `png`, the APNG delay unit); frame `pts` are the cumulative delays
+/// within each stream. When the encoder returns exactly one packet per
+/// picture, the gateway stamps `pts` / `dts` / `duration` / `time_base`
+/// on the packets so that `decode(encode_frames(..))` reports the same
+/// delays regardless of what the codec did with the frame `pts`;
+/// otherwise the encoder's packet timing is kept.
 pub fn encode_frames(
     ctx: &RuntimeContext,
     images: &[Image],
@@ -290,17 +297,13 @@ pub fn encode_frames(
         )));
     }
 
-    for img in images {
-        if (img.width(), img.height()) != (first.width(), first.height()) {
-            return Err(Error::invalid(format!(
-                "frame {} is {}x{} but the sequence is {}x{}",
-                img.index(),
-                img.width(),
-                img.height(),
-                first.width(),
-                first.height()
-            )));
-        }
+    let groups = group_by_geometry(images);
+    if groups.len() > 1 && matches!(target, Target::CodecOnly(_)) {
+        return Err(Error::unsupported(format!(
+            "{target} writes one picture geometry per file; {} were given ({})",
+            groups.len(),
+            geometries(&groups)
+        )));
     }
 
     let candidates = candidates(ctx, &codec_id, first.format(), opts);
@@ -308,7 +311,7 @@ pub fn encode_frames(
     let mut same = true;
     let mut attempts: Vec<String> = Vec::new();
     for dst in candidates {
-        match encode_attempt(ctx, images, &target, &codec_id, dst, opts) {
+        match encode_attempt(ctx, images, &groups, &target, &codec_id, dst, opts) {
             Ok(bytes) => return Ok(bytes),
             Err(e) => {
                 let text = e.to_string();
@@ -331,6 +334,39 @@ pub fn encode_frames(
         "no input layout was accepted by encoder '{codec_id}' + {target} — {}",
         attempts.join("; ")
     )))
+}
+
+/// Pictures sharing one geometry: one output stream each.
+struct Group {
+    width: u32,
+    height: u32,
+    /// Indices into the picture slice, in order.
+    members: Vec<usize>,
+}
+
+/// One group per distinct `(width, height)`, in first-appearance order.
+fn group_by_geometry(images: &[Image]) -> Vec<Group> {
+    let mut groups: Vec<Group> = Vec::new();
+    for (i, img) in images.iter().enumerate() {
+        let (w, h) = (img.width(), img.height());
+        match groups.iter_mut().find(|g| g.width == w && g.height == h) {
+            Some(g) => g.members.push(i),
+            None => groups.push(Group {
+                width: w,
+                height: h,
+                members: vec![i],
+            }),
+        }
+    }
+    groups
+}
+
+fn geometries(groups: &[Group]) -> String {
+    groups
+        .iter()
+        .map(|g| format!("{}x{}", g.width, g.height))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Encode one picture and write it to `path`; the extension picks the
@@ -466,20 +502,128 @@ fn declared_formats(ctx: &RuntimeContext, codec_id: &CodecId) -> Vec<PixelFormat
         .unwrap_or_default()
 }
 
-/// One attempt in a fixed layout: convert every picture, encode, mux
-/// into memory.
+/// One attempt in a fixed layout: convert every picture, encode each
+/// geometry group on its own encoder, mux into memory.
 fn encode_attempt(
     ctx: &RuntimeContext,
     images: &[Image],
+    groups: &[Group],
     target: &Target,
     codec_id: &CodecId,
     dst: PixelFormat,
     opts: &SaveOptions,
 ) -> Result<Vec<u8>> {
-    let first = &images[0];
+    let time_base = opts.time_base.unwrap_or_else(|| match target {
+        // The APNG muxer reads `duration` in its 1/100 s delay unit.
+        Target::Container(c) if c == "png" || c == "apng" => TimeBase::new(1, 100),
+        _ => TimeBase::MILLIS,
+    });
+    let default_delay = opts.default_delay.unwrap_or(DEFAULT_DELAY);
+
+    let mut streams: Vec<StreamInfo> = Vec::with_capacity(groups.len());
+    let mut per_group: Vec<Vec<Packet>> = Vec::with_capacity(groups.len());
+    for (gi, g) in groups.iter().enumerate() {
+        let params = encoder_params(ctx, codec_id, g, &images[g.members[0]], dst, opts);
+        let (packets, out_params, total) = encode_group(
+            ctx,
+            images,
+            g,
+            gi as u32,
+            &params,
+            matches!(target, Target::Container(_)),
+            time_base,
+            default_delay,
+        )?;
+        streams.push(StreamInfo {
+            index: gi as u32,
+            time_base,
+            duration: Some(total),
+            start_time: Some(0),
+            params: out_params,
+        });
+        per_group.push(packets);
+    }
+
+    let container = match target {
+        Target::Container(c) => c.as_str(),
+        Target::CodecOnly(id) => {
+            // `encode_frames` admits one group here.
+            let mut packets = per_group.pop().unwrap_or_default();
+            if packets.len() != 1 {
+                return Err(Error::unsupported(format!(
+                    "codec-only format '{id}' produced {} packets for {} picture(s); \
+                     only a single-packet file can be written without a muxer",
+                    packets.len(),
+                    images.len()
+                )));
+            }
+            return Ok(packets.pop().map(|p| p.data).unwrap_or_default());
+        }
+    };
+
+    // Packet order: the pictures' own order when every group produced
+    // one packet per picture, else group by group.
+    let one_each = groups
+        .iter()
+        .zip(&per_group)
+        .all(|(g, p)| g.members.len() == p.len());
+    let packets: Vec<Packet> = if one_each {
+        let mut indexed: Vec<(usize, Packet)> = groups
+            .iter()
+            .zip(per_group)
+            .flat_map(|(g, p)| g.members.iter().copied().zip(p))
+            .collect();
+        indexed.sort_by_key(|(i, _)| *i);
+        indexed.into_iter().map(|(_, p)| p).collect()
+    } else {
+        per_group.into_iter().flatten().collect()
+    };
+
+    // A muxer that takes one geometry refuses the stream set: say which
+    // geometries were asked for instead of handing its error through.
+    let multi = |e: oxideav_core::Error| {
+        if groups.len() > 1 {
+            Error::unsupported(format!(
+                "container '{container}' refused {} picture geometries ({}): {e}",
+                groups.len(),
+                geometries(groups)
+            ))
+        } else {
+            Error::Core(e)
+        }
+    };
+    let sink = SharedCursor::default();
+    let mut muxer = ctx
+        .containers
+        .open_muxer(container, Box::new(sink.clone()), &streams)
+        .map_err(multi)?;
+    muxer.write_header().map_err(multi)?;
+    for pkt in &packets {
+        muxer.write_packet(pkt).map_err(multi)?;
+    }
+    muxer.write_trailer().map_err(multi)?;
+    drop(muxer);
+    let bytes = sink.into_bytes();
+    if bytes.is_empty() {
+        return Err(Error::unsupported(format!(
+            "muxer '{container}' wrote no bytes"
+        )));
+    }
+    Ok(bytes)
+}
+
+/// Encoder parameters for one geometry group in layout `dst`.
+fn encoder_params(
+    ctx: &RuntimeContext,
+    codec_id: &CodecId,
+    group: &Group,
+    first: &Image,
+    dst: PixelFormat,
+    opts: &SaveOptions,
+) -> CodecParameters {
     let mut params = CodecParameters::video(codec_id.clone());
-    params.width = Some(first.width());
-    params.height = Some(first.height());
+    params.width = Some(group.width);
+    params.height = Some(group.height);
     params.pixel_format = Some(dst);
     if let Some(sig) = first.color_signal() {
         params.color_signal = sig;
@@ -496,18 +640,33 @@ fn encode_attempt(
     for (k, v) in &opts.options {
         params.options = params.options.set(k.clone(), v.clone());
     }
+    params
+}
 
-    let time_base = opts.time_base.unwrap_or_else(|| match target {
-        // The APNG muxer reads `duration` in its 1/100 s delay unit.
-        Target::Container(c) if c == "png" || c == "apng" => TimeBase::new(1, 100),
-        _ => TimeBase::MILLIS,
-    });
-    let default_delay = opts.default_delay.unwrap_or(DEFAULT_DELAY);
-    let mut encoder = ctx.codecs.first_encoder(&params)?;
+/// Encode the pictures of one group on one encoder: the packets (stamped
+/// with `stream_index` and, when there is one per picture, with this
+/// group's timing), the encoder's output parameters and the group's
+/// total duration in ticks.
+#[allow(clippy::too_many_arguments)]
+fn encode_group(
+    ctx: &RuntimeContext,
+    images: &[Image],
+    group: &Group,
+    stream_index: u32,
+    params: &CodecParameters,
+    has_muxer: bool,
+    time_base: TimeBase,
+    default_delay: Duration,
+) -> Result<(Vec<Packet>, CodecParameters, i64)> {
+    let codec_id = &params.codec_id;
+    let dst = params.pixel_format.unwrap_or(PixelFormat::Rgba);
+    let n = group.members.len();
+    let mut encoder = ctx.codecs.first_encoder(params)?;
     let mut packets: Vec<Packet> = Vec::new();
     let mut pts: i64 = 0;
-    let mut ticks: Vec<(i64, i64)> = Vec::with_capacity(images.len());
-    for img in images {
+    let mut ticks: Vec<(i64, i64)> = Vec::with_capacity(n);
+    for &i in &group.members {
+        let img = &images[i];
         let converted = img.to_format(dst)?;
         let (mut frame, _) = converted.into_video_frame();
         frame.pts = Some(pts);
@@ -529,16 +688,16 @@ fn encode_attempt(
             "encoder '{codec_id}' produced no packets for {dst:?} input"
         )));
     }
-    if packets.len() == 1 && images.len() > 1 && matches!(target, Target::Container(_)) {
+    if packets.len() == 1 && n > 1 && has_muxer {
         // The encoder folded every picture into one packet (png writes
         // an APNG itself with a uniform delay). Containers whose muxer
         // assembles the multi-picture file from one packet per picture
         // need exactly that, so encode each picture on its own encoder
         // and let the muxer do the assembly with our timing.
         packets.clear();
-        for img in images {
-            let mut enc = ctx.codecs.first_encoder(&params)?;
-            let (mut frame, _) = img.to_format(dst)?.into_video_frame();
+        for &i in &group.members {
+            let mut enc = ctx.codecs.first_encoder(params)?;
+            let (mut frame, _) = images[i].to_format(dst)?.into_video_frame();
             frame.pts = Some(0);
             enc.send_frame(&Frame::Video(frame))?;
             enc.flush()?;
@@ -552,7 +711,7 @@ fn encode_attempt(
             }
         }
     }
-    if packets.len() == images.len() {
+    if packets.len() == n {
         for (pkt, (p, d)) in packets.iter_mut().zip(&ticks) {
             pkt.time_base = time_base;
             pkt.pts = Some(*p);
@@ -560,49 +719,12 @@ fn encode_attempt(
             pkt.duration = (*d > 0 || images.len() > 1).then_some(*d);
         }
     }
-
-    let container = match target {
-        Target::Container(c) => c.as_str(),
-        Target::CodecOnly(id) => {
-            if packets.len() != 1 {
-                return Err(Error::unsupported(format!(
-                    "codec-only format '{id}' produced {} packets for {} picture(s); \
-                     only a single-packet file can be written without a muxer",
-                    packets.len(),
-                    images.len()
-                )));
-            }
-            return Ok(packets.pop().map(|p| p.data).unwrap_or_default());
-        }
-    };
+    for pkt in &mut packets {
+        pkt.stream_index = stream_index;
+    }
     let mut out_params = encoder.output_params().clone();
     out_params.media_type = MediaType::Video;
-    let stream = StreamInfo {
-        index: 0,
-        time_base,
-        duration: Some(pts),
-        start_time: Some(0),
-        params: out_params,
-    };
-    let sink = SharedCursor::default();
-    let mut muxer = ctx.containers.open_muxer(
-        container,
-        Box::new(sink.clone()),
-        std::slice::from_ref(&stream),
-    )?;
-    muxer.write_header()?;
-    for pkt in &packets {
-        muxer.write_packet(pkt)?;
-    }
-    muxer.write_trailer()?;
-    drop(muxer);
-    let bytes = sink.into_bytes();
-    if bytes.is_empty() {
-        return Err(Error::unsupported(format!(
-            "muxer '{container}' wrote no bytes"
-        )));
-    }
-    Ok(bytes)
+    Ok((packets, out_params, pts))
 }
 
 /// An in-memory sink the muxer can own while we keep a handle to read

@@ -31,6 +31,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for a 16-bit view through 16-bit pivots when pixfmt has no direct
   step (pixfmt's own staging pivots `Gray16Le → Rgb48Le` and
   `Rgb48Le → Gray16Le` through `Gray8`, which narrowed).
+- `encode_frames` with per-picture geometry: pictures of one size share
+  an output stream, every further size is a stream of its own (the ICO /
+  EXR shape), so a multi-stream muxer writes the set; a one-geometry
+  muxer's refusal and a codec-only target become `Unsupported` naming
+  the geometries — never a resize, never a panic.
+
+### Changed
+
+- Mixed geometries in `encode_frames` are `Unsupported` (from the muxer
+  or the codec-only rule) instead of an up-front `InvalidData`.
 
 ### Fixed
 

@@ -315,11 +315,12 @@ fn error_paths_have_their_variants() {
         encode_frames(&ctx, &[], "oxim", &SaveOptions::default()),
         Err(ImageError::InvalidData(_))
     ));
+    // Mixed geometries into a one-geometry muxer: a typed refusal.
     let other = Image::from_rgb8(3, 2, vec![0; 18]).unwrap();
-    assert!(matches!(
-        encode_frames(&ctx, &[img.clone(), other], "oxim", &SaveOptions::default()),
-        Err(ImageError::InvalidData(_))
-    ));
+    match encode_frames(&ctx, &[img.clone(), other], "oxim", &SaveOptions::default()) {
+        Err(ImageError::Unsupported(msg)) => assert!(msg.contains("2x2, 3x2"), "{msg}"),
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
     // A stream whose codec nobody decodes.
     let bytes = still(PixelFormat::Rgb24).encode();
     assert!(matches!(
@@ -950,4 +951,70 @@ fn allow_and_deny_lists_refuse_before_decoding() {
         decode_bytes_with(&ctx, &bytes, &opts).unwrap().container(),
         fixture::CONTAINER_RGB_ONLY
     );
+}
+
+#[test]
+fn encode_frames_with_mixed_geometry_goes_to_a_multi_stream_container() {
+    let ctx = fixture::ctx();
+    let frames = vec![
+        Image::from_rgb8(2, 2, vec![10; 12]).unwrap(),
+        Image::from_rgb8(3, 3, vec![20; 27]).unwrap(),
+        Image::from_rgb8(2, 2, vec![30; 12]).unwrap(),
+        Image::from_rgba8(1, 4, vec![40; 16]).unwrap(),
+    ];
+    // Writable? The muxer decides, not the gateway: `oximmulti` yes.
+    let multi = SaveOptions::new().with_codec(fixture::CODEC);
+    let bytes = encode_frames(&ctx, &frames, fixture::CONTAINER_MULTI, &multi).unwrap();
+    let hint = OpenOptions::new().with_ext_hint("oximmulti");
+    let back = decode_bytes_with(&ctx, &bytes, &hint).unwrap();
+    assert_eq!(back.container(), fixture::CONTAINER_MULTI);
+    assert_eq!(back.len(), 4);
+    // One stream per distinct geometry in first-appearance order; the
+    // 2x2 pictures share stream 0.
+    let mut seen: Vec<(usize, u32, u32, Vec<u8>)> = back
+        .frames()
+        .iter()
+        .map(|i| (i.stream(), i.width(), i.height(), i.to_rgb8().unwrap()))
+        .collect();
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec![
+            (0, 2, 2, vec![10; 12]),
+            (0, 2, 2, vec![30; 12]),
+            (1, 3, 3, vec![20; 27]),
+            (2, 1, 4, vec![40; 12]),
+        ]
+    );
+    // The same set into a one-geometry container is refused by type,
+    // naming the geometries — never resized, never a panic.
+    match encode_frames(&ctx, &frames, "oxim", &SaveOptions::default()) {
+        Err(ImageError::Unsupported(msg)) => {
+            assert!(msg.contains("3 picture geometries"), "{msg}");
+            assert!(msg.contains("2x2, 3x3, 1x4"), "{msg}");
+        }
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+    // A codec-only target refuses before encoding anything.
+    match encode_frames(
+        &ctx,
+        &frames,
+        fixture::CODEC_YUV_ONLY,
+        &SaveOptions::default(),
+    ) {
+        Err(ImageError::Unsupported(msg)) => assert!(msg.contains("one picture geometry"), "{msg}"),
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+    // Uniform geometry through the multi-stream muxer is one stream.
+    let same: Vec<Image> = (0..3u8)
+        .map(|i| {
+            Image::from_rgb8(2, 2, vec![i; 12])
+                .unwrap()
+                .with_delay(ms(25))
+        })
+        .collect();
+    let bytes = encode_frames(&ctx, &same, fixture::CONTAINER_MULTI, &multi).unwrap();
+    let back = decode_bytes_with(&ctx, &bytes, &hint).unwrap();
+    assert!(back.frames().iter().all(|i| i.stream() == 0));
+    assert!(back.frames().iter().all(|i| i.delay() == ms(25)));
 }
