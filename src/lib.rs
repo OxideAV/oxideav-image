@@ -58,7 +58,10 @@ pub use open::{
     decode_bytes, decode_bytes_with, decode_reader, decode_vec, decode_vec_with, open, open_with,
     ImageFile, OpenOptions,
 };
-pub use save::{encode, encode_frames, encoder_options, save, SaveOptions, DEFAULT_DELAY};
+pub use save::{
+    can_encode, encode, encode_frames, encoder_options, resolve_target, save, EncodeTarget,
+    SaveOptions, DEFAULT_DELAY,
+};
 
 /// Re-exported for convenience: the framework's pixel layouts and colour
 /// description, which [`Image`] reports.

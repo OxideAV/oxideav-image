@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `can_encode(&ctx, format)` and `resolve_target(&ctx, format, &opts) ->
+  EncodeTarget` answer "will this save?" without decoding: the resolved
+  container (or codec-only), the encoder id, its declared accepted
+  layouts, its option schema and the pixel-format ladder for a given
+  source layout (`EncodeTarget::ladder`). `encoder_options` now rides
+  `resolve_target`.
+
 ### Fixed
 
 - Pixel-format ladder: colour before grey (`IMAGE_CRATE_API.md` round-474

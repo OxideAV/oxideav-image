@@ -96,14 +96,109 @@ pub fn encoder_options(
     format: &str,
     opts: &SaveOptions,
 ) -> Result<&'static [OptionField]> {
-    let target = resolve_target(ctx, format)?;
-    let codec_id = codec_for(ctx, &target, opts);
-    if !ctx.codecs.has_encoder(&codec_id) {
+    Ok(resolve_target(ctx, format, opts)?.options())
+}
+
+/// Where [`encode`] / [`save`] would send a picture for `format` (a
+/// registered container name or a file extension), resolved through the
+/// registries without touching any pixels: the container (or that the
+/// format is codec-only), the encoder, the layouts it declares and its
+/// option schema. Consumers ask this before decoding a source they may
+/// not be able to save.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct EncodeTarget {
+    format: String,
+    container: Option<String>,
+    codec: CodecId,
+    accepted: Vec<PixelFormat>,
+    options: &'static [OptionField],
+}
+
+impl EncodeTarget {
+    /// The format name as resolved (lower-case, no leading dot).
+    pub fn format(&self) -> &str {
+        &self.format
+    }
+
+    /// Registered name of the container whose muxer writes the file;
+    /// `None` for a codec-only format (the encoder's single packet is
+    /// the file).
+    pub fn container(&self) -> Option<&str> {
+        self.container.as_deref()
+    }
+
+    /// True when no muxer is involved (see [`container`](Self::container)).
+    pub fn is_codec_only(&self) -> bool {
+        self.container.is_none()
+    }
+
+    /// Id of the encoder [`encode`] would create.
+    pub fn codec(&self) -> &str {
+        self.codec.as_str()
+    }
+
+    /// The input layouts the encoder declares
+    /// (`CodecCapabilities::accepted_pixel_formats`); empty when it
+    /// declares none, in which case the ladder's fixed rungs apply.
+    pub fn accepted_pixel_formats(&self) -> &[PixelFormat] {
+        &self.accepted
+    }
+
+    /// The encoder's declared option schema (see [`encoder_options`]).
+    pub fn options(&self) -> &'static [OptionField] {
+        self.options
+    }
+
+    /// The layouts [`encode`] would offer the encoder for a picture in
+    /// `src`, in order (README, *Pixel-format ladder*);
+    /// `SaveOptions::pixel_format` reduces it to that one layout.
+    pub fn ladder(&self, src: PixelFormat, opts: &SaveOptions) -> Vec<PixelFormat> {
+        match opts.pixel_format {
+            Some(f) => vec![f],
+            None => ladder::ladder(src, &self.accepted),
+        }
+    }
+}
+
+/// Resolve `format` the way [`encode`] does, without encoding: the
+/// errors are the ones `encode` would return before looking at a
+/// picture (`UnknownFormat` for a name or extension no muxer serves,
+/// `Unsupported` when the container's codec — or
+/// `SaveOptions::codec` — has no registered encoder).
+pub fn resolve_target(
+    ctx: &RuntimeContext,
+    format: &str,
+    opts: &SaveOptions,
+) -> Result<EncodeTarget> {
+    let target = resolve_format(ctx, format)?;
+    let codec = codec_for(ctx, &target, opts);
+    if !ctx.codecs.has_encoder(&codec) {
         return Err(Error::unsupported(format!(
-            "no registered encoder for codec '{codec_id}' ({target})"
+            "no registered encoder for codec '{codec}' ({target})"
         )));
     }
-    Ok(ctx.codecs.encoder_options_schema(&codec_id).unwrap_or(&[]))
+    let accepted = declared_formats(ctx, &codec);
+    let options = ctx.codecs.encoder_options_schema(&codec).unwrap_or(&[]);
+    let (format, container) = match target {
+        Target::Container(c) => (c.clone(), Some(c)),
+        Target::CodecOnly(c) => (c, None),
+    };
+    Ok(EncodeTarget {
+        format,
+        container,
+        codec,
+        accepted,
+        options,
+    })
+}
+
+/// Whether [`encode`] / [`save`] can write `format` at all (a muxer or
+/// codec-only encoder is registered for the name or extension). The
+/// layout question is answered when encoding: see
+/// [`EncodeTarget::ladder`].
+pub fn can_encode(ctx: &RuntimeContext, format: &str) -> bool {
+    resolve_target(ctx, format, &SaveOptions::default()).is_ok()
 }
 
 /// The codec [`encode`] uses for a resolved target.
@@ -187,7 +282,7 @@ pub fn encode_frames(
     let first = images
         .first()
         .ok_or_else(|| Error::invalid("encode_frames: no image"))?;
-    let target = resolve_target(ctx, format)?;
+    let target = resolve_format(ctx, format)?;
     let codec_id = codec_for(ctx, &target, opts);
     if !ctx.codecs.has_encoder(&codec_id) {
         return Err(Error::unsupported(format!(
@@ -280,7 +375,7 @@ impl std::fmt::Display for Target {
 
 /// Map a format name or extension onto a registered container that
 /// has a muxer, or onto a codec that stands alone.
-fn resolve_target(ctx: &RuntimeContext, format: &str) -> Result<Target> {
+fn resolve_format(ctx: &RuntimeContext, format: &str) -> Result<Target> {
     let lower = format.trim_start_matches('.').to_ascii_lowercase();
     if ctx.containers.muxer_names().any(|n| n == lower) {
         return Ok(Target::Container(lower));

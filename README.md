@@ -54,6 +54,7 @@ let apng = encode_frames(&ctx, file.frames(), "png", &SaveOptions::default())?;
 | `Image::from_rgb8` / `from_rgba8` / `from_raw` / `from_planes` / `from_video_frame` | Fallible constructors: geometry, plane count, stride and length are validated. |
 | `encode(&ctx, &Image, "png", &SaveOptions)` / `encode_frames(&ctx, &[Image], ..)` / `save(&ctx, &Image, path, ..)` | Encoder + muxer by container name or extension; see *Format resolution* and *Pixel-format ladder*. |
 | `encoder_options(&ctx, format, &SaveOptions)` | The option schema of the encoder `encode` would use (names for `SaveOptions::with_option`). |
+| `can_encode(&ctx, format)` / `resolve_target(&ctx, format, &SaveOptions)` | "Will this save?" before decoding: `can_encode` is a yes / no; `resolve_target` returns the `EncodeTarget` (`format()`, `container()` / `is_codec_only()`, `codec()`, `accepted_pixel_formats()`, `options()`, `ladder(src, &opts)`) or the error `encode` would return before looking at a picture. |
 | `OpenOptions` | `max_frames`, `ext_hint`, `decoder_options`, `max_pixels`. |
 | `SaveOptions` | `quality`, `pixel_format`, `codec`, `options`, `time_base`, `default_delay`. |
 | `ImageError` (`Error`) | `#[non_exhaustive]`: see *Errors*. |
@@ -77,6 +78,12 @@ one from the container, else pixfmt's defaults.
   → `mjpeg`, `dcx` → `pcx`, `ani` / `cur` → `ico`, `svgz` → `svg`,
   `iff_*` → `ilbm`); `SaveOptions::codec` overrides it (`"hevc"` or
   `"av1"` for a HEIF sequence track, for instance).
+- **Asking first:** `can_encode(&ctx, "webp")` says whether a name or
+  extension resolves to something writable at all; `resolve_target`
+  tells which container and encoder, the layouts the encoder declares
+  and the ladder a given source layout would walk — so a converter can
+  refuse a target before decoding a large source, and a renderer can
+  pick the output layout it will produce. Neither touches pixels.
 - **Codec-only formats:** some image crates register a codec and an
   extension but no container (qoi, webp, gif, avif, openexr, pict, icer,
   jpeg2000, jpegxs, jpegxl). `encode` / `save` write the encoder's

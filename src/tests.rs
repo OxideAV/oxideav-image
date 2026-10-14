@@ -7,8 +7,8 @@ use oxideav_core::{PixelFormat, TimeBase, VideoPlane};
 
 use crate::fixture::{self, Fixture, FORMATS};
 use crate::{
-    decode_bytes, decode_bytes_with, decode_vec, encode, encode_frames, encoder_options, Image,
-    ImageError, OpenOptions, SaveOptions,
+    can_encode, decode_bytes, decode_bytes_with, decode_vec, encode, encode_frames,
+    encoder_options, resolve_target, Image, ImageError, OpenOptions, SaveOptions,
 };
 
 fn still(format: PixelFormat) -> Fixture {
@@ -808,5 +808,83 @@ fn quality_reaches_only_encoders_that_declare_it() {
     assert!(matches!(
         encoder_options(&ctx, "nope", &SaveOptions::default()),
         Err(ImageError::UnknownFormat(_))
+    ));
+}
+
+#[test]
+fn can_encode_and_resolve_target_answer_without_pixels() {
+    let ctx = fixture::ctx();
+    assert!(can_encode(&ctx, "oxim"));
+    assert!(can_encode(&ctx, ".OXIM"));
+    // `oximrgb` names no encoder of its own: not writable by default,
+    // writable once the payload codec is named.
+    assert!(!can_encode(&ctx, "oximrgb"));
+    assert_eq!(
+        resolve_target(
+            &ctx,
+            "oximrgb",
+            &SaveOptions::new().with_codec(fixture::CODEC)
+        )
+        .unwrap()
+        .container(),
+        Some("oximrgb")
+    );
+    assert!(!can_encode(&ctx, "nope"));
+    // A demuxer without a muxer cannot be written.
+    assert!(!can_encode(&ctx, "oximnodec"));
+    // A codec registered without any container is codec-only.
+    assert!(can_encode(&ctx, fixture::CODEC_YUV_ONLY));
+
+    let t = resolve_target(&ctx, "OXIM", &SaveOptions::default()).unwrap();
+    assert_eq!(t.format(), "oxim");
+    assert_eq!(t.container(), Some("oxim"));
+    assert!(!t.is_codec_only());
+    assert_eq!(t.codec(), fixture::CODEC);
+    assert_eq!(t.accepted_pixel_formats(), FORMATS);
+    assert_eq!(t.options().len(), 1);
+    assert_eq!(t.options()[0].name, "quality");
+    // The ladder a declared set yields: only declared layouts.
+    let l = t.ladder(PixelFormat::Rgb24, &SaveOptions::default());
+    assert_eq!(l[0], PixelFormat::Rgb24);
+    assert!(l.iter().all(|f| FORMATS.contains(f)));
+    assert_eq!(
+        t.ladder(
+            PixelFormat::Rgb24,
+            &SaveOptions::new().with_pixel_format(PixelFormat::Gray8)
+        ),
+        vec![PixelFormat::Gray8]
+    );
+
+    let opts = SaveOptions::new().with_codec(fixture::CODEC_UNDECLARED);
+    let t = resolve_target(&ctx, "oxim", &opts).unwrap();
+    assert_eq!(t.codec(), fixture::CODEC_UNDECLARED);
+    assert!(t.accepted_pixel_formats().is_empty());
+    assert!(t.options().is_empty());
+    let l = t.ladder(PixelFormat::Rgb24, &opts);
+    assert_eq!(l[0], PixelFormat::Rgb24);
+    assert!(l.contains(&PixelFormat::Yuv444P));
+    assert_eq!(l.last(), Some(&PixelFormat::Gray16Le));
+
+    let t = resolve_target(&ctx, fixture::CODEC_YUV_ONLY, &SaveOptions::default()).unwrap();
+    assert!(t.is_codec_only());
+    assert_eq!(t.container(), None);
+    assert_eq!(t.format(), fixture::CODEC_YUV_ONLY);
+    assert_eq!(t.accepted_pixel_formats(), &[PixelFormat::Yuv420P]);
+
+    assert!(matches!(
+        resolve_target(&ctx, "nope", &SaveOptions::default()),
+        Err(ImageError::UnknownFormat(_))
+    ));
+    assert!(matches!(
+        resolve_target(&ctx, "oximnodec", &SaveOptions::default()),
+        Err(ImageError::UnknownFormat(_))
+    ));
+    assert!(matches!(
+        resolve_target(
+            &ctx,
+            "oxim",
+            &SaveOptions::new().with_codec("no_such_codec")
+        ),
+        Err(ImageError::Unsupported(_))
     ));
 }
