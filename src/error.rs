@@ -30,6 +30,10 @@ pub enum ImageError {
     /// A caller-configured budget ([`crate::OpenOptions::max_pixels`])
     /// would be exceeded; nothing past the budget was decoded.
     LimitExceeded(String),
+    /// The probed container or a stream's codec is refused by the
+    /// caller's allow / deny lists ([`crate::OpenOptions::allow_containers`]
+    /// and friends); nothing was decoded.
+    Restricted(String),
 }
 
 /// Crate-local alias, so signatures read `Result<T, Error>`.
@@ -48,6 +52,7 @@ impl fmt::Display for ImageError {
             ImageError::Unsupported(s) => write!(f, "unsupported: {s}"),
             ImageError::InvalidData(s) => write!(f, "invalid data: {s}"),
             ImageError::LimitExceeded(s) => write!(f, "limit exceeded: {s}"),
+            ImageError::Restricted(s) => write!(f, "restricted: {s}"),
         }
     }
 }
@@ -85,5 +90,9 @@ impl ImageError {
 
     pub(crate) fn limit(msg: impl Into<String>) -> Self {
         ImageError::LimitExceeded(msg.into())
+    }
+
+    pub(crate) fn restricted(msg: impl Into<String>) -> Self {
+        ImageError::Restricted(msg.into())
     }
 }

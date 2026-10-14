@@ -55,7 +55,7 @@ let apng = encode_frames(&ctx, file.frames(), "png", &SaveOptions::default())?;
 | `encode(&ctx, &Image, "png", &SaveOptions)` / `encode_frames(&ctx, &[Image], ..)` / `save(&ctx, &Image, path, ..)` | Encoder + muxer by container name or extension; see *Format resolution* and *Pixel-format ladder*. |
 | `encoder_options(&ctx, format, &SaveOptions)` | The option schema of the encoder `encode` would use (names for `SaveOptions::with_option`). |
 | `can_encode(&ctx, format)` / `resolve_target(&ctx, format, &SaveOptions)` | "Will this save?" before decoding: `can_encode` is a yes / no; `resolve_target` returns the `EncodeTarget` (`format()`, `container()` / `is_codec_only()`, `codec()`, `accepted_pixel_formats()`, `options()`, `ladder(src, &opts)`) or the error `encode` would return before looking at a picture. |
-| `OpenOptions` | `max_frames`, `ext_hint`, `decoder_options`, `max_pixels`. |
+| `OpenOptions` | `max_frames`, `ext_hint`, `decoder_options`, `max_pixels`, `allow_containers` / `deny_containers` / `allow_codecs` / `deny_codecs`. |
 | `SaveOptions` | `quality`, `pixel_format`, `codec`, `options`, `time_base`, `default_delay`. |
 | `ImageError` (`Error`) | `#[non_exhaustive]`: see *Errors*. |
 
@@ -163,6 +163,18 @@ and again before each picture is kept, so an oversized file fails with
 the budget has to cover. `decode_bytes(&[u8])` copies the slice once
 (the demuxer needs an owned seekable reader); `decode_vec` does not.
 
+`OpenOptions::allow_containers` / `deny_containers` (`Option<Vec>` =
+any when `None`; `Vec`, deny wins; names compare case-insensitively)
+are checked on the probe result before the demuxer parses the header;
+`allow_codecs` / `deny_codecs` are checked on the demuxer's stream table
+— every video stream's codec id — before any decoder is created. A
+refused file costs one probe (containers) or one header parse (codecs)
+and fails with `Restricted`; streams the gateway never decodes (audio,
+data) are not checked. `oxideav-io` enforces the same lists ahead of
+the gateway today; the gateway now offers them so io can hand its lists
+through (`OpenOptions::with_allow_containers(..)` and friends) instead
+of parsing the header itself.
+
 ### Errors
 
 | Variant | When |
@@ -173,6 +185,7 @@ the budget has to cover. `decode_bytes(&[u8])` copies the slice once
 | `Unsupported` | No encoder for the codec, no layout of the ladder accepted, a planar layout asked for as packed bytes, a `crop` origin off the chroma grid or on a bit-packed layout. |
 | `InvalidData` | Caller data inconsistent with its geometry (buffer length, plane count, stride), a crop window outside the picture, mixed geometries in `encode_frames`, a stream without a pixel format. |
 | `LimitExceeded` | `max_pixels` would be exceeded. |
+| `Restricted` | The probed container or a video stream's codec is refused by the allow / deny lists; nothing was decoded. |
 | `Core` | A registry, demuxer, decoder, muxer or encoder error, unchanged. |
 
 ### What the gateway deliberately does not do
@@ -196,7 +209,7 @@ the budget has to cover. `decode_bytes(&[u8])` copies the slice once
 Unit tests run against a synthetic `OXIM` container + codec pair
 registered exactly like a sibling crate (probe by magic and by extension
 hint, 14 packed and planar layouts, `Pal8` with its palette, multi-frame
-timing in every mode, the ladder against a layout-refusing codec, an encoder that declares
+timing in every mode, allow / deny lists, the ladder against a layout-refusing codec, an encoder that declares
 no layouts (colour before grey) and a layout-refusing muxer, options, limits, every error variant). The
 umbrella's `crates/oxideav-tests/tests/image_gateway.rs` runs the gateway
 over the real format crates through `oxideav_meta::register_all`.

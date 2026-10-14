@@ -888,3 +888,63 @@ fn can_encode_and_resolve_target_answer_without_pixels() {
         Err(ImageError::Unsupported(_))
     ));
 }
+
+#[test]
+fn allow_and_deny_lists_refuse_before_decoding() {
+    let ctx = fixture::ctx();
+    let bytes = still(PixelFormat::Rgb24).encode();
+    let restricted = |opts: &OpenOptions| match decode_bytes_with(&ctx, &bytes, opts) {
+        Err(ImageError::Restricted(msg)) => msg,
+        other => panic!("expected Restricted, got {other:?}"),
+    };
+    // Containers: deny wins, allow must contain, both case-insensitive.
+    let msg = restricted(&OpenOptions::new().with_deny_containers(["OXIM"]));
+    assert!(msg.contains("container 'oxim'"), "{msg}");
+    restricted(&OpenOptions::new().with_allow_containers(["png", "oximrgb"]));
+    assert!(decode_bytes_with(
+        &ctx,
+        &bytes,
+        &OpenOptions::new().with_allow_containers(["Oxim"])
+    )
+    .is_ok());
+    restricted(
+        &OpenOptions::new()
+            .with_allow_containers(["oxim"])
+            .with_deny_containers(["oxim"]),
+    );
+    // An empty allow list allows nothing; a cleared one allows all.
+    restricted(&OpenOptions::new().with_allow_containers(Vec::<String>::new()));
+    let mut opts = OpenOptions::new().with_allow_containers(["nothing"]);
+    opts.allow_containers = None;
+    assert!(decode_bytes_with(&ctx, &bytes, &opts).is_ok());
+    // Codecs: from the stream table, before any decoder exists.
+    let msg = restricted(&OpenOptions::new().with_deny_codecs([fixture::CODEC]));
+    assert!(
+        msg.contains("codec 'oxim'") && msg.contains("stream 0"),
+        "{msg}"
+    );
+    restricted(&OpenOptions::new().with_allow_codecs(["png"]));
+    assert!(decode_bytes_with(
+        &ctx,
+        &bytes,
+        &OpenOptions::new().with_allow_codecs(["OXIM"])
+    )
+    .is_ok());
+    // A stream whose codec nobody decodes is still refused by its id
+    // (Restricted outranks NoImage: the list is checked first).
+    let opts = OpenOptions::new()
+        .with_ext_hint("oximnodec")
+        .with_deny_codecs([fixture::CODEC_NO_DECODER]);
+    assert!(matches!(
+        decode_bytes_with(&ctx, &bytes, &opts),
+        Err(ImageError::Restricted(_))
+    ));
+    // The hint selects the container before the lists see it.
+    let opts = OpenOptions::new()
+        .with_ext_hint("oximrgb")
+        .with_allow_containers(["oximrgb"]);
+    assert_eq!(
+        decode_bytes_with(&ctx, &bytes, &opts).unwrap().container(),
+        fixture::CONTAINER_RGB_ONLY
+    );
+}

@@ -15,6 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   layouts, its option schema and the pixel-format ladder for a given
   source layout (`EncodeTarget::ladder`). `encoder_options` now rides
   `resolve_target`.
+- `OpenOptions::allow_containers` / `deny_containers` / `allow_codecs` /
+  `deny_codecs` (round-473 ruling), with `with_*` setters: containers are
+  checked on the probe result before the header is parsed, codecs on the
+  demuxer's stream table before any decoder exists, so a refused file
+  costs one header parse at most. Refusals are the new
+  `ImageError::Restricted`. The field shapes mirror `oxideav-io`'s
+  (`Option<Vec<String>>` allow = any when `None`, `Vec<String>` deny,
+  case-insensitive) so io can hand its lists through.
 
 ### Fixed
 

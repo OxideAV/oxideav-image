@@ -114,6 +114,22 @@ pub struct OpenOptions {
     /// oversized file fails with [`crate::ImageError::LimitExceeded`]
     /// before its pixels are decoded. `None` = unlimited.
     pub max_pixels: Option<u64>,
+    /// Container names the probe may resolve to; `None` = any. Checked
+    /// right after the probe, before the demuxer parses the header, and
+    /// refused with [`crate::ImageError::Restricted`]. Names compare
+    /// case-insensitively.
+    pub allow_containers: Option<Vec<String>>,
+    /// Container names refused after the probe (wins over the allow
+    /// list).
+    pub deny_containers: Vec<String>,
+    /// Codec ids the file's video streams may carry; `None` = any.
+    /// Checked from the demuxer's stream table before any decoder is
+    /// created — one header parse — and refused with
+    /// [`crate::ImageError::Restricted`]. Streams the gateway never
+    /// decodes (audio, data) are not checked.
+    pub allow_codecs: Option<Vec<String>>,
+    /// Codec ids refused on any video stream (wins over the allow list).
+    pub deny_codecs: Vec<String>,
 }
 
 impl OpenOptions {
@@ -154,6 +170,58 @@ impl OpenOptions {
     pub fn with_max_pixels(mut self, n: u64) -> Self {
         self.max_pixels = Some(n);
         self
+    }
+
+    /// Only these containers may open (see the field).
+    pub fn with_allow_containers<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.allow_containers = Some(names.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Refuse these containers (see the field).
+    pub fn with_deny_containers<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.deny_containers = names.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Only these codecs may be decoded (see the field).
+    pub fn with_allow_codecs<I, S>(mut self, ids: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.allow_codecs = Some(ids.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Refuse these codecs (see the field).
+    pub fn with_deny_codecs<I, S>(mut self, ids: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.deny_codecs = ids.into_iter().map(Into::into).collect();
+        self
+    }
+}
+
+/// The allow / deny rule: a denied name loses; otherwise an allow list,
+/// when present, must contain it. Case-insensitive.
+fn permitted(name: &str, allow: Option<&[String]>, deny: &[String]) -> bool {
+    if deny.iter().any(|d| d.eq_ignore_ascii_case(name)) {
+        return false;
+    }
+    match allow {
+        Some(list) => list.iter().any(|a| a.eq_ignore_ascii_case(name)),
+        None => true,
     }
 }
 
@@ -227,6 +295,15 @@ pub fn decode_reader(
             }
             other => Error::Core(other),
         })?;
+    if !permitted(
+        &container,
+        opts.allow_containers.as_deref(),
+        &opts.deny_containers,
+    ) {
+        return Err(Error::restricted(format!(
+            "container '{container}' is not permitted by the open options"
+        )));
+    }
     let mut demuxer = ctx
         .containers
         .open_demuxer(&container, reader, &ctx.codecs)
@@ -240,6 +317,21 @@ pub fn decode_reader(
         })?;
     let streams: Vec<StreamInfo> = demuxer.streams().to_vec();
     let metadata = demuxer.metadata().to_vec();
+    // The codec lists are checked from the stream table alone: no
+    // decoder exists yet, so a refused file costs one header parse.
+    for s in &streams {
+        if s.params.media_type != oxideav_core::MediaType::Video {
+            continue;
+        }
+        let id = s.params.codec_id.as_str();
+        if !permitted(id, opts.allow_codecs.as_deref(), &opts.deny_codecs) {
+            return Err(Error::restricted(format!(
+                "codec '{id}' (stream {} of container '{container}') is not permitted by the \
+                 open options",
+                s.index
+            )));
+        }
+    }
 
     // One decoder per video stream; other streams are skipped.
     let budget = opts.max_pixels.unwrap_or(u64::MAX);
