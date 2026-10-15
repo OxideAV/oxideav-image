@@ -49,7 +49,7 @@ let apng = encode_frames(&ctx, file.frames(), "png", &SaveOptions::default())?;
 |---|---|
 | `open(&ctx, path)` / `open_with(.., &OpenOptions)` | Probe the file (extension as hint), open its demuxer, decode every video stream → `ImageFile`. |
 | `decode_bytes(&ctx, &[u8])` / `decode_vec(&ctx, Vec<u8>)` / `decode_reader(&ctx, Box<dyn ReadSeek>, &OpenOptions)` | Same from memory (`decode_vec` without a copy) or any seekable reader. `*_with` variants take `OpenOptions`. |
-| `ImageFile` | `container()`, `metadata()`, `primary()`, `frames()`, `frames_mut()`, `iter()`, `into_frames()`, `into_primary()`, `len()`; `IntoIterator` for `ImageFile` and `&ImageFile`. Metadata: `blobs()`, `stream_blobs(i)`, `blob(&kind)`, `icc()`, `exif()`, `xmp()`, `iptc()`, `has_metadata()` (see *Metadata*). |
+| `ImageFile` | `container()`, `metadata()`, `primary()`, `frames()`, `frames_mut()`, `iter()`, `into_frames()`, `into_primary()`, `len()`; `IntoIterator` for `ImageFile` and `&ImageFile`. Metadata: `blobs()`, `stream_blobs(i)`, `blob(&kind)`, `icc()`, `exif()`, `xmp()`, `iptc()`, `has_metadata()`, `retain_blobs(f)`, `strip_metadata()` (see *Metadata*). |
 | `Image` | A `VideoFrame` + `CodecParameters`: `width` / `height` / `format` / `color_signal` / `palette`; `palette_alpha`, `palette_rgba(i)`, `palette_entries`, `has_palette_alpha`, `has_alpha` (see *Palette alpha*); `delay`, `timestamp`, `stream`, `index`, `raw_timing`, `time_base`; `to_format(PixelFormat)`, `to_gray8`, `to_rgb8`, `to_rgba8`, `to_gray16`, `to_rgb16`, `to_rgba16`, `to_packed`, `as_packed`, `into_raw`, `crop`, `with_delay`, `with_color_signal`, `with_palette_rgba` / `with_palette` / `with_palette_alpha`, `frame`, `params`, `into_video_frame`. Metadata: `frame_blobs`, `stream_blobs`, `blobs`, `blob(&kind)`, `blobs_of(&kind)`, `icc`, `exif`, `xmp`, `iptc`, `has_metadata`, `with_blob(s)` / `set_blobs` / `push_blob` / `with_stream_blobs` / `take_blobs` / `retain_blobs` / `strip_metadata` / `without_metadata`. |
 | `Image::from_rgb8` / `from_rgba8` / `from_indexed` / `from_raw` / `from_planes` / `from_video_frame` | Fallible constructors: geometry, plane count, stride and length are validated; `from_indexed` takes RGBA palette entries. |
 | `encode(&ctx, &Image, "png", &SaveOptions)` / `encode_frames(&ctx, &[Image], ..)` / `save(&ctx, &Image, path, ..)` | Encoder + muxer by container name or extension; see *Format resolution*, *Pixel-format ladder* and *Geometry*. |
@@ -174,8 +174,9 @@ it, so a pipeline receives exactly what the decoder produced.
 **Opening:** `OpenOptions::without_metadata()` (`strip_metadata`) drops
 every blob at both levels before the decoder, the pictures or a later
 `encode` see them; `with_stripped_blobs([BlobKind::EXIF])` drops kinds.
-The container's string metadata (`ImageFile::metadata()`) is not a blob
-and is never stripped.
+`ImageFile::retain_blobs(f)` / `strip_metadata()` do the same to an
+open file. The container's string metadata (`ImageFile::metadata()`) is
+not a blob and is never stripped.
 
 **Saving:** `encode` / `encode_frames` hand blobs to the encoder at both
 levels. The encoder's `CodecParameters::blobs` get the first picture's

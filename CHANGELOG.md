@@ -22,8 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   / `without_metadata`; `into_video_frame` re-attaches the record;
   `to_format` and `crop` carry the blobs. `OpenOptions::strip_metadata`
   / `strip_blobs` (`with_metadata(bool)` / `without_metadata()` /
-  `with_stripped_blobs(kinds)`) drop blobs at both levels while opening.
-  `BlobKind` / `MetadataBlob` are re-exported.
+  `with_stripped_blobs(kinds)`) drop blobs at both levels while opening;
+  `ImageFile::retain_blobs` / `strip_metadata` do the same after the
+  fact. `BlobKind` / `MetadataBlob` are re-exported.
 - **Metadata written**: `encode` / `encode_frames` hand the blobs to the
   encoder — stream-level ones on its `CodecParameters::blobs` (the first
   picture's stream blobs; for a single-picture encode its frame blobs

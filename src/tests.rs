@@ -1160,6 +1160,37 @@ fn open_options_strip_metadata_or_kinds() {
 }
 
 #[test]
+fn image_file_strips_metadata_after_the_fact() {
+    let ctx = fixture::ctx();
+    let mut fx = Fixture::new(4, 4, PixelFormat::Rgb24);
+    fx.push_gradient(40, 1);
+    fx.last_frame().blobs = vec![blob(BlobKind::EXIF, b"II*\0page")];
+    fx.metadata = vec![("title".into(), "kept".into())];
+    let fx = fx.with_blobs(vec![
+        blob(BlobKind::ICC, b"acsp"),
+        blob(BlobKind::XMP, b"<x/>"),
+    ]);
+    let mut file = decode_bytes(&ctx, &fx.encode()).unwrap();
+    file.retain_blobs(|b| !b.is(&BlobKind::EXIF));
+    assert_eq!(file.blobs().len(), 2);
+    assert!(file.primary().frame_blobs().is_empty());
+    assert_eq!(file.primary().exif(), None);
+    assert_eq!(file.primary().icc(), Some(&b"acsp"[..]));
+    file.strip_metadata();
+    assert!(!file.has_metadata());
+    assert!(file.blobs().is_empty());
+    assert!(file.primary().stream_blobs().is_empty());
+    assert_eq!(file.metadata(), fx.metadata.as_slice());
+    // What the pictures now carry is what an encode hands on.
+    let back = decode_bytes(
+        &ctx,
+        &encode(&ctx, file.primary(), "oxim", &SaveOptions::default()).unwrap(),
+    )
+    .unwrap();
+    assert!(!back.has_metadata());
+}
+
+#[test]
 fn encode_hands_blobs_to_the_encoder_at_both_levels() {
     let ctx = fixture::ctx();
     let mut fx = Fixture::new(4, 4, PixelFormat::Rgb24);

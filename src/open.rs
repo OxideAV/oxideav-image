@@ -91,6 +91,25 @@ impl ImageFile {
             || self.images.iter().any(|i| !i.frame_blobs().is_empty())
     }
 
+    /// Keep only the blobs `keep` accepts, on every stream and every
+    /// picture (both levels) — the post-open counterpart of
+    /// [`OpenOptions::strip_blobs`].
+    pub fn retain_blobs(&mut self, mut keep: impl FnMut(&MetadataBlob) -> bool) {
+        for blobs in &mut self.stream_blobs {
+            blobs.retain(|b| keep(b));
+        }
+        for img in &mut self.images {
+            img.retain_blobs(&mut keep);
+        }
+    }
+
+    /// Drop every blob on every stream and every picture; the string
+    /// metadata stays. The post-open counterpart of
+    /// [`OpenOptions::strip_metadata`].
+    pub fn strip_metadata(&mut self) {
+        self.retain_blobs(|_| false);
+    }
+
     /// The primary picture: the first decoded frame.
     pub fn primary(&self) -> &Image {
         &self.images[0]
