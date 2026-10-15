@@ -4,7 +4,8 @@
 use std::time::Duration;
 
 use oxideav_core::{
-    CodecId, CodecParameters, ColorSignal, MediaType, PixelFormat, TimeBase, VideoFrame, VideoPlane,
+    BlobKind, CodecId, CodecParameters, ColorSignal, MediaType, MetadataBlob, PixelFormat,
+    TimeBase, VideoFrame, VideoPlane,
 };
 use oxideav_pixfmt::{convert_with, supports_direct, ConvertContext, ConvertOptions, FrameInfo};
 
@@ -21,10 +22,22 @@ use crate::error::{Error, Result};
 /// the one-call raw paths ([`to_rgb8`](Image::to_rgb8),
 /// [`to_rgba8`](Image::to_rgba8), [`to_rgba16`](Image::to_rgba16))
 /// return tightly packed row-major bytes.
+///
+/// Metadata rides along at two levels (see *Metadata* in the README):
+/// stream-level blobs on the parameters ([`stream_blobs`](Self::stream_blobs),
+/// the file's ICC profile / Exif / XMP as the demuxer reported them) and
+/// per-picture blobs lifted off the frame's side-channel record
+/// ([`frame_blobs`](Self::frame_blobs)). The typed accessors
+/// ([`icc`](Self::icc), [`exif`](Self::exif), [`xmp`](Self::xmp),
+/// [`iptc`](Self::iptc), [`blob`](Self::blob)) apply the precedence
+/// rule: a frame blob overrides a stream blob of the same kind.
 #[derive(Clone, Debug)]
 pub struct Image {
     frame: VideoFrame,
     params: CodecParameters,
+    /// Per-picture blobs, lifted off `frame`'s side-channel record at
+    /// construction and re-attached by `into_video_frame`.
+    blobs: Vec<MetadataBlob>,
     delay: Option<Duration>,
     index: usize,
     stream: usize,
@@ -41,8 +54,10 @@ pub struct Image {
 impl Image {
     /// Wrap a decoded frame. `params` must carry `width`, `height` and
     /// `pixel_format`; the frame must have the plane count the format
-    /// implies (side-channel records excluded).
-    pub fn from_video_frame(frame: VideoFrame, params: &CodecParameters) -> Result<Self> {
+    /// implies (side-channel records excluded). A metadata-blobs record
+    /// on the frame is lifted into [`frame_blobs`](Self::frame_blobs);
+    /// `params.blobs` become the [`stream_blobs`](Self::stream_blobs).
+    pub fn from_video_frame(mut frame: VideoFrame, params: &CodecParameters) -> Result<Self> {
         let width = params
             .width
             .ok_or_else(|| Error::invalid("image stream has no width"))?;
@@ -64,9 +79,11 @@ impl Image {
                 "frame carries {planes} image plane(s) but {format:?} has {expected}"
             )));
         }
+        let blobs = frame.take_blobs();
         Ok(Self {
             frame,
             params: params.clone(),
+            blobs,
             delay: None,
             index: 0,
             stream: 0,
@@ -111,6 +128,7 @@ impl Image {
                 planes: vec![VideoPlane { stride: row, data }],
             },
             params,
+            blobs: Vec::new(),
             delay: None,
             index: 0,
             stream: 0,
@@ -186,6 +204,35 @@ impl Image {
         Self::from_raw(width, height, PixelFormat::Rgba, rgba)
     }
 
+    /// An indexed (`Pal8`) picture: one byte per pixel into `palette`
+    /// (at most 256 RGBA entries; alpha `255` = opaque). The palette
+    /// is attached as the frame's side-channel record, plus the
+    /// palette-alpha record when any entry is not opaque, so
+    /// [`palette_rgba`](Self::palette_rgba) and the RGBA views honour
+    /// the entries' alpha.
+    pub fn from_indexed(
+        width: u32,
+        height: u32,
+        indices: Vec<u8>,
+        palette: &[[u8; 4]],
+    ) -> Result<Self> {
+        if palette.is_empty() || palette.len() > 256 {
+            return Err(Error::invalid(format!(
+                "a Pal8 palette has 1..=256 entries, {} given",
+                palette.len()
+            )));
+        }
+        let mut img = Self::from_raw(width, height, PixelFormat::Pal8, indices)?;
+        let rgb = palette.iter().flat_map(|e| [e[0], e[1], e[2]]).collect();
+        img.frame.set_palette(rgb);
+        // No record means opaque: attach one only when an entry is not.
+        if palette.iter().any(|e| e[3] != u8::MAX) {
+            img.frame
+                .set_palette_alpha(palette.iter().map(|e| e[3]).collect());
+        }
+        Ok(img)
+    }
+
     /// Picture width in pixels.
     pub fn width(&self) -> u32 {
         self.params.width.unwrap_or(0)
@@ -222,6 +269,203 @@ impl Image {
     /// Attached palette (packed RGB triplets) for indexed layouts.
     pub fn palette(&self) -> Option<&[u8]> {
         self.frame.palette()
+    }
+
+    /// The palette-alpha record next to the palette: byte `i` is the
+    /// alpha of entry `i` (`0` transparent, `255` opaque); it may be
+    /// shorter than the palette, and every entry it does not cover is
+    /// opaque. `None` without a palette or without the record.
+    pub fn palette_alpha(&self) -> Option<&[u8]> {
+        self.frame.palette_alpha()
+    }
+
+    /// Palette entry `index` as RGBA — alpha `255` when no alpha record
+    /// covers it; `None` when the palette does not reach `index`.
+    pub fn palette_rgba(&self, index: u8) -> Option<[u8; 4]> {
+        self.frame.palette_rgba(index)
+    }
+
+    /// Every palette entry as RGBA (alpha filled in per
+    /// [`palette_rgba`](Self::palette_rgba)); `None` without a palette.
+    pub fn palette_entries(&self) -> Option<Vec<[u8; 4]>> {
+        let n = self.frame.palette()?.len() / 3;
+        Some(
+            (0..n.min(256))
+                .filter_map(|i| self.frame.palette_rgba(i as u8))
+                .collect(),
+        )
+    }
+
+    /// Replace the palette with RGBA entries (both side-channel
+    /// records). Meaningful for `Pal8` pictures only; harmless elsewhere.
+    pub fn with_palette_rgba(mut self, palette: &[[u8; 4]]) -> Self {
+        self.frame.set_palette_rgba(palette);
+        self
+    }
+
+    /// Replace the palette (packed RGB triplets), leaving any
+    /// palette-alpha record in place.
+    pub fn with_palette(mut self, rgb: Vec<u8>) -> Self {
+        self.frame.set_palette(rgb);
+        self
+    }
+
+    /// Attach (or replace) the palette-alpha record: one byte per
+    /// entry, in entry order, possibly shorter than the palette (the
+    /// rest is opaque). Empty removes the record.
+    pub fn set_palette_alpha(&mut self, alpha: Vec<u8>) {
+        self.frame.set_palette_alpha(alpha);
+    }
+
+    /// Builder form of [`set_palette_alpha`](Self::set_palette_alpha).
+    pub fn with_palette_alpha(mut self, alpha: Vec<u8>) -> Self {
+        self.frame.set_palette_alpha(alpha);
+        self
+    }
+
+    /// True when any palette entry is not fully opaque — the picture
+    /// has transparency even though `Pal8` itself has no alpha channel.
+    pub fn has_palette_alpha(&self) -> bool {
+        self.frame
+            .palette_alpha()
+            .is_some_and(|a| a.iter().any(|&v| v != u8::MAX))
+    }
+
+    /// True when the picture carries transparency: an alpha channel in
+    /// its layout, or a palette with a non-opaque entry
+    /// ([`has_palette_alpha`](Self::has_palette_alpha)).
+    pub fn has_alpha(&self) -> bool {
+        self.format().has_alpha() || self.has_palette_alpha()
+    }
+
+    // ---- metadata ---------------------------------------------------------
+
+    /// Per-picture metadata blobs (the frame's own record: a page's
+    /// Exif, a burst item's profile). Empty for most stills, whose
+    /// metadata is stream-level ([`stream_blobs`](Self::stream_blobs)).
+    pub fn frame_blobs(&self) -> &[MetadataBlob] {
+        &self.blobs
+    }
+
+    /// Stream-level metadata blobs: the file's ICC profile / Exif / XMP
+    /// as the demuxer put them on the stream's `CodecParameters`.
+    pub fn stream_blobs(&self) -> &[MetadataBlob] {
+        self.params.blobs()
+    }
+
+    /// The effective blobs of this picture: every frame blob, then the
+    /// stream blobs of kinds no frame blob carries — a frame blob
+    /// overrides the stream blob(s) of the same kind.
+    pub fn blobs(&self) -> Vec<&MetadataBlob> {
+        let mut out: Vec<&MetadataBlob> = self.blobs.iter().collect();
+        for b in self.params.blobs() {
+            if !self.blobs.iter().any(|f| f.kind == b.kind) {
+                out.push(b);
+            }
+        }
+        out
+    }
+
+    /// The first effective blob of `kind` (frame level first, then
+    /// stream level).
+    pub fn blob(&self, kind: &BlobKind) -> Option<&MetadataBlob> {
+        self.blobs
+            .iter()
+            .find(|b| b.is(kind))
+            .or_else(|| self.params.blob(kind))
+    }
+
+    /// Every effective blob of `kind`: the frame's when it has any of
+    /// that kind, else the stream's.
+    pub fn blobs_of(&self, kind: &BlobKind) -> Vec<&MetadataBlob> {
+        let frame: Vec<&MetadataBlob> = self.blobs.iter().filter(|b| b.is(kind)).collect();
+        if !frame.is_empty() {
+            return frame;
+        }
+        self.params.blobs().iter().filter(|b| b.is(kind)).collect()
+    }
+
+    /// The ICC profile (`BlobKind::ICC` payload: a complete profile
+    /// file), per the precedence of [`blob`](Self::blob).
+    pub fn icc(&self) -> Option<&[u8]> {
+        self.blob(&BlobKind::ICC).map(|b| b.data.as_slice())
+    }
+
+    /// The Exif block (`BlobKind::EXIF` payload: TIFF-structured, from
+    /// the byte-order mark).
+    pub fn exif(&self) -> Option<&[u8]> {
+        self.blob(&BlobKind::EXIF).map(|b| b.data.as_slice())
+    }
+
+    /// The XMP packet (`BlobKind::XMP` payload: UTF-8 RDF/XML).
+    pub fn xmp(&self) -> Option<&[u8]> {
+        self.blob(&BlobKind::XMP).map(|b| b.data.as_slice())
+    }
+
+    /// The IPTC-IIM datasets (`BlobKind::IPTC`).
+    pub fn iptc(&self) -> Option<&[u8]> {
+        self.blob(&BlobKind::IPTC).map(|b| b.data.as_slice())
+    }
+
+    /// True when any blob is attached at either level.
+    pub fn has_metadata(&self) -> bool {
+        !self.blobs.is_empty() || !self.params.blobs().is_empty()
+    }
+
+    /// Append a per-picture blob (frame level; it then overrides a
+    /// stream blob of the same kind and travels with the frame into an
+    /// encoder).
+    pub fn push_blob(&mut self, blob: MetadataBlob) {
+        self.blobs.push(blob);
+    }
+
+    /// Builder form of [`push_blob`](Self::push_blob).
+    pub fn with_blob(mut self, blob: MetadataBlob) -> Self {
+        self.blobs.push(blob);
+        self
+    }
+
+    /// Replace the per-picture blobs.
+    pub fn set_blobs(&mut self, blobs: Vec<MetadataBlob>) {
+        self.blobs = blobs;
+    }
+
+    /// Builder form of [`set_blobs`](Self::set_blobs).
+    pub fn with_blobs(mut self, blobs: Vec<MetadataBlob>) -> Self {
+        self.blobs = blobs;
+        self
+    }
+
+    /// Replace the stream-level blobs (what a demuxer would have put on
+    /// the stream; [`crate::encode`] hands them to the encoder's
+    /// parameters).
+    pub fn with_stream_blobs(mut self, blobs: Vec<MetadataBlob>) -> Self {
+        self.params.blobs = blobs;
+        self
+    }
+
+    /// Detach and return the per-picture blobs.
+    pub fn take_blobs(&mut self) -> Vec<MetadataBlob> {
+        std::mem::take(&mut self.blobs)
+    }
+
+    /// Keep only the blobs (both levels) `keep` accepts.
+    pub fn retain_blobs(&mut self, mut keep: impl FnMut(&MetadataBlob) -> bool) {
+        self.blobs.retain(|b| keep(b));
+        self.params.blobs.retain(|b| keep(b));
+    }
+
+    /// Drop every blob at both levels (the container's string metadata
+    /// on [`crate::ImageFile`] is untouched).
+    pub fn strip_metadata(&mut self) {
+        self.blobs.clear();
+        self.params.blobs.clear();
+    }
+
+    /// Builder form of [`strip_metadata`](Self::strip_metadata).
+    pub fn without_metadata(mut self) -> Self {
+        self.strip_metadata();
+        self
     }
 
     /// Display delay for this picture inside a sequence or animation.
@@ -280,7 +524,8 @@ impl Image {
         self.delay = delay;
     }
 
-    /// Everything but the frame and its parameters.
+    /// Everything but the frame and its parameters (the per-picture
+    /// blobs included: they describe the picture, whatever its layout).
     fn clone_timing(&self) -> Image {
         Image {
             frame: VideoFrame {
@@ -288,6 +533,7 @@ impl Image {
                 planes: Vec::new(),
             },
             params: CodecParameters::video(CodecId::new("rawvideo")),
+            blobs: self.blobs.clone(),
             delay: self.delay,
             index: self.index,
             stream: self.stream,
@@ -314,26 +560,39 @@ impl Image {
         self
     }
 
-    /// The underlying frame.
+    /// The underlying frame: pixel planes plus the palette, palette
+    /// alpha, colour-signal and significant-bits records. Its
+    /// metadata-blobs record was lifted into
+    /// [`frame_blobs`](Self::frame_blobs) and is re-attached by
+    /// [`into_video_frame`](Self::into_video_frame).
     pub fn frame(&self) -> &VideoFrame {
         &self.frame
     }
 
-    /// The stream parameters describing the frame.
+    /// The stream parameters describing the frame (their `blobs` are the
+    /// [`stream_blobs`](Self::stream_blobs)).
     pub fn params(&self) -> &CodecParameters {
         &self.params
     }
 
-    /// Hand the frame back to the framework (pipeline, encoder, filter).
+    /// Hand the frame back to the framework (pipeline, encoder, filter),
+    /// with the per-picture blobs re-attached as its side-channel record.
     pub fn into_video_frame(self) -> (VideoFrame, CodecParameters) {
-        (self.frame, self.params)
+        (self.frame.with_blobs(self.blobs), self.params)
     }
 
     /// Convert to another layout through `oxideav-pixfmt`. Same format
     /// returns a clone. The colour signal used for YCbCr ↔ RGB is the
     /// frame's own record, else the stream-level one from the container
     /// (what [`color_signal`](Self::color_signal) reports), else
-    /// pixfmt's defaults.
+    /// pixfmt's defaults. The per-picture blobs are carried over.
+    ///
+    /// Palette alpha: a `Pal8` source with a palette-alpha record asked
+    /// for a layout with alpha is expanded here through
+    /// [`palette_rgba`](Self::palette_rgba) (transparent entries yield
+    /// alpha `0`, uncovered ones `255`) and converted on from `Rgba`; a
+    /// target without alpha drops it (no compositing — the entry's RGB
+    /// is used as is), as [`to_rgb8`](Self::to_rgb8) documents.
     pub fn to_format(&self, dst: PixelFormat) -> Result<Image> {
         let src = self.format();
         if src == dst {
@@ -345,15 +604,22 @@ impl Image {
                 cx = cx.with_signal(sig);
             }
         }
+        let (w, h) = (self.width(), self.height());
+        let mut cur = src;
+        let mut converted: Option<VideoFrame> = None;
+        if src == PixelFormat::Pal8 && dst.has_alpha() && self.frame.palette_alpha().is_some() {
+            converted = Some(self.expand_palette_rgba()?);
+            cur = PixelFormat::Rgba;
+        }
         // A deep source asked for a 16-bit view walks the deep pivots
         // when pixfmt has no single-step route, so no hop narrows to
         // eight bits (pixfmt's own staging would pivot through Gray8 for
         // Gray16Le → Rgb48Le, say).
-        let hops = deep_route(src, dst).unwrap_or_default();
-        let (w, h) = (self.width(), self.height());
-        let mut cur = src;
-        let mut converted: Option<VideoFrame> = None;
+        let hops = deep_route(cur, dst).unwrap_or_default();
         for next in hops.into_iter().chain(std::iter::once(dst)) {
+            if next == cur {
+                continue;
+            }
             let info = FrameInfo::new(cur, w, h);
             let from = converted.as_ref().unwrap_or(&self.frame);
             converted = Some(convert_with(
@@ -376,19 +642,61 @@ impl Image {
         })
     }
 
+    /// `Pal8` → tight `Rgba` through the frame's palette and
+    /// palette-alpha records. An index past the palette is opaque black.
+    fn expand_palette_rgba(&self) -> Result<VideoFrame> {
+        let (w, h) = (self.width() as usize, self.height() as usize);
+        let plane = self
+            .frame
+            .image_planes()
+            .first()
+            .ok_or_else(|| Error::invalid("Pal8 frame has no plane"))?;
+        if self.frame.palette().is_none() {
+            return Err(Error::invalid("Pal8 frame carries no palette"));
+        }
+        let table: Vec<[u8; 4]> = (0..=255u8)
+            .map(|i| self.frame.palette_rgba(i).unwrap_or([0, 0, 0, 255]))
+            .collect();
+        let mut data = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            let row = plane
+                .data
+                .get(y * plane.stride..y * plane.stride + w)
+                .ok_or_else(|| Error::invalid("Pal8 plane is too short for its geometry"))?;
+            for &i in row {
+                data.extend_from_slice(&table[usize::from(i)]);
+            }
+        }
+        let mut frame = VideoFrame {
+            pts: self.frame.pts,
+            planes: vec![VideoPlane {
+                stride: w * 4,
+                data,
+            }],
+        };
+        if let Some(sig) = self.frame.color_signal() {
+            frame.set_color_signal(sig);
+        }
+        Ok(frame)
+    }
+
     /// Tightly packed `Gray8` bytes (`width × height`): luma of colour
-    /// sources, palette expanded first.
+    /// sources, palette expanded first (palette alpha dropped).
     pub fn to_gray8(&self) -> Result<Vec<u8>> {
         self.packed_bytes(PixelFormat::Gray8)
     }
 
-    /// Tightly packed `Rgb24` bytes (`width × height × 3`).
+    /// Tightly packed `Rgb24` bytes (`width × height × 3`). Alpha —
+    /// a channel or a palette entry's alpha — is dropped, never
+    /// composited: a transparent pixel yields its stored RGB.
     pub fn to_rgb8(&self) -> Result<Vec<u8>> {
         self.packed_bytes(PixelFormat::Rgb24)
     }
 
     /// Tightly packed `Rgba` bytes (`width × height × 4`); alpha is
-    /// opaque when the source has none.
+    /// opaque when the source has none. A `Pal8` source with a
+    /// palette-alpha record yields each entry's alpha (`0` for a
+    /// transparent entry, `255` for opaque and uncovered ones).
     pub fn to_rgba8(&self) -> Result<Vec<u8>> {
         self.packed_bytes(PixelFormat::Rgba)
     }
@@ -396,14 +704,14 @@ impl Image {
     /// Tightly packed `Rgba64Le` bytes (`width × height × 8`,
     /// little-endian 16-bit samples); see [`to_rgb16`](Self::to_rgb16)
     /// for the depth rule. Alpha is opaque (`65535`) when the source has
-    /// none.
+    /// none; palette alpha widens like any 8-bit sample.
     pub fn to_rgba16(&self) -> Result<Vec<u8>> {
         self.packed_bytes(PixelFormat::Rgba64Le)
     }
 
     /// Tightly packed `Rgb48Le` bytes (`width × height × 6`,
     /// little-endian 16-bit samples): the lossless 16-bit view for
-    /// texture consumers.
+    /// texture consumers. Alpha is dropped as in [`to_rgb8`](Self::to_rgb8).
     ///
     /// Depth rule (shared by [`to_rgba16`](Self::to_rgba16) and
     /// [`to_gray16`](Self::to_gray16)): a 16-bit source is returned
@@ -444,8 +752,9 @@ impl Image {
     }
 
     /// The `w × h` window at `(x, y)` as a new image in the same layout,
-    /// with the palette, colour signal and significant-bits records
-    /// carried over. Works on every layout `PixelFormat` describes with
+    /// with the palette, palette alpha, colour signal and
+    /// significant-bits records and the blobs at both levels carried
+    /// over. Works on every layout `PixelFormat` describes with
     /// whole bytes per sample position; for chroma-subsampled layouts
     /// `x` and `y` must sit on the chroma grid (even for 4:2:0), else
     /// `Unsupported`. Bit-packed mono and packed 4:2:2 macropixel
@@ -514,6 +823,9 @@ impl Image {
         };
         if let Some(pal) = self.frame.palette() {
             frame.set_palette(pal.to_vec());
+        }
+        if let Some(alpha) = self.frame.palette_alpha() {
+            frame.set_palette_alpha(alpha.to_vec());
         }
         if let Some(bits) = self.frame.significant_bits() {
             frame.set_significant_bits(bits.to_vec());
@@ -747,14 +1059,38 @@ mod tests {
     #[test]
     fn deep_routes_only_where_pixfmt_has_no_direct_step() {
         use PixelFormat as P;
-        assert_eq!(deep_route(P::Gray16Le, P::Gray16Le), None);
+        // Which deep pairs pixfmt converts directly is pixfmt's to
+        // grow (release by release), so the rule is checked against
+        // `supports_direct` rather than a pinned pair: no route where a
+        // direct step exists, else a chain of direct steps through the
+        // pivots, at most three hops.
+        let check = |a: P, b: P| {
+            let r = deep_route(a, b);
+            if a == b || supports_direct(a, b) {
+                assert_eq!(r, None, "{a:?} → {b:?}");
+                return;
+            }
+            let r = r.unwrap_or_else(|| panic!("{a:?} → {b:?} has no route"));
+            assert!(!r.is_empty() && r.len() <= 3);
+            assert!(r.iter().all(|f| DEEP_PIVOTS.contains(f)));
+            let mut cur = a;
+            for &hop in &r {
+                assert!(supports_direct(cur, hop), "{cur:?} → {hop:?}");
+                cur = hop;
+            }
+            assert!(supports_direct(cur, b), "{cur:?} → {b:?}");
+        };
+        for &a in &DEEP_PIVOTS {
+            for &b in &DEEP_PIVOTS {
+                check(a, b);
+            }
+        }
+        check(P::Yuv444P16Le, P::Gray16Le);
+        check(P::Yuv420P10Le, P::Rgb48Le);
+        // Shallow sources and non-view targets never route.
         assert_eq!(deep_route(P::Rgb24, P::Rgb48Le), None);
-        assert_eq!(deep_route(P::Rgb48Le, P::Rgba64Le), None);
         assert_eq!(deep_route(P::Rgb48Le, P::Gray8), None);
-        let r = deep_route(P::Gray16Le, P::Rgb48Le).unwrap();
-        assert!(!r.is_empty() && r.len() <= 3);
-        assert!(r.iter().all(|f| DEEP_PIVOTS.contains(f)));
-        assert!(deep_route(P::Rgb48Le, P::Gray16Le).is_some());
+        assert_eq!(deep_route(P::Rgba, P::Rgba64Le), None);
     }
 
     #[test]

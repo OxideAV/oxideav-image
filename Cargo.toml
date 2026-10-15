@@ -18,6 +18,6 @@ categories = ["multimedia::encoding", "multimedia::images"]
 # The gateway consumes the registries an application populated (normally
 # `oxideav_meta::register_all`) and never depends on a format crate, so
 # it stays publishable on its own.
-oxideav-core = "0.1"
+oxideav-core = "0.1.40"
 # Every pixel-layout conversion `Image::to_*` offers.
 oxideav-pixfmt = "0.1"

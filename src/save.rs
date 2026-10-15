@@ -10,8 +10,8 @@ use crate::error::{Error, Result};
 use crate::image::{duration_to_ticks, Image};
 use crate::ladder;
 use oxideav_core::{
-    CodecId, CodecParameters, Frame, MediaType, OptionField, Packet, PixelFormat, RuntimeContext,
-    StreamInfo, TimeBase,
+    BlobKind, CodecId, CodecParameters, Frame, MediaType, MetadataBlob, OptionField, Packet,
+    PixelFormat, RuntimeContext, StreamInfo, TimeBase,
 };
 
 /// Knobs for [`encode`] / [`encode_frames`] / [`save`].
@@ -39,6 +39,18 @@ pub struct SaveOptions {
     /// Delay used for a picture that carries none in a multi-picture
     /// encode (`None` = 100 ms).
     pub default_delay: Option<Duration>,
+    /// Blobs written into the encoder's stream parameters on top of
+    /// the pictures' own (README, *Metadata*): a blob here replaces
+    /// every source blob of the same kind (set an ICC profile, swap
+    /// the XMP packet); other kinds pass through untouched.
+    pub blobs: Vec<MetadataBlob>,
+    /// Hand no source blob to the encoder — neither the pictures'
+    /// stream-level ones nor their per-picture ones. `blobs` above are
+    /// still written. Default `false`.
+    pub strip_metadata: bool,
+    /// Source blob kinds withheld from the encoder when
+    /// `strip_metadata` is off.
+    pub strip_blobs: Vec<BlobKind>,
 }
 
 impl SaveOptions {
@@ -82,6 +94,91 @@ impl SaveOptions {
         self.default_delay = Some(d);
         self
     }
+
+    /// Add a blob for the encoder's stream parameters (see the field).
+    pub fn with_blob(mut self, blob: MetadataBlob) -> Self {
+        self.blobs.push(blob);
+        self
+    }
+
+    /// Replace the blobs for the encoder's stream parameters.
+    pub fn with_blobs(mut self, blobs: Vec<MetadataBlob>) -> Self {
+        self.blobs = blobs;
+        self
+    }
+
+    /// Keep (`true`, the default) or withhold every source blob.
+    pub fn with_metadata(mut self, keep: bool) -> Self {
+        self.strip_metadata = !keep;
+        self
+    }
+
+    /// Withhold every source blob from the encoder.
+    pub fn without_metadata(self) -> Self {
+        self.with_metadata(false)
+    }
+
+    /// Withhold these source blob kinds from the encoder.
+    pub fn with_stripped_blobs<I, K>(mut self, kinds: I) -> Self
+    where
+        I: IntoIterator<Item = K>,
+        K: Into<BlobKind>,
+    {
+        self.strip_blobs = kinds.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Whether a source blob reaches the encoder.
+    fn keeps(&self, blob: &MetadataBlob) -> bool {
+        !self.strip_metadata && !self.strip_blobs.iter().any(|k| blob.is(k))
+    }
+
+    /// The per-picture blobs handed to the encoder with `image`'s frame.
+    fn frame_blobs(&self, image: &Image) -> Vec<MetadataBlob> {
+        image
+            .frame_blobs()
+            .iter()
+            .filter(|b| self.keeps(b))
+            .cloned()
+            .collect()
+    }
+
+    /// The stream-level blobs of an encoder whose first picture is
+    /// `first`: the picture's stream blobs — and, for a single-picture
+    /// encode (`single`), its per-picture blobs ahead of them (frame
+    /// wins by kind), since a still-format encoder reads the stream
+    /// parameters — filtered by the strip rules, then `self.blobs`,
+    /// each replacing the source blobs of its kind.
+    fn stream_blobs(&self, first: &Image, single: bool) -> Vec<MetadataBlob> {
+        let mut out: Vec<MetadataBlob> = if single {
+            first.blobs().into_iter().cloned().collect()
+        } else {
+            first.stream_blobs().to_vec()
+        };
+        out.retain(|b| self.keeps(b));
+        for b in &self.blobs {
+            out.retain(|s| s.kind != b.kind);
+        }
+        out.extend(self.blobs.iter().cloned());
+        out
+    }
+}
+
+/// How a target carries metadata blobs, from
+/// [`EncodeTarget::metadata_support`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MetadataSupport {
+    /// The encoder declares nothing about blobs (no codec does today —
+    /// the framework has no capability field for it). The gateway hands
+    /// every blob through regardless: stream-level ones on the encoder's
+    /// `CodecParameters::blobs`, per-picture ones on each frame's
+    /// record. Whether the format embeds them is the encoder's.
+    PassThrough,
+    /// The encoder declares the kinds it writes; others are handed
+    /// through but will not be embedded. Reserved for a framework
+    /// capability declaration — never produced today.
+    Declared(Vec<BlobKind>),
 }
 
 /// Default delay for a picture without one in a multi-picture encode.
@@ -152,12 +249,32 @@ impl EncodeTarget {
 
     /// The layouts [`encode`] would offer the encoder for a picture in
     /// `src`, in order (README, *Pixel-format ladder*);
-    /// `SaveOptions::pixel_format` reduces it to that one layout.
+    /// `SaveOptions::pixel_format` reduces it to that one layout. The
+    /// source's transparency is read from its layout; for a `Pal8`
+    /// picture with a transparent palette entry use
+    /// [`ladder_for`](Self::ladder_for), which ranks alpha rungs first.
     pub fn ladder(&self, src: PixelFormat, opts: &SaveOptions) -> Vec<PixelFormat> {
         match opts.pixel_format {
             Some(f) => vec![f],
             None => ladder::ladder(src, &self.accepted),
         }
+    }
+
+    /// [`ladder`](Self::ladder) for an actual picture: what [`encode`]
+    /// tries for it, palette alpha accounted for ([`Image::has_alpha`]).
+    pub fn ladder_for(&self, image: &Image, opts: &SaveOptions) -> Vec<PixelFormat> {
+        match opts.pixel_format {
+            Some(f) => vec![f],
+            None => ladder::ladder_with_alpha(image.format(), image.has_alpha(), &self.accepted),
+        }
+    }
+
+    /// How the target carries metadata blobs. Always
+    /// [`MetadataSupport::PassThrough`] today: every blob the pictures
+    /// or [`SaveOptions::blobs`] carry reaches the encoder; the
+    /// framework has no declaration of which kinds a format embeds.
+    pub fn metadata_support(&self) -> MetadataSupport {
+        MetadataSupport::PassThrough
     }
 }
 
@@ -306,7 +423,7 @@ pub fn encode_frames(
         )));
     }
 
-    let candidates = candidates(ctx, &codec_id, first.format(), opts);
+    let candidates = candidates(ctx, &codec_id, first, opts);
     let mut first_err: Option<Error> = None;
     let mut same = true;
     let mut attempts: Vec<String> = Vec::new();
@@ -477,18 +594,23 @@ fn default_codec_for_container(
 }
 
 /// Encoder input layouts to try, in order: the forced one, else the
-/// ladder of [`crate::ladder`] for the picture's own layout and the
-/// encoder's declared accepted set.
+/// ladder of [`crate::ladder`] for the picture's own layout (and its
+/// transparency, palette alpha included) and the encoder's declared
+/// accepted set.
 fn candidates(
     ctx: &RuntimeContext,
     codec_id: &CodecId,
-    src: PixelFormat,
+    first: &Image,
     opts: &SaveOptions,
 ) -> Vec<PixelFormat> {
     if let Some(f) = opts.pixel_format {
         return vec![f];
     }
-    ladder::ladder(src, &declared_formats(ctx, codec_id))
+    ladder::ladder_with_alpha(
+        first.format(),
+        first.has_alpha(),
+        &declared_formats(ctx, codec_id),
+    )
 }
 
 /// The accepted input layouts the encoder `first_encoder` picks for
@@ -523,7 +645,15 @@ fn encode_attempt(
     let mut streams: Vec<StreamInfo> = Vec::with_capacity(groups.len());
     let mut per_group: Vec<Vec<Packet>> = Vec::with_capacity(groups.len());
     for (gi, g) in groups.iter().enumerate() {
-        let params = encoder_params(ctx, codec_id, g, &images[g.members[0]], dst, opts);
+        let params = encoder_params(
+            ctx,
+            codec_id,
+            g,
+            &images[g.members[0]],
+            images.len() == 1,
+            dst,
+            opts,
+        );
         let (packets, out_params, total) = encode_group(
             ctx,
             images,
@@ -533,6 +663,7 @@ fn encode_attempt(
             matches!(target, Target::Container(_)),
             time_base,
             default_delay,
+            opts,
         )?;
         streams.push(StreamInfo {
             index: gi as u32,
@@ -612,12 +743,14 @@ fn encode_attempt(
     Ok(bytes)
 }
 
-/// Encoder parameters for one geometry group in layout `dst`.
+/// Encoder parameters for one geometry group in layout `dst`
+/// (`single`: the whole encode is one picture).
 fn encoder_params(
     ctx: &RuntimeContext,
     codec_id: &CodecId,
     group: &Group,
     first: &Image,
+    single: bool,
     dst: PixelFormat,
     opts: &SaveOptions,
 ) -> CodecParameters {
@@ -628,6 +761,7 @@ fn encoder_params(
     if let Some(sig) = first.color_signal() {
         params.color_signal = sig;
     }
+    params.blobs = opts.stream_blobs(first, single);
     if let Some(q) = opts.quality {
         let declared = ctx
             .codecs
@@ -657,6 +791,7 @@ fn encode_group(
     has_muxer: bool,
     time_base: TimeBase,
     default_delay: Duration,
+    opts: &SaveOptions,
 ) -> Result<(Vec<Packet>, CodecParameters, i64)> {
     let codec_id = &params.codec_id;
     let dst = params.pixel_format.unwrap_or(PixelFormat::Rgba);
@@ -669,6 +804,7 @@ fn encode_group(
         let img = &images[i];
         let converted = img.to_format(dst)?;
         let (mut frame, _) = converted.into_video_frame();
+        frame.set_blobs(opts.frame_blobs(img));
         frame.pts = Some(pts);
         let delay = if images.len() == 1 {
             img.delay().unwrap_or(Duration::ZERO)
@@ -698,6 +834,7 @@ fn encode_group(
         for &i in &group.members {
             let mut enc = ctx.codecs.first_encoder(params)?;
             let (mut frame, _) = images[i].to_format(dst)?.into_video_frame();
+            frame.set_blobs(opts.frame_blobs(&images[i]));
             frame.pts = Some(0);
             enc.send_frame(&Frame::Video(frame))?;
             enc.flush()?;

@@ -74,8 +74,10 @@ const RUNGS: &[PixelFormat] = &[
     PixelFormat::Gray16Le,
 ];
 
-/// Sort key of a candidate layout `f` for a source `src`: lower first.
-fn rank(src: PixelFormat, f: PixelFormat) -> (u8, u8, u8, u8, u8, String) {
+/// Sort key of a candidate layout `f` for a source `src` (`src_alpha`:
+/// the source carries transparency — its layout has alpha, or its
+/// palette has a non-opaque entry): lower first.
+fn rank(src: PixelFormat, src_alpha: bool, f: PixelFormat) -> (u8, u8, u8, u8, u8, String) {
     let sf = family(src);
     let ff = family(f);
     // Family: the source's own first; grey last unless the source is
@@ -90,7 +92,7 @@ fn rank(src: PixelFormat, f: PixelFormat) -> (u8, u8, u8, u8, u8, String) {
     // Tier: the source's own bit tier first.
     let tier = u8::from(is_deep(f) != is_deep(src));
     // Alpha: keep it when the source has it, do not invent it otherwise.
-    let alpha = u8::from(f.has_alpha() != src.has_alpha());
+    let alpha = u8::from(f.has_alpha() != src_alpha);
     // Fidelity: at or below the source by decreasing fidelity, then
     // above it, closest first.
     let (s, c) = (fidelity(src), fidelity(f));
@@ -103,14 +105,26 @@ fn rank(src: PixelFormat, f: PixelFormat) -> (u8, u8, u8, u8, u8, String) {
 /// The layouts to offer an encoder for a picture in `src`, in order.
 /// `declared` is the encoder's accepted set (empty = undeclared, use
 /// the fixed rungs). Every rung but the source itself must be reachable
-/// through `oxideav-pixfmt`.
+/// through `oxideav-pixfmt`. The source's transparency is read from its
+/// layout; [`ladder_with_alpha`] takes it explicitly (palette alpha).
 pub(crate) fn ladder(src: PixelFormat, declared: &[PixelFormat]) -> Vec<PixelFormat> {
+    ladder_with_alpha(src, src.has_alpha(), declared)
+}
+
+/// [`ladder`] for a source whose transparency is known independently of
+/// its layout: a `Pal8` picture with a transparent palette entry ranks
+/// the alpha-carrying rungs first (`Rgba` before `Rgb24`).
+pub(crate) fn ladder_with_alpha(
+    src: PixelFormat,
+    src_alpha: bool,
+    declared: &[PixelFormat],
+) -> Vec<PixelFormat> {
     let mut rungs: Vec<PixelFormat> = if declared.is_empty() {
         RUNGS.to_vec()
     } else {
         declared.to_vec()
     };
-    rungs.sort_by_cached_key(|f| rank(src, *f));
+    rungs.sort_by_cached_key(|f| rank(src, src_alpha, *f));
     rungs.dedup();
     let mut out = Vec::with_capacity(rungs.len() + 1);
     if declared.is_empty() || declared.contains(&src) {
@@ -188,6 +202,29 @@ mod tests {
         let l = ladder(P::Gray8, &declared);
         assert_eq!(l, vec![P::Gray8, P::Yuv444P, P::Yuv420P]);
         assert_eq!(ladder(P::Rgba, &[P::Yuv420P]), vec![P::Yuv420P]);
+    }
+
+    #[test]
+    fn palette_alpha_ranks_alpha_rungs_first() {
+        // Pal8 itself has no alpha channel: without palette alpha Rgb24
+        // leads, with it Rgba does — in the fixed rungs and in a
+        // declared set alike.
+        let l = ladder(P::Pal8, &[]);
+        assert!(pos(&l, P::Rgb24) < pos(&l, P::Rgba));
+        let l = ladder_with_alpha(P::Pal8, true, &[]);
+        assert_eq!(&l[..2], &[P::Pal8, P::Rgba]);
+        assert!(pos(&l, P::Rgba) < pos(&l, P::Rgb24));
+        assert!(pos(&l, P::Rgba64Le) < pos(&l, P::Rgb48Le));
+        assert!(pos(&l, P::Yuva444P) < pos(&l, P::Yuv444P));
+        let declared = [P::Rgb24, P::Rgba, P::Gray8];
+        assert_eq!(
+            ladder_with_alpha(P::Pal8, true, &declared),
+            vec![P::Rgba, P::Rgb24, P::Gray8]
+        );
+        assert_eq!(
+            ladder_with_alpha(P::Pal8, false, &declared),
+            vec![P::Rgb24, P::Rgba, P::Gray8]
+        );
     }
 
     #[test]

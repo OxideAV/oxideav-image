@@ -7,13 +7,19 @@
 //! ```text
 //! magic "OXIM" | width u32 | height u32 | format tag u8 | flags u8
 //! | frame count u32 | metadata length u16 | metadata ("k=v\n" …)
+//! | stream blobs length u32 | stream blobs (`blob::encode_blobs` form)
 //! then per frame: delay_ms u32 | payload length u32 | payload
 //! ```
 //!
 //! `flags` bit 0: the demuxer stamps `Packet::duration`; bit 1: the
 //! demuxer leaves packet `pts` unset. The codec payload is
-//! `palette length u16 | palette RGB bytes | planes, tight rows, in
-//! plane order`, which the decoder splits with the stream geometry.
+//! `palette length u16 | palette RGB bytes | palette alpha length u16 |
+//! palette alpha bytes | frame blobs length u32 | frame blobs | planes,
+//! tight rows, in plane order`, which the decoder splits with the
+//! stream geometry. The stream blobs land on the stream's
+//! `CodecParameters::blobs`, the frame blobs and the palette alpha on
+//! the decoded `VideoFrame`'s side-channel records — the carriage a
+//! real sibling crate uses once it adopts core 0.1.40.
 //!
 //! Registered names: container `oxim` (extension `.oxim`, codec `oxim`
 //! accepting every layout in [`FORMATS`]), container `oximrgb` (same
@@ -23,12 +29,13 @@
 
 use std::io::{Read, Seek, SeekFrom, Write};
 
+use oxideav_core::blob::{decode_blobs, encode_blobs};
 use oxideav_core::{
     parse_options, CodecCapabilities, CodecId, CodecInfo, CodecOptionsStruct, CodecParameters,
-    CodecResolver, Decoder, Demuxer, Encoder, Error, Frame, MediaType, Muxer, OptionField,
-    OptionKind, OptionValue, Packet, PixelFormat, ProbeData, ProbeScore, ReadSeek, Result,
-    RuntimeContext, StreamInfo, TimeBase, VideoFrame, VideoPlane, WriteSeek, MAX_PROBE_SCORE,
-    PROBE_SCORE_EXTENSION,
+    CodecResolver, Decoder, Demuxer, Encoder, Error, Frame, MediaType, MetadataBlob, Muxer,
+    OptionField, OptionKind, OptionValue, Packet, PixelFormat, ProbeData, ProbeScore, ReadSeek,
+    Result, RuntimeContext, StreamInfo, TimeBase, VideoFrame, VideoPlane, WriteSeek,
+    MAX_PROBE_SCORE, PROBE_SCORE_EXTENSION,
 };
 
 pub(crate) const CONTAINER: &str = "oxim";
@@ -81,6 +88,10 @@ pub(crate) struct FixtureFrame {
     /// Tight planes in plane order.
     pub planes: Vec<VideoPlane>,
     pub palette: Option<Vec<u8>>,
+    /// Palette-alpha record (one byte per entry, may be shorter).
+    pub palette_alpha: Option<Vec<u8>>,
+    /// Per-frame metadata blobs.
+    pub blobs: Vec<MetadataBlob>,
 }
 
 /// A fixture file before serialisation.
@@ -91,6 +102,8 @@ pub(crate) struct Fixture {
     pub format: PixelFormat,
     pub flags: u8,
     pub metadata: Vec<(String, String)>,
+    /// Stream-level metadata blobs.
+    pub blobs: Vec<MetadataBlob>,
     pub frames: Vec<FixtureFrame>,
 }
 
@@ -102,6 +115,7 @@ impl Fixture {
             format,
             flags: FLAG_DURATIONS,
             metadata: Vec::new(),
+            blobs: Vec::new(),
             frames: Vec::new(),
         }
     }
@@ -114,8 +128,21 @@ impl Fixture {
             delay_ms,
             planes,
             palette,
+            palette_alpha: None,
+            blobs: Vec::new(),
         });
         self
+    }
+
+    /// Stream-level blobs the demuxer reports on the stream.
+    pub fn with_blobs(mut self, blobs: Vec<MetadataBlob>) -> Self {
+        self.blobs = blobs;
+        self
+    }
+
+    /// The last pushed frame, to attach per-frame records.
+    pub fn last_frame(&mut self) -> &mut FixtureFrame {
+        self.frames.last_mut().expect("a frame was pushed")
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -135,8 +162,16 @@ impl Fixture {
         }
         out.extend_from_slice(&(meta.len() as u16).to_le_bytes());
         out.extend_from_slice(&meta);
+        let blobs = encode_blobs(&self.blobs);
+        out.extend_from_slice(&(blobs.len() as u32).to_le_bytes());
+        out.extend_from_slice(&blobs);
         for f in &self.frames {
-            let payload = encode_payload(&f.planes, f.palette.as_deref());
+            let payload = encode_payload(
+                &f.planes,
+                f.palette.as_deref(),
+                f.palette_alpha.as_deref(),
+                &f.blobs,
+            );
             out.extend_from_slice(&f.delay_ms.to_le_bytes());
             out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
             out.extend_from_slice(&payload);
@@ -182,15 +217,46 @@ pub(crate) fn test_palette(seed: u8) -> Vec<u8> {
         .collect()
 }
 
-fn encode_payload(planes: &[VideoPlane], palette: Option<&[u8]>) -> Vec<u8> {
+fn encode_payload(
+    planes: &[VideoPlane],
+    palette: Option<&[u8]>,
+    palette_alpha: Option<&[u8]>,
+    blobs: &[MetadataBlob],
+) -> Vec<u8> {
     let mut out = Vec::new();
     let pal = palette.unwrap_or(&[]);
     out.extend_from_slice(&(pal.len() as u16).to_le_bytes());
     out.extend_from_slice(pal);
+    let alpha = palette_alpha.unwrap_or(&[]);
+    out.extend_from_slice(&(alpha.len() as u16).to_le_bytes());
+    out.extend_from_slice(alpha);
+    let blobs = encode_blobs(blobs);
+    out.extend_from_slice(&(blobs.len() as u32).to_le_bytes());
+    out.extend_from_slice(&blobs);
     for p in planes {
         out.extend_from_slice(&p.data);
     }
     out
+}
+
+/// A length-prefixed slice at `at`: `(slice, next offset)`.
+fn rd_len16(b: &[u8], at: usize) -> Result<(&[u8], usize)> {
+    let len = b
+        .get(at..at + 2)
+        .map(|s| u16::from_le_bytes([s[0], s[1]]) as usize)
+        .ok_or_else(|| Error::invalid("oxim: truncated"))?;
+    let data = b
+        .get(at + 2..at + 2 + len)
+        .ok_or_else(|| Error::invalid("oxim: truncated"))?;
+    Ok((data, at + 2 + len))
+}
+
+fn rd_len32(b: &[u8], at: usize) -> Result<(&[u8], usize)> {
+    let len = rd_u32(b, at)? as usize;
+    let data = b
+        .get(at + 4..at + 4 + len)
+        .ok_or_else(|| Error::invalid("oxim: truncated"))?;
+    Ok((data, at + 4 + len))
 }
 
 fn rd_u32(b: &[u8], at: usize) -> Result<u32> {
@@ -232,15 +298,12 @@ impl Decoder for OximDecoder {
             _ => return Err(Error::invalid("oxim decoder: stream geometry missing")),
         };
         let d = &packet.data;
-        let pal_len = d
-            .get(0..2)
-            .map(|s| u16::from_le_bytes([s[0], s[1]]) as usize)
-            .ok_or_else(|| Error::invalid("oxim: truncated payload"))?;
-        let pal = d
-            .get(2..2 + pal_len)
-            .ok_or_else(|| Error::invalid("oxim: truncated palette"))?
-            .to_vec();
-        let mut at = 2 + pal_len;
+        let (pal, at) = rd_len16(d, 0)?;
+        let pal = pal.to_vec();
+        let (alpha, at) = rd_len16(d, at)?;
+        let alpha = alpha.to_vec();
+        let (blobs, mut at) = rd_len32(d, at)?;
+        let blobs = decode_blobs(blobs).unwrap_or_default();
         let mut planes = Vec::new();
         for p in 0..f.plane_count() {
             let stride = f
@@ -263,6 +326,12 @@ impl Decoder for OximDecoder {
         };
         if !pal.is_empty() {
             frame.set_palette(pal);
+        }
+        if !alpha.is_empty() {
+            frame.set_palette_alpha(alpha);
+        }
+        if !blobs.is_empty() {
+            frame.set_blobs(blobs);
         }
         if self.params.options.get("stamp_color").is_some() {
             frame.set_color_signal(self.params.color_signal);
@@ -422,7 +491,7 @@ impl Encoder for OximEncoder {
             }
             tight.push(VideoPlane { stride: row, data });
         }
-        let payload = encode_payload(&tight, vf.palette());
+        let payload = encode_payload(&tight, vf.palette(), vf.palette_alpha(), &vf.blobs());
         let mut pkt = Packet::new(0, TIME_BASE, payload);
         pkt.pts = vf.pts;
         pkt.dts = vf.pts;
@@ -468,6 +537,7 @@ struct Header {
     flags: u8,
     frames: u32,
     metadata: Vec<(String, String)>,
+    blobs: Vec<MetadataBlob>,
     /// Offset of the first frame record.
     body: usize,
 }
@@ -494,6 +564,8 @@ fn parse_header(buf: &[u8]) -> Result<Header> {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
         })
         .collect();
+    let (blobs, body) = rd_len32(buf, 20 + meta_len)?;
+    let blobs = decode_blobs(blobs).unwrap_or_default();
     Ok(Header {
         width,
         height,
@@ -501,7 +573,8 @@ fn parse_header(buf: &[u8]) -> Result<Header> {
         flags,
         frames,
         metadata,
-        body: 20 + meta_len,
+        blobs,
+        body,
     })
 }
 
@@ -534,6 +607,7 @@ fn parse_block(buf: &[u8], at: usize, stream: u32, codec: &str) -> Result<Block>
     params.width = Some(hdr.width);
     params.height = Some(hdr.height);
     params.pixel_format = Some(hdr.format);
+    params.blobs = hdr.blobs;
     let total: i64 = frames.iter().map(|(_, d, _)| *d as i64).sum();
     let info = StreamInfo {
         index: stream,
@@ -737,6 +811,9 @@ impl Muxer for OximMuxer {
             }
             out.extend_from_slice(&(meta.len() as u16).to_le_bytes());
             out.extend_from_slice(&meta);
+            let blobs = encode_blobs(&p.blobs);
+            out.extend_from_slice(&(blobs.len() as u32).to_le_bytes());
+            out.extend_from_slice(&blobs);
             // Delays: the packet's duration in its own time base, else the
             // gap to the next packet, else 0 — rescaled to milliseconds.
             for (i, pkt) in packets.iter().enumerate() {

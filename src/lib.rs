@@ -41,6 +41,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod adapt;
 mod error;
 mod image;
 mod ladder;
@@ -60,9 +61,10 @@ pub use open::{
 };
 pub use save::{
     can_encode, encode, encode_frames, encoder_options, resolve_target, save, EncodeTarget,
-    SaveOptions, DEFAULT_DELAY,
+    MetadataSupport, SaveOptions, DEFAULT_DELAY,
 };
 
 /// Re-exported for convenience: the framework's pixel layouts and colour
-/// description, which [`Image`] reports.
-pub use oxideav_core::{ColorSignal, PixelFormat, RuntimeContext};
+/// description, which [`Image`] reports, and the metadata-blob types
+/// its `icc()` / `exif()` / `xmp()` / `blob()` accessors are built on.
+pub use oxideav_core::{BlobKind, ColorSignal, MetadataBlob, PixelFormat, RuntimeContext};

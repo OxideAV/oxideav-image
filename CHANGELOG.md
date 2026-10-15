@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Metadata blobs surfaced** (core 0.1.40): `ImageFile::blobs()` /
+  `stream_blobs(i)` / `blob(&kind)` / `icc()` / `exif()` / `xmp()` /
+  `iptc()` / `has_metadata()` report the stream-level blobs the demuxer
+  put on the stream's `CodecParameters`; `Image::frame_blobs()` (the
+  frame's own record, lifted at construction) / `stream_blobs()` /
+  `blobs()` / `blob(&kind)` / `blobs_of(&kind)` / `icc()` / `exif()` /
+  `xmp()` / `iptc()` / `has_metadata()` apply the precedence rule — a
+  frame blob overrides the stream blob(s) of the same kind. Builders
+  `with_blob` / `with_blobs` / `set_blobs` / `push_blob` /
+  `with_stream_blobs` / `take_blobs` / `retain_blobs` / `strip_metadata`
+  / `without_metadata`; `into_video_frame` re-attaches the record;
+  `to_format` and `crop` carry the blobs. `OpenOptions::strip_metadata`
+  / `strip_blobs` (`with_metadata(bool)` / `without_metadata()` /
+  `with_stripped_blobs(kinds)`) drop blobs at both levels while opening.
+  `BlobKind` / `MetadataBlob` are re-exported.
+- **Metadata written**: `encode` / `encode_frames` hand the blobs to the
+  encoder — stream-level ones on its `CodecParameters::blobs` (the first
+  picture's stream blobs; for a single-picture encode its frame blobs
+  too, frame first), per-picture ones on each frame's record.
+  `SaveOptions::blobs` (`with_blob` / `with_blobs`) replace the source
+  blobs of the same kind; `strip_metadata` / `strip_blobs`
+  (`with_metadata(bool)` / `without_metadata()` /
+  `with_stripped_blobs(kinds)`) withhold source blobs.
+  `EncodeTarget::metadata_support()` → `MetadataSupport::PassThrough`
+  (the framework has no per-kind encoder declaration yet; `Declared` is
+  reserved for one).
+- **Palette alpha honoured** (core 0.1.40): `Image::palette_alpha()` /
+  `palette_rgba(i)` / `palette_entries()` / `has_palette_alpha()` /
+  `has_alpha()`; `from_indexed(w, h, indices, &[[r, g, b, a]])`,
+  `with_palette_rgba` / `with_palette` / `set_palette_alpha` /
+  `with_palette_alpha`. `to_rgba8` / `to_rgba16` (and every alpha
+  layout through `to_format`) expand a `Pal8` source through
+  `palette_rgba`: a transparent entry yields alpha `0`, opaque and
+  uncovered ones `255`; `to_rgb8` / `to_rgb16` / grey drop the alpha
+  (no compositing). The ladder ranks alpha-carrying rungs first for a
+  palette with a non-opaque entry (`EncodeTarget::ladder_for(&image,
+  &opts)`); `crop` keeps the alpha record.
+- **Legacy adaptation** (read side, withdrawn once the crate adopts the
+  record): a `png` stream's `extradata` (`IHDR || len || PLTE || len ||
+  tRNS`) tRNS tail becomes the palette-alpha record of a `Pal8` picture.
+- README: *Metadata* and *Palette alpha* sections, the round-476 survey
+  of the 25 image crates (ICC / Exif / XMP / palette alpha: blob, legacy
+  or none, with the per-crate ask).
+
+### Changed
+
+- The synthetic OXIM fixture carries stream blobs, frame blobs and the
+  palette-alpha record, the way a sibling crate does after adopting core
+  0.1.40. The deep-route unit test checks pixfmt's direct-step table
+  instead of a pinned pair.
+
 ## [0.0.3](https://github.com/OxideAV/oxideav-image/compare/v0.0.2...v0.0.3) - 2026-10-14
 
 ### Other

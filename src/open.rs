@@ -5,7 +5,9 @@ use std::fs::File;
 use std::io::{BufReader, Cursor};
 use std::path::Path;
 
-use oxideav_core::{Decoder, Frame, ReadSeek, RuntimeContext, StreamInfo};
+use oxideav_core::{
+    BlobKind, CodecParameters, Decoder, Frame, MetadataBlob, ReadSeek, RuntimeContext, StreamInfo,
+};
 
 use crate::image::ticks_to_duration;
 
@@ -19,6 +21,9 @@ use crate::image::Image;
 pub struct ImageFile {
     container: String,
     metadata: Vec<(String, String)>,
+    /// Stream-level blobs per container stream (after the open
+    /// options' strip rules), indexed like `Image::stream()`.
+    stream_blobs: Vec<Vec<MetadataBlob>>,
     images: Vec<Image>,
 }
 
@@ -29,9 +34,61 @@ impl ImageFile {
         &self.container
     }
 
-    /// Container-level metadata as the demuxer reported it.
+    /// Container-level metadata as the demuxer reported it: string
+    /// pairs. Opaque payloads (ICC, Exif, XMP, …) are blobs instead —
+    /// see [`blobs`](Self::blobs).
     pub fn metadata(&self) -> &[(String, String)] {
         &self.metadata
+    }
+
+    /// The file's metadata blobs: the stream-level blobs of the stream
+    /// the primary picture came from (what the demuxer put on that
+    /// stream's `CodecParameters` — the ICC profile, Exif, XMP of the
+    /// file as a whole). Per-picture blobs are on each [`Image`].
+    pub fn blobs(&self) -> &[MetadataBlob] {
+        self.stream_blobs(self.images[0].stream())
+    }
+
+    /// The stream-level blobs of container stream `index` (empty for a
+    /// stream the gateway did not decode or an index out of range).
+    pub fn stream_blobs(&self, index: usize) -> &[MetadataBlob] {
+        self.stream_blobs
+            .get(index)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    /// The first file-level blob of `kind` (see [`blobs`](Self::blobs)).
+    pub fn blob(&self, kind: &BlobKind) -> Option<&MetadataBlob> {
+        self.blobs().iter().find(|b| b.is(kind))
+    }
+
+    /// The file's ICC profile (`BlobKind::ICC`), stream level. The
+    /// primary picture's [`Image::icc`] also consults its own frame
+    /// record first.
+    pub fn icc(&self) -> Option<&[u8]> {
+        self.blob(&BlobKind::ICC).map(|b| b.data.as_slice())
+    }
+
+    /// The file's Exif block (`BlobKind::EXIF`), stream level.
+    pub fn exif(&self) -> Option<&[u8]> {
+        self.blob(&BlobKind::EXIF).map(|b| b.data.as_slice())
+    }
+
+    /// The file's XMP packet (`BlobKind::XMP`), stream level.
+    pub fn xmp(&self) -> Option<&[u8]> {
+        self.blob(&BlobKind::XMP).map(|b| b.data.as_slice())
+    }
+
+    /// The file's IPTC datasets (`BlobKind::IPTC`), stream level.
+    pub fn iptc(&self) -> Option<&[u8]> {
+        self.blob(&BlobKind::IPTC).map(|b| b.data.as_slice())
+    }
+
+    /// True when any stream or any picture carries a blob.
+    pub fn has_metadata(&self) -> bool {
+        self.stream_blobs.iter().any(|b| !b.is_empty())
+            || self.images.iter().any(|i| !i.frame_blobs().is_empty())
     }
 
     /// The primary picture: the first decoded frame.
@@ -130,6 +187,14 @@ pub struct OpenOptions {
     pub allow_codecs: Option<Vec<String>>,
     /// Codec ids refused on any video stream (wins over the allow list).
     pub deny_codecs: Vec<String>,
+    /// Drop every metadata blob — stream level and per picture — as the
+    /// file is opened, so nothing embedded (ICC, Exif, XMP, …) reaches
+    /// the pictures or a later `encode`. The container's string
+    /// metadata is unaffected. Default `false`: everything is kept.
+    pub strip_metadata: bool,
+    /// Blob kinds dropped at both levels when `strip_metadata` is off
+    /// (`BlobKind::EXIF` to shed location data, say).
+    pub strip_blobs: Vec<BlobKind>,
 }
 
 impl OpenOptions {
@@ -210,6 +275,40 @@ impl OpenOptions {
     {
         self.deny_codecs = ids.into_iter().map(Into::into).collect();
         self
+    }
+
+    /// Keep (`true`, the default) or drop every metadata blob while
+    /// opening (see the `strip_metadata` field).
+    pub fn with_metadata(mut self, keep: bool) -> Self {
+        self.strip_metadata = !keep;
+        self
+    }
+
+    /// Drop every metadata blob while opening.
+    pub fn without_metadata(self) -> Self {
+        self.with_metadata(false)
+    }
+
+    /// Drop these blob kinds while opening (see the field).
+    pub fn with_stripped_blobs<I, K>(mut self, kinds: I) -> Self
+    where
+        I: IntoIterator<Item = K>,
+        K: Into<BlobKind>,
+    {
+        self.strip_blobs = kinds.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Whether a blob survives these options.
+    fn keeps(&self, blob: &MetadataBlob) -> bool {
+        !self.strip_metadata && !self.strip_blobs.iter().any(|k| blob.is(k))
+    }
+
+    /// Apply the strip rules to a stream's parameters.
+    fn filter_params(&self, params: &mut CodecParameters) {
+        if self.strip_metadata || !self.strip_blobs.is_empty() {
+            params.blobs.retain(|b| self.keeps(b));
+        }
     }
 }
 
@@ -315,7 +414,12 @@ pub fn decode_reader(
             }
             other => Error::Core(other),
         })?;
-    let streams: Vec<StreamInfo> = demuxer.streams().to_vec();
+    let mut streams: Vec<StreamInfo> = demuxer.streams().to_vec();
+    // The strip rules apply before anything downstream sees the
+    // parameters: the decoder, the pictures, a later encode.
+    for s in &mut streams {
+        opts.filter_params(&mut s.params);
+    }
     let metadata = demuxer.metadata().to_vec();
     // The codec lists are checked from the stream table alone: no
     // decoder exists yet, so a refused file costs one header parse.
@@ -390,6 +494,7 @@ pub fn decode_reader(
                         &mut images,
                         limit,
                         (&mut spent, budget),
+                        opts,
                     )?;
                 }
             }
@@ -405,6 +510,7 @@ pub fn decode_reader(
                             &mut images,
                             limit,
                             (&mut spent, budget),
+                            opts,
                         )?;
                     }
                 }
@@ -419,14 +525,17 @@ pub fn decode_reader(
         )));
     }
     resolve_delays(&mut images, streams.len());
+    let stream_blobs = streams.into_iter().map(|s| s.params.blobs).collect();
     Ok(ImageFile {
         container,
         metadata,
+        stream_blobs,
         images,
     })
 }
 
 /// Pull every ready frame out of a decoder.
+#[allow(clippy::too_many_arguments)]
 fn drain(
     dec: &mut dyn Decoder,
     info: &StreamInfo,
@@ -435,6 +544,7 @@ fn drain(
     images: &mut Vec<Image>,
     limit: usize,
     (spent, budget): (&mut u64, u64),
+    opts: &OpenOptions,
 ) -> Result<()> {
     let stream = &info.params;
     loop {
@@ -478,6 +588,10 @@ fn drain(
                 }
                 let index = images.len();
                 let mut img = Image::from_video_frame(vf, stream)?.with_index(index);
+                crate::adapt::adapt(&mut img, stream);
+                if opts.strip_metadata || !opts.strip_blobs.is_empty() {
+                    img.retain_blobs(|b| opts.keeps(b));
+                }
                 img.set_timing(
                     stream_index,
                     info.time_base,

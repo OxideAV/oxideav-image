@@ -3,12 +3,12 @@
 
 use std::time::Duration;
 
-use oxideav_core::{PixelFormat, TimeBase, VideoPlane};
+use oxideav_core::{BlobKind, MetadataBlob, PixelFormat, TimeBase, VideoPlane};
 
 use crate::fixture::{self, Fixture, FORMATS};
 use crate::{
     can_encode, decode_bytes, decode_bytes_with, decode_vec, encode, encode_frames,
-    encoder_options, resolve_target, Image, ImageError, OpenOptions, SaveOptions,
+    encoder_options, resolve_target, Image, ImageError, MetadataSupport, OpenOptions, SaveOptions,
 };
 
 fn still(format: PixelFormat) -> Fixture {
@@ -1017,4 +1017,398 @@ fn encode_frames_with_mixed_geometry_goes_to_a_multi_stream_container() {
     let back = decode_bytes_with(&ctx, &bytes, &hint).unwrap();
     assert!(back.frames().iter().all(|i| i.stream() == 0));
     assert!(back.frames().iter().all(|i| i.delay() == ms(25)));
+}
+
+// ---- metadata blobs (core 0.1.40) -------------------------------------------
+
+fn blob(kind: BlobKind, data: &[u8]) -> MetadataBlob {
+    MetadataBlob::new(kind, data.to_vec())
+}
+
+#[test]
+fn stream_blobs_surface_on_the_file_and_on_every_picture() {
+    let ctx = fixture::ctx();
+    let fx = still(PixelFormat::Rgb24).with_blobs(vec![
+        blob(BlobKind::ICC, b"acsp-profile"),
+        blob(BlobKind::XMP, b"<x:xmpmeta/>"),
+        MetadataBlob::new(BlobKind::custom("oxim-notes"), b"n".to_vec()).with_mime("text/plain"),
+    ]);
+    let file = decode_bytes(&ctx, &fx.encode()).unwrap();
+    assert!(file.has_metadata());
+    assert_eq!(file.blobs().len(), 3);
+    assert_eq!(file.icc(), Some(&b"acsp-profile"[..]));
+    assert_eq!(file.xmp(), Some(&b"<x:xmpmeta/>"[..]));
+    assert_eq!(file.exif(), None);
+    assert_eq!(file.iptc(), None);
+    assert_eq!(
+        file.blob(&BlobKind::custom("oxim-notes"))
+            .and_then(|b| b.mime.as_deref()),
+        Some("text/plain")
+    );
+    assert_eq!(file.stream_blobs(0).len(), 3);
+    assert!(file.stream_blobs(7).is_empty());
+    // The picture sees the stream's blobs through the precedence view.
+    let img = file.primary();
+    assert!(img.frame_blobs().is_empty());
+    assert_eq!(img.stream_blobs().len(), 3);
+    assert_eq!(img.blobs().len(), 3);
+    assert_eq!(img.icc(), Some(&b"acsp-profile"[..]));
+    assert_eq!(img.xmp(), Some(&b"<x:xmpmeta/>"[..]));
+    assert!(img.has_metadata());
+    // The frame handed back carries no blobs record (they are
+    // stream-level); the parameters do.
+    assert!(img.frame().blobs().is_empty());
+    assert_eq!(img.params().blobs().len(), 3);
+    // Views keep the stream blobs with the parameters.
+    let rgba = img.to_format(PixelFormat::Rgba).unwrap();
+    assert_eq!(rgba.icc(), Some(&b"acsp-profile"[..]));
+}
+
+#[test]
+fn frame_blobs_override_stream_blobs_of_the_same_kind() {
+    let ctx = fixture::ctx();
+    let mut fx = Fixture::new(4, 4, PixelFormat::Rgb24);
+    fx.push_gradient(40, 1).push_gradient(40, 2);
+    fx.last_frame().blobs = vec![
+        blob(BlobKind::EXIF, b"II*\0page-2"),
+        blob(BlobKind::EXIF, b"II*\0page-2-bis"),
+    ];
+    let fx = fx.with_blobs(vec![
+        blob(BlobKind::EXIF, b"II*\0file"),
+        blob(BlobKind::ICC, b"acsp"),
+    ]);
+    let file = decode_bytes(&ctx, &fx.encode()).unwrap();
+    let [a, b] = file.frames() else {
+        panic!("two pictures")
+    };
+    // Picture 0 has no frame blobs: the stream's Exif and ICC.
+    assert_eq!(a.exif(), Some(&b"II*\0file"[..]));
+    assert_eq!(a.icc(), Some(&b"acsp"[..]));
+    assert_eq!(a.blobs().len(), 2);
+    // Picture 1 carries its own Exif: it wins, every one of that kind;
+    // the ICC still comes from the stream.
+    assert_eq!(b.frame_blobs().len(), 2);
+    assert_eq!(b.exif(), Some(&b"II*\0page-2"[..]));
+    assert_eq!(b.blobs_of(&BlobKind::EXIF).len(), 2);
+    assert_eq!(a.blobs_of(&BlobKind::EXIF).len(), 1);
+    assert_eq!(b.icc(), Some(&b"acsp"[..]));
+    let all = b.blobs();
+    assert_eq!(all.len(), 3);
+    assert!(all[..2].iter().all(|x| x.is(&BlobKind::EXIF)));
+    assert!(all[2].is(&BlobKind::ICC));
+    // The file-level accessors are stream level only.
+    assert_eq!(file.exif(), Some(&b"II*\0file"[..]));
+    // Frame blobs are lifted off the frame and re-attached on the way
+    // out; crop and conversion keep them.
+    assert!(b.frame().blobs().is_empty());
+    assert_eq!(
+        b.crop(1, 1, 2, 2).unwrap().exif(),
+        Some(&b"II*\0page-2"[..])
+    );
+    assert_eq!(
+        b.to_format(PixelFormat::Rgba).unwrap().frame_blobs().len(),
+        2
+    );
+    let (frame, params) = b.clone().into_video_frame();
+    assert_eq!(frame.blobs().len(), 2);
+    assert_eq!(params.blobs().len(), 2);
+    // Round trip through the constructor lifts them again.
+    let again = Image::from_video_frame(frame, &params).unwrap();
+    assert_eq!(again.frame_blobs().len(), 2);
+    assert!(again.frame().blobs().is_empty());
+}
+
+#[test]
+fn open_options_strip_metadata_or_kinds() {
+    let ctx = fixture::ctx();
+    let mut fx = Fixture::new(4, 4, PixelFormat::Rgb24);
+    fx.push_gradient(40, 1);
+    fx.last_frame().blobs = vec![blob(BlobKind::EXIF, b"II*\0page")];
+    fx.metadata = vec![("title".into(), "kept".into())];
+    let fx = fx.with_blobs(vec![
+        blob(BlobKind::ICC, b"acsp"),
+        blob(BlobKind::XMP, b"<x/>"),
+    ]);
+    let bytes = fx.encode();
+    let all = decode_bytes(&ctx, &bytes).unwrap();
+    assert!(all.has_metadata());
+    assert_eq!(all.primary().blobs().len(), 3);
+
+    let none = decode_bytes_with(&ctx, &bytes, &OpenOptions::new().without_metadata()).unwrap();
+    assert!(!none.has_metadata());
+    assert!(none.blobs().is_empty());
+    assert!(none.primary().blobs().is_empty());
+    assert!(none.primary().frame_blobs().is_empty());
+    assert!(none.primary().params().blobs().is_empty());
+    // String metadata is not a blob.
+    assert_eq!(none.metadata(), fx.metadata.as_slice());
+    let kept = decode_bytes_with(&ctx, &bytes, &OpenOptions::new().with_metadata(true)).unwrap();
+    assert_eq!(kept.primary().blobs().len(), 3);
+
+    let no_exif = decode_bytes_with(
+        &ctx,
+        &bytes,
+        &OpenOptions::new().with_stripped_blobs([BlobKind::EXIF, BlobKind::XMP]),
+    )
+    .unwrap();
+    let img = no_exif.primary();
+    assert_eq!(img.exif(), None);
+    assert_eq!(img.xmp(), None);
+    assert_eq!(img.icc(), Some(&b"acsp"[..]));
+    assert_eq!(no_exif.blobs().len(), 1);
+    assert!(img.frame_blobs().is_empty());
+}
+
+#[test]
+fn encode_hands_blobs_to_the_encoder_at_both_levels() {
+    let ctx = fixture::ctx();
+    let mut fx = Fixture::new(4, 4, PixelFormat::Rgb24);
+    fx.push_gradient(40, 1).push_gradient(40, 2);
+    fx.last_frame().blobs = vec![blob(BlobKind::EXIF, b"II*\0page-2")];
+    let bytes = fx
+        .with_blobs(vec![
+            blob(BlobKind::ICC, b"acsp"),
+            blob(BlobKind::XMP, b"<x/>"),
+        ])
+        .encode();
+    let file = decode_bytes(&ctx, &bytes).unwrap();
+
+    // Multi-picture: the stream gets the first picture's stream blobs,
+    // each frame its own — the fixture muxer writes the stream blobs
+    // and its encoder the frame blobs, so a decode shows the same split.
+    let out = encode_frames(&ctx, file.frames(), "oxim", &SaveOptions::default()).unwrap();
+    let back = decode_bytes(&ctx, &out).unwrap();
+    assert_eq!(back.icc(), Some(&b"acsp"[..]));
+    assert_eq!(back.xmp(), Some(&b"<x/>"[..]));
+    assert_eq!(back.exif(), None);
+    assert!(back.frames()[0].frame_blobs().is_empty());
+    assert_eq!(back.frames()[1].exif(), Some(&b"II*\0page-2"[..]));
+    assert_eq!(back.frames()[1].frame_blobs().len(), 1);
+
+    // Single picture: its frame blobs are promoted to the stream as
+    // well (a still encoder reads the parameters), frame first.
+    let one = encode(&ctx, &file.frames()[1], "oxim", &SaveOptions::default()).unwrap();
+    let back = decode_bytes(&ctx, &one).unwrap();
+    assert_eq!(back.exif(), Some(&b"II*\0page-2"[..]));
+    assert_eq!(back.icc(), Some(&b"acsp"[..]));
+    assert_eq!(back.blobs()[0].kind, BlobKind::EXIF);
+    assert_eq!(back.primary().frame_blobs().len(), 1);
+    // The ladder path converts first; blobs still travel.
+    let yuv = encode(
+        &ctx,
+        &file.frames()[1],
+        "oxim",
+        &SaveOptions::new().with_codec("oxim_yuv"),
+    )
+    .unwrap();
+    let back = decode_bytes(&ctx, &yuv).unwrap();
+    assert_eq!(back.primary().format(), PixelFormat::Yuv420P);
+    assert_eq!(back.primary().exif(), Some(&b"II*\0page-2"[..]));
+    assert_eq!(back.icc(), Some(&b"acsp"[..]));
+
+    // SaveOptions blobs replace the source's of the same kind, and
+    // nothing else; strip rules withhold the source's.
+    let opts = SaveOptions::new()
+        .with_blob(blob(BlobKind::ICC, b"acsp-new"))
+        .with_blob(blob(BlobKind::IPTC, b"\x1c\x02"));
+    let back = decode_bytes(&ctx, &encode(&ctx, file.primary(), "oxim", &opts).unwrap()).unwrap();
+    assert_eq!(back.icc(), Some(&b"acsp-new"[..]));
+    assert_eq!(back.iptc(), Some(&b"\x1c\x02"[..]));
+    assert_eq!(back.xmp(), Some(&b"<x/>"[..]));
+    assert_eq!(back.blobs().len(), 3);
+    let opts = SaveOptions::new()
+        .without_metadata()
+        .with_blob(blob(BlobKind::ICC, b"only"));
+    let back = decode_bytes(
+        &ctx,
+        &encode(&ctx, &file.frames()[1], "oxim", &opts).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(back.blobs().len(), 1);
+    assert_eq!(back.icc(), Some(&b"only"[..]));
+    assert!(back.primary().frame_blobs().is_empty());
+    let opts = SaveOptions::new().with_stripped_blobs([BlobKind::EXIF]);
+    let back = decode_bytes(
+        &ctx,
+        &encode_frames(&ctx, file.frames(), "oxim", &opts).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(back.blobs().len(), 2);
+    assert!(back.frames()[1].frame_blobs().is_empty());
+    assert_eq!(back.frames()[1].exif(), None);
+
+    // Caller-built pictures: blobs attached on the Image reach the
+    // encoder the same way.
+    let img = Image::from_rgb8(2, 2, vec![0; 12])
+        .unwrap()
+        .with_blob(blob(BlobKind::EXIF, b"II*\0built"))
+        .with_stream_blobs(vec![blob(BlobKind::ICC, b"acsp-built")]);
+    assert_eq!(img.exif(), Some(&b"II*\0built"[..]));
+    let back = decode_bytes(
+        &ctx,
+        &encode(&ctx, &img, "oxim", &SaveOptions::default()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(back.exif(), Some(&b"II*\0built"[..]));
+    assert_eq!(back.icc(), Some(&b"acsp-built"[..]));
+    assert_eq!(back.primary().exif(), Some(&b"II*\0built"[..]));
+    let stripped = img.clone().without_metadata();
+    assert!(!stripped.has_metadata());
+    let mut retained = img.clone();
+    retained.retain_blobs(|b| b.is(&BlobKind::ICC));
+    assert_eq!(retained.exif(), None);
+    assert_eq!(retained.icc(), Some(&b"acsp-built"[..]));
+    let mut taken = img;
+    assert_eq!(taken.take_blobs().len(), 1);
+    assert!(taken.frame_blobs().is_empty());
+}
+
+#[test]
+fn metadata_support_is_pass_through() {
+    let ctx = fixture::ctx();
+    let target = resolve_target(&ctx, "oxim", &SaveOptions::default()).unwrap();
+    assert_eq!(target.metadata_support(), MetadataSupport::PassThrough);
+}
+
+// ---- palette alpha (core 0.1.40) --------------------------------------------
+
+/// A 2×2 Pal8 picture over a four-entry palette whose entry 1 is
+/// transparent and entry 2 half-transparent; entry 3 is uncovered by
+/// the alpha record (opaque).
+fn indexed_with_alpha() -> Image {
+    let img = Image::from_indexed(
+        2,
+        2,
+        vec![0, 1, 2, 3],
+        &[
+            [10, 20, 30, 255],
+            [40, 50, 60, 0],
+            [70, 80, 90, 128],
+            [1, 2, 3, 255],
+        ],
+    )
+    .unwrap();
+    // Shorten the record: entry 3 is uncovered.
+    let (mut frame, params) = img.into_video_frame();
+    frame.set_palette_alpha(vec![255, 0, 128]);
+    Image::from_video_frame(frame, &params).unwrap()
+}
+
+#[test]
+fn palette_alpha_reaches_the_rgba_views_and_not_the_rgb_ones() {
+    let img = indexed_with_alpha();
+    assert_eq!(img.format(), PixelFormat::Pal8);
+    assert_eq!(img.palette_alpha(), Some(&[255, 0, 128][..]));
+    assert_eq!(img.palette_rgba(1), Some([40, 50, 60, 0]));
+    assert_eq!(img.palette_rgba(3), Some([1, 2, 3, 255]));
+    assert_eq!(img.palette_rgba(4), None);
+    assert_eq!(
+        img.palette_entries().unwrap(),
+        vec![
+            [10, 20, 30, 255],
+            [40, 50, 60, 0],
+            [70, 80, 90, 128],
+            [1, 2, 3, 255]
+        ]
+    );
+    assert!(img.has_palette_alpha());
+    assert!(img.has_alpha());
+    assert_eq!(
+        img.to_rgba8().unwrap(),
+        vec![10, 20, 30, 255, 40, 50, 60, 0, 70, 80, 90, 128, 1, 2, 3, 255]
+    );
+    // Alpha widens like any sample (0 → 0, 128 → 0x8080, 255 → 0xffff).
+    let wide = img.to_rgba16().unwrap();
+    assert_eq!(&wide[6..8], &[0xff, 0xff]);
+    assert_eq!(&wide[14..16], &[0, 0]);
+    assert_eq!(&wide[22..24], &[0x80, 0x80]);
+    assert_eq!(&wide[..6], &[10, 10, 20, 20, 30, 30]);
+    // RGB views drop the alpha: the stored RGB of a transparent entry.
+    assert_eq!(
+        img.to_rgb8().unwrap(),
+        vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 1, 2, 3]
+    );
+    assert_eq!(&img.to_rgb16().unwrap()[6..12], &[40, 40, 50, 50, 60, 60]);
+    assert_eq!(img.to_gray8().unwrap().len(), 4);
+    // Other alpha layouts go through the expander too.
+    let bgra = img.to_packed(PixelFormat::Bgra).unwrap();
+    assert_eq!(&bgra[4..8], &[60, 50, 40, 0]);
+    // Crop keeps both palette records.
+    let c = img.crop(1, 0, 1, 2).unwrap();
+    assert_eq!(c.palette_alpha(), Some(&[255, 0, 128][..]));
+    assert_eq!(c.to_rgba8().unwrap(), vec![40, 50, 60, 0, 1, 2, 3, 255]);
+    // An opaque palette is not alpha, with or without a record.
+    let opaque = Image::from_indexed(1, 1, vec![0], &[[1, 2, 3, 255]]).unwrap();
+    assert!(!opaque.has_palette_alpha());
+    assert!(!opaque.has_alpha());
+    assert_eq!(opaque.to_rgba8().unwrap(), vec![1, 2, 3, 255]);
+    let plain = Image::from_raw(1, 1, PixelFormat::Pal8, vec![0]).unwrap();
+    assert_eq!(plain.palette_alpha(), None);
+    assert_eq!(plain.palette_entries(), None);
+    assert!(!plain.has_alpha());
+    assert!(Image::from_indexed(1, 1, vec![0], &[]).is_err());
+    // An index past the palette is opaque black, as pixfmt expands it.
+    let short = Image::from_indexed(1, 1, vec![5], &[[9, 9, 9, 0]]).unwrap();
+    assert_eq!(short.to_rgba8().unwrap(), vec![0, 0, 0, 255]);
+}
+
+#[test]
+fn palette_alpha_survives_the_registry_and_ranks_alpha_rungs_first() {
+    let ctx = fixture::ctx();
+    let img = indexed_with_alpha();
+    // Encoded natively (oxim accepts Pal8): both records round-trip.
+    let bytes = encode(&ctx, &img, "oxim", &SaveOptions::default()).unwrap();
+    let back = decode_bytes(&ctx, &bytes).unwrap();
+    let b = back.primary();
+    assert_eq!(b.format(), PixelFormat::Pal8);
+    assert_eq!(b.palette(), img.palette());
+    assert_eq!(b.palette_alpha(), Some(&[255, 0, 128][..]));
+    assert_eq!(b.to_rgba8().unwrap(), img.to_rgba8().unwrap());
+    // Through a fixture file with the record shorter than the palette.
+    let mut fx = Fixture::new(5, 3, PixelFormat::Pal8);
+    fx.push_gradient(0, 1);
+    fx.last_frame().palette_alpha = Some(vec![0]);
+    let file = decode_bytes(&ctx, &fx.encode()).unwrap();
+    let p = file.primary();
+    assert!(p.has_alpha());
+    let rgba = p.to_rgba8().unwrap();
+    for (i, &idx) in fx.frames[0].planes[0].data.iter().enumerate() {
+        assert_eq!(rgba[i * 4 + 3], if idx == 0 { 0 } else { 255 });
+    }
+    // The ladder: a transparent palette ranks Rgba ahead of Rgb24
+    // against an encoder that declares both, and the picture reaches an
+    // RGB-only encoder as Rgba with its alpha intact.
+    let target = resolve_target(&ctx, "oxim", &SaveOptions::default()).unwrap();
+    let l = target.ladder_for(&img, &SaveOptions::default());
+    assert_eq!(l[0], PixelFormat::Pal8);
+    assert!(l[1].has_alpha(), "{l:?}");
+    assert!(
+        l.iter().position(|f| *f == PixelFormat::Rgba)
+            < l.iter().position(|f| *f == PixelFormat::Rgb24)
+    );
+    let l = target.ladder(PixelFormat::Pal8, &SaveOptions::default());
+    assert_eq!(l[0], PixelFormat::Pal8);
+    assert!(
+        l.iter().position(|f| *f == PixelFormat::Rgb24)
+            < l.iter().position(|f| *f == PixelFormat::Rgba)
+    );
+    let opaque = Image::from_indexed(2, 2, vec![0; 4], &[[1, 2, 3, 255]]).unwrap();
+    let l = target.ladder_for(&opaque, &SaveOptions::default());
+    assert!(
+        l.iter().position(|f| *f == PixelFormat::Rgb24)
+            < l.iter().position(|f| *f == PixelFormat::Rgba)
+    );
+    // oxim_undeclared takes Yuv420P / Yuv444P / Gray8 only: the
+    // alpha-carrying rungs come first but none is accepted, so the
+    // picture lands as 4:4:4 (alpha dropped, never composited).
+    let yuv = encode(
+        &ctx,
+        &img,
+        "oxim",
+        &SaveOptions::new().with_codec(fixture::CODEC_UNDECLARED),
+    )
+    .unwrap();
+    let back = decode_bytes(&ctx, &yuv).unwrap();
+    assert_eq!(back.primary().format(), PixelFormat::Yuv444P);
+    assert!(!back.primary().has_alpha());
 }
