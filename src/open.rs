@@ -5,6 +5,8 @@ use std::fs::File;
 use std::io::{BufReader, Cursor};
 use std::path::Path;
 
+use std::sync::Arc;
+
 use oxideav_core::{
     BlobKind, CodecParameters, Decoder, Frame, MetadataBlob, ReadSeek, RuntimeContext, StreamInfo,
 };
@@ -21,9 +23,10 @@ use crate::image::Image;
 pub struct ImageFile {
     container: String,
     metadata: Vec<(String, String)>,
-    /// Stream-level blobs per container stream (after the open
-    /// options' strip rules), indexed like `Image::stream()`.
-    stream_blobs: Vec<Vec<MetadataBlob>>,
+    /// The container streams' parameters (after the open options'
+    /// strip rules), indexed like `Image::stream()` and shared with the
+    /// pictures of each stream.
+    streams: Vec<Arc<CodecParameters>>,
     images: Vec<Image>,
 }
 
@@ -52,9 +55,9 @@ impl ImageFile {
     /// The stream-level blobs of container stream `index` (empty for a
     /// stream the gateway did not decode or an index out of range).
     pub fn stream_blobs(&self, index: usize) -> &[MetadataBlob] {
-        self.stream_blobs
+        self.streams
             .get(index)
-            .map(Vec::as_slice)
+            .map(|p| p.blobs())
             .unwrap_or_default()
     }
 
@@ -87,7 +90,7 @@ impl ImageFile {
 
     /// True when any stream or any picture carries a blob.
     pub fn has_metadata(&self) -> bool {
-        self.stream_blobs.iter().any(|b| !b.is_empty())
+        self.streams.iter().any(|p| !p.blobs().is_empty())
             || self.images.iter().any(|i| !i.frame_blobs().is_empty())
     }
 
@@ -95,11 +98,37 @@ impl ImageFile {
     /// picture (both levels) — the post-open counterpart of
     /// [`OpenOptions::strip_blobs`].
     pub fn retain_blobs(&mut self, mut keep: impl FnMut(&MetadataBlob) -> bool) {
-        for blobs in &mut self.stream_blobs {
-            blobs.retain(|b| keep(b));
+        // Pictures of one stream share its parameters: filter each
+        // distinct set once and re-point the pictures that held it, so
+        // the sharing survives (a picture given its own parameters by
+        // the caller is filtered on its own).
+        type Shared = Arc<CodecParameters>;
+        fn filter(
+            seen: &mut Vec<(Shared, Shared)>,
+            keep: &mut dyn FnMut(&MetadataBlob) -> bool,
+            p: &Shared,
+        ) -> Shared {
+            if let Some((_, f)) = seen.iter().find(|(o, _)| Arc::ptr_eq(o, p)) {
+                return f.clone();
+            }
+            let f = if p.blobs().iter().all(&mut *keep) {
+                p.clone()
+            } else {
+                let mut c = (**p).clone();
+                c.blobs.retain(|b| keep(b));
+                Arc::new(c)
+            };
+            seen.push((p.clone(), f.clone()));
+            f
+        }
+        let mut seen: Vec<(Shared, Shared)> = Vec::new();
+        for p in &mut self.streams {
+            *p = filter(&mut seen, &mut keep, p);
         }
         for img in &mut self.images {
-            img.retain_blobs(&mut keep);
+            let shared = filter(&mut seen, &mut keep, img.params_arc());
+            img.set_params_arc(shared);
+            img.retain_frame_blobs(&mut keep);
         }
     }
 
@@ -456,6 +485,10 @@ pub fn decode_reader(
         }
     }
 
+    // The pictures of a stream share its parameters (one copy of the
+    // stream's blobs, however many pages or frames).
+    let shared: Vec<Arc<CodecParameters>> =
+        streams.iter().map(|s| Arc::new(s.params.clone())).collect();
     // One decoder per video stream; other streams are skipped.
     let budget = opts.max_pixels.unwrap_or(u64::MAX);
     let mut decoders: Vec<Option<Box<dyn Decoder>>> = Vec::with_capacity(streams.len());
@@ -507,7 +540,7 @@ pub fn decode_reader(
                     dec.send_packet(&pkt)?;
                     drain(
                         dec.as_mut(),
-                        &streams[idx],
+                        (&streams[idx], &shared[idx]),
                         idx,
                         &mut timing[idx],
                         &mut images,
@@ -523,7 +556,7 @@ pub fn decode_reader(
                         let _ = dec.flush();
                         drain(
                             dec.as_mut(),
-                            &streams[i],
+                            (&streams[i], &shared[i]),
                             i,
                             &mut timing[i],
                             &mut images,
@@ -544,11 +577,10 @@ pub fn decode_reader(
         )));
     }
     resolve_delays(&mut images, streams.len());
-    let stream_blobs = streams.into_iter().map(|s| s.params.blobs).collect();
     Ok(ImageFile {
         container,
         metadata,
-        stream_blobs,
+        streams: shared,
         images,
     })
 }
@@ -557,7 +589,7 @@ pub fn decode_reader(
 #[allow(clippy::too_many_arguments)]
 fn drain(
     dec: &mut dyn Decoder,
-    info: &StreamInfo,
+    (info, shared): (&StreamInfo, &Arc<CodecParameters>),
     stream_index: usize,
     timing: &mut VecDeque<(Option<i64>, Option<i64>)>,
     images: &mut Vec<Image>,
@@ -606,10 +638,12 @@ fn drain(
                     )));
                 }
                 let index = images.len();
-                let mut img = Image::from_video_frame(vf, stream)?.with_index(index);
+                let mut img = Image::from_video_frame_shared(vf, shared.clone())?.with_index(index);
                 crate::adapt::adapt(&mut img, stream);
+                // The stream level was filtered before decoding; only
+                // the frame's own blobs are left to check.
                 if opts.strip_metadata || !opts.strip_blobs.is_empty() {
-                    img.retain_blobs(|b| opts.keeps(b));
+                    img.retain_frame_blobs(|b| opts.keeps(b));
                 }
                 img.set_timing(
                     stream_index,

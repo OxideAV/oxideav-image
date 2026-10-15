@@ -56,6 +56,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The pictures of one stream share that stream's `CodecParameters`
+  (copy on write): a 40-page document with a 64 KiB profile holds it
+  once, not once per page; `ImageFile::retain_blobs` filters each shared
+  set once and keeps the sharing.
+
 - The synthetic OXIM fixture carries stream blobs, frame blobs and the
   palette-alpha record, the way a sibling crate does after adopting core
   0.1.40. The deep-route unit test checks pixfmt's direct-step table

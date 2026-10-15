@@ -25,6 +25,7 @@
 //! let (w, h, fmt) = (img.width(), img.height(), img.format());
 //!
 //! for frame in &file { let _ = (frame.delay(), frame.timestamp()); } // sequences, pages
+//! let (icc, exif) = (img.icc(), img.exif());    // metadata blobs, frame over stream
 //!
 //! oxideav_image::save(&ctx, img, "out.png", &SaveOptions::default())?;
 //! let heic = oxideav_image::encode(&ctx, img, "heic", &SaveOptions::new().with_option("qp", "20"))?;

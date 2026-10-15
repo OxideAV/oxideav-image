@@ -1160,6 +1160,59 @@ fn open_options_strip_metadata_or_kinds() {
 }
 
 #[test]
+fn pictures_of_a_stream_share_its_parameters() {
+    // A 40-frame file with a 64 KiB profile: the stream's blobs are
+    // held once, not once per picture (40 × 64 KiB → 64 KiB), and the
+    // sharing survives a post-open filter that drops nothing from the
+    // stream level. A filter that does drop something copies once per
+    // stream, not per picture.
+    let ctx = fixture::ctx();
+    let mut fx = Fixture::new(2, 2, PixelFormat::Rgb24);
+    for i in 0..40 {
+        fx.push_gradient(10, i);
+    }
+    fx.last_frame().blobs = vec![blob(BlobKind::EXIF, b"II*\0last")];
+    let fx = fx.with_blobs(vec![
+        blob(BlobKind::ICC, &vec![7u8; 64 * 1024]),
+        blob(BlobKind::XMP, b"<x/>"),
+    ]);
+    let mut file = decode_bytes(&ctx, &fx.encode()).unwrap();
+    assert_eq!(file.len(), 40);
+    let first = file.primary().params() as *const _;
+    assert!(file
+        .frames()
+        .iter()
+        .all(|i| std::ptr::eq(i.params(), first)));
+    file.retain_blobs(|b| !b.is(&BlobKind::EXIF));
+    let first = file.primary().params() as *const _;
+    assert!(file
+        .frames()
+        .iter()
+        .all(|i| std::ptr::eq(i.params(), first)));
+    assert!(file.frames()[39].frame_blobs().is_empty());
+    assert_eq!(file.frames()[39].icc().map(<[u8]>::len), Some(64 * 1024));
+    file.retain_blobs(|b| !b.is(&BlobKind::XMP));
+    let first = file.primary().params() as *const _;
+    assert!(file
+        .frames()
+        .iter()
+        .all(|i| std::ptr::eq(i.params(), first)));
+    assert_eq!(file.blobs().len(), 1);
+    assert_eq!(file.frames()[5].stream_blobs().len(), 1);
+    // A picture given its own stream blobs stops sharing, alone.
+    let own = file.frames()[3]
+        .clone()
+        .with_stream_blobs(vec![blob(BlobKind::XMP, b"<own/>")]);
+    assert!(!std::ptr::eq(own.params(), first));
+    assert!(std::ptr::eq(file.frames()[4].params(), first));
+    assert_eq!(own.xmp(), Some(&b"<own/>"[..]));
+    assert_eq!(file.frames()[3].xmp(), None);
+    // into_video_frame hands a shared stream's parameters back by copy.
+    let (_, params) = file.frames()[2].clone().into_video_frame();
+    assert_eq!(params.blobs().len(), 1);
+}
+
+#[test]
 fn image_file_strips_metadata_after_the_fact() {
     let ctx = fixture::ctx();
     let mut fx = Fixture::new(4, 4, PixelFormat::Rgb24);

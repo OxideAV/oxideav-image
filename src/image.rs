@@ -1,6 +1,7 @@
 //! [`Image`]: a decoded picture in its native layout, with the raw
 //! `Vec<u8>` views every Rust image consumer expects.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use oxideav_core::{
@@ -34,7 +35,10 @@ use crate::error::{Error, Result};
 #[derive(Clone, Debug)]
 pub struct Image {
     frame: VideoFrame,
-    params: CodecParameters,
+    /// Shared by every picture of one stream (a 200-page document or a
+    /// long animation holds the stream's profile once, not per page);
+    /// copied on write.
+    params: Arc<CodecParameters>,
     /// Per-picture blobs, lifted off `frame`'s side-channel record at
     /// construction and re-attached by `into_video_frame`.
     blobs: Vec<MetadataBlob>,
@@ -57,7 +61,16 @@ impl Image {
     /// implies (side-channel records excluded). A metadata-blobs record
     /// on the frame is lifted into [`frame_blobs`](Self::frame_blobs);
     /// `params.blobs` become the [`stream_blobs`](Self::stream_blobs).
-    pub fn from_video_frame(mut frame: VideoFrame, params: &CodecParameters) -> Result<Self> {
+    pub fn from_video_frame(frame: VideoFrame, params: &CodecParameters) -> Result<Self> {
+        Self::from_video_frame_shared(frame, Arc::new(params.clone()))
+    }
+
+    /// [`from_video_frame`](Self::from_video_frame) over parameters
+    /// shared with the other pictures of the stream.
+    pub(crate) fn from_video_frame_shared(
+        mut frame: VideoFrame,
+        params: Arc<CodecParameters>,
+    ) -> Result<Self> {
         let width = params
             .width
             .ok_or_else(|| Error::invalid("image stream has no width"))?;
@@ -82,7 +95,7 @@ impl Image {
         let blobs = frame.take_blobs();
         Ok(Self {
             frame,
-            params: params.clone(),
+            params,
             blobs,
             delay: None,
             index: 0,
@@ -127,7 +140,7 @@ impl Image {
                 pts: Some(0),
                 planes: vec![VideoPlane { stride: row, data }],
             },
-            params,
+            params: Arc::new(params),
             blobs: Vec::new(),
             delay: None,
             index: 0,
@@ -262,7 +275,7 @@ impl Image {
     /// receive.
     pub fn with_color_signal(mut self, signal: ColorSignal) -> Self {
         self.frame.set_color_signal(signal);
-        self.params.color_signal = signal;
+        Arc::make_mut(&mut self.params).color_signal = signal;
         self
     }
 
@@ -440,7 +453,7 @@ impl Image {
     /// the stream; [`crate::encode`] hands them to the encoder's
     /// parameters).
     pub fn with_stream_blobs(mut self, blobs: Vec<MetadataBlob>) -> Self {
-        self.params.blobs = blobs;
+        Arc::make_mut(&mut self.params).blobs = blobs;
         self
     }
 
@@ -452,14 +465,31 @@ impl Image {
     /// Keep only the blobs (both levels) `keep` accepts.
     pub fn retain_blobs(&mut self, mut keep: impl FnMut(&MetadataBlob) -> bool) {
         self.blobs.retain(|b| keep(b));
-        self.params.blobs.retain(|b| keep(b));
+        // Copy the shared parameters only when something has to go.
+        if !self.params.blobs.iter().all(&mut keep) {
+            Arc::make_mut(&mut self.params).blobs.retain(|b| keep(b));
+        }
+    }
+
+    /// Keep only the per-picture blobs `keep` accepts (stream level
+    /// untouched).
+    pub(crate) fn retain_frame_blobs(&mut self, mut keep: impl FnMut(&MetadataBlob) -> bool) {
+        self.blobs.retain(|b| keep(b));
+    }
+
+    /// The shared stream parameters, for `ImageFile` to re-point.
+    pub(crate) fn params_arc(&self) -> &Arc<CodecParameters> {
+        &self.params
+    }
+
+    pub(crate) fn set_params_arc(&mut self, params: Arc<CodecParameters>) {
+        self.params = params;
     }
 
     /// Drop every blob at both levels (the container's string metadata
     /// on [`crate::ImageFile`] is untouched).
     pub fn strip_metadata(&mut self) {
-        self.blobs.clear();
-        self.params.blobs.clear();
+        self.retain_blobs(|_| false);
     }
 
     /// Builder form of [`strip_metadata`](Self::strip_metadata).
@@ -532,7 +562,7 @@ impl Image {
                 pts: None,
                 planes: Vec::new(),
             },
-            params: CodecParameters::video(CodecId::new("rawvideo")),
+            params: Arc::new(CodecParameters::video(CodecId::new("rawvideo"))),
             blobs: self.blobs.clone(),
             delay: self.delay,
             index: self.index,
@@ -578,7 +608,8 @@ impl Image {
     /// Hand the frame back to the framework (pipeline, encoder, filter),
     /// with the per-picture blobs re-attached as its side-channel record.
     pub fn into_video_frame(self) -> (VideoFrame, CodecParameters) {
-        (self.frame.with_blobs(self.blobs), self.params)
+        let params = Arc::try_unwrap(self.params).unwrap_or_else(|a| (*a).clone());
+        (self.frame.with_blobs(self.blobs), params)
     }
 
     /// Convert to another layout through `oxideav-pixfmt`. Same format
@@ -632,12 +663,12 @@ impl Image {
             cur = next;
         }
         let converted = converted.ok_or_else(|| Error::invalid("conversion produced no frame"))?;
-        let mut params = self.params.clone();
+        let mut params = (*self.params).clone();
         params.pixel_format = Some(dst);
         params.media_type = MediaType::Video;
         Ok(Image {
             frame: converted,
-            params,
+            params: Arc::new(params),
             ..self.clone_timing()
         })
     }
@@ -833,12 +864,12 @@ impl Image {
         if let Some(sig) = self.frame.color_signal() {
             frame.set_color_signal(sig);
         }
-        let mut params = self.params.clone();
+        let mut params = (*self.params).clone();
         params.width = Some(w);
         params.height = Some(h);
         Ok(Image {
             frame,
-            params,
+            params: Arc::new(params),
             ..self.clone_timing()
         })
     }

@@ -41,6 +41,11 @@ let heic = encode(&ctx, img, "heic", &SaveOptions::new().with_option("qp", "20")
 
 let thumb = img.crop(0, 0, 256, 256)?;
 let apng = encode_frames(&ctx, file.frames(), "png", &SaveOptions::default())?;
+
+if let Some(icc) = img.icc() { /* hand the profile to colour management */ }
+let bare = encode(&ctx, img, "jpg", &SaveOptions::new().without_metadata())?;
+let indexed = Image::from_indexed(2, 1, vec![0, 1], &[[255, 0, 0, 255], [0, 0, 0, 0]])?;
+assert_eq!(indexed.to_rgba8()?[7], 0);           // palette alpha reaches the RGBA view
 ```
 
 ## API
@@ -176,7 +181,9 @@ every blob at both levels before the decoder, the pictures or a later
 `encode` see them; `with_stripped_blobs([BlobKind::EXIF])` drops kinds.
 `ImageFile::retain_blobs(f)` / `strip_metadata()` do the same to an
 open file. The container's string metadata (`ImageFile::metadata()`) is
-not a blob and is never stripped.
+not a blob and is never stripped. The pictures of a stream share its
+parameters (copy on write), so a long animation or a many-page document
+holds the stream's profile once.
 
 **Saving:** `encode` / `encode_frames` hand blobs to the encoder at both
 levels. The encoder's `CodecParameters::blobs` get the first picture's
