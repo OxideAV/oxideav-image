@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/OxideAV/oxideav-image/compare/v0.0.2...v0.0.3) - 2026-10-14
+
+### Other
+
+- one stream per picture geometry — multi-stream muxers write the set, single-geometry ones refuse by type, never a resize
+- :to_rgb16 / to_gray16: lossless 16-bit views; deep sources stage through 16-bit pivots, never an 8-bit one
+- allow / deny lists for containers and codecs on OpenOptions, checked between probe and first decoder; ImageError::Restricted
+- can_encode / resolve_target: answer "will this save?" through the registries without touching pixels
+- colour before grey — source family by fidelity, other colour family, grey last; declared sets sorted the same way
+
 ### Added
 
 - `can_encode(&ctx, format)` and `resolve_target(&ctx, format, &opts) ->
