@@ -49,14 +49,15 @@ let apng = encode_frames(&ctx, file.frames(), "png", &SaveOptions::default())?;
 |---|---|
 | `open(&ctx, path)` / `open_with(.., &OpenOptions)` | Probe the file (extension as hint), open its demuxer, decode every video stream → `ImageFile`. |
 | `decode_bytes(&ctx, &[u8])` / `decode_vec(&ctx, Vec<u8>)` / `decode_reader(&ctx, Box<dyn ReadSeek>, &OpenOptions)` | Same from memory (`decode_vec` without a copy) or any seekable reader. `*_with` variants take `OpenOptions`. |
-| `ImageFile` | `container()`, `metadata()`, `primary()`, `frames()`, `frames_mut()`, `iter()`, `into_frames()`, `into_primary()`, `len()`; `IntoIterator` for `ImageFile` and `&ImageFile`. |
-| `Image` | A `VideoFrame` + `CodecParameters`: `width` / `height` / `format` / `color_signal` / `palette`; `delay`, `timestamp`, `stream`, `index`, `raw_timing`, `time_base`; `to_format(PixelFormat)`, `to_gray8`, `to_rgb8`, `to_rgba8`, `to_gray16`, `to_rgb16`, `to_rgba16`, `to_packed`, `as_packed`, `into_raw`, `crop`, `with_delay`, `with_color_signal`, `frame`, `params`, `into_video_frame`. |
-| `Image::from_rgb8` / `from_rgba8` / `from_raw` / `from_planes` / `from_video_frame` | Fallible constructors: geometry, plane count, stride and length are validated. |
+| `ImageFile` | `container()`, `metadata()`, `primary()`, `frames()`, `frames_mut()`, `iter()`, `into_frames()`, `into_primary()`, `len()`; `IntoIterator` for `ImageFile` and `&ImageFile`. Metadata: `blobs()`, `stream_blobs(i)`, `blob(&kind)`, `icc()`, `exif()`, `xmp()`, `iptc()`, `has_metadata()` (see *Metadata*). |
+| `Image` | A `VideoFrame` + `CodecParameters`: `width` / `height` / `format` / `color_signal` / `palette`; `palette_alpha`, `palette_rgba(i)`, `palette_entries`, `has_palette_alpha`, `has_alpha` (see *Palette alpha*); `delay`, `timestamp`, `stream`, `index`, `raw_timing`, `time_base`; `to_format(PixelFormat)`, `to_gray8`, `to_rgb8`, `to_rgba8`, `to_gray16`, `to_rgb16`, `to_rgba16`, `to_packed`, `as_packed`, `into_raw`, `crop`, `with_delay`, `with_color_signal`, `with_palette_rgba` / `with_palette` / `with_palette_alpha`, `frame`, `params`, `into_video_frame`. Metadata: `frame_blobs`, `stream_blobs`, `blobs`, `blob(&kind)`, `blobs_of(&kind)`, `icc`, `exif`, `xmp`, `iptc`, `has_metadata`, `with_blob(s)` / `set_blobs` / `push_blob` / `with_stream_blobs` / `take_blobs` / `retain_blobs` / `strip_metadata` / `without_metadata`. |
+| `Image::from_rgb8` / `from_rgba8` / `from_indexed` / `from_raw` / `from_planes` / `from_video_frame` | Fallible constructors: geometry, plane count, stride and length are validated; `from_indexed` takes RGBA palette entries. |
 | `encode(&ctx, &Image, "png", &SaveOptions)` / `encode_frames(&ctx, &[Image], ..)` / `save(&ctx, &Image, path, ..)` | Encoder + muxer by container name or extension; see *Format resolution*, *Pixel-format ladder* and *Geometry*. |
 | `encoder_options(&ctx, format, &SaveOptions)` | The option schema of the encoder `encode` would use (names for `SaveOptions::with_option`). |
-| `can_encode(&ctx, format)` / `resolve_target(&ctx, format, &SaveOptions)` | "Will this save?" before decoding: `can_encode` is a yes / no; `resolve_target` returns the `EncodeTarget` (`format()`, `container()` / `is_codec_only()`, `codec()`, `accepted_pixel_formats()`, `options()`, `ladder(src, &opts)`) or the error `encode` would return before looking at a picture. |
-| `OpenOptions` | `max_frames`, `ext_hint`, `decoder_options`, `max_pixels`, `allow_containers` / `deny_containers` / `allow_codecs` / `deny_codecs`. |
-| `SaveOptions` | `quality`, `pixel_format`, `codec`, `options`, `time_base`, `default_delay`. |
+| `can_encode(&ctx, format)` / `resolve_target(&ctx, format, &SaveOptions)` | "Will this save?" before decoding: `can_encode` is a yes / no; `resolve_target` returns the `EncodeTarget` (`format()`, `container()` / `is_codec_only()`, `codec()`, `accepted_pixel_formats()`, `options()`, `ladder(src, &opts)` / `ladder_for(&image, &opts)`, `metadata_support()`) or the error `encode` would return before looking at a picture. |
+| `OpenOptions` | `max_frames`, `ext_hint`, `decoder_options`, `max_pixels`, `allow_containers` / `deny_containers` / `allow_codecs` / `deny_codecs`, `strip_metadata` / `strip_blobs` (`without_metadata()`, `with_stripped_blobs(kinds)`). |
+| `SaveOptions` | `quality`, `pixel_format`, `codec`, `options`, `time_base`, `default_delay`, `blobs` (`with_blob(s)`), `strip_metadata` / `strip_blobs` (`without_metadata()`, `with_stripped_blobs(kinds)`). |
+| `BlobKind` / `MetadataBlob` / `MetadataSupport` | The framework's blob types, re-exported; `MetadataSupport` is what `EncodeTarget::metadata_support()` answers. |
 | `ImageError` (`Error`) | `#[non_exhaustive]`: see *Errors*. |
 
 All conversions go through `oxideav-pixfmt`; `to_gray8` / `to_rgb8` /
@@ -113,7 +114,9 @@ can reach from it. The order is a rule, not a table:
 
 1. the source layout;
 2. the colour layouts of the source's own family (RGB or YCbCr), in the
-   source's bit tier first, alpha kept when the source has it; YCbCr
+   source's bit tier first, alpha kept when the source has it (an alpha
+   channel, or a palette with a non-opaque entry — see *Palette
+   alpha*); YCbCr
    rungs at or below the source by decreasing chroma fidelity, then
    above it, closest first (a 4:2:0 source offers 4:2:2 before 4:4:4);
 3. the other colour family the same way;
@@ -142,6 +145,79 @@ options strictly; a lossless encoder would reject the unknown name).
 `SaveOptions::with_option(name, value)` is forwarded verbatim; names
 come from `encoder_options`. `OpenOptions::with_decoder_option` does the
 same on the decoding side.
+
+### Metadata
+
+Opaque payloads — ICC profiles, Exif, XMP, IPTC, anything a format
+embeds as bytes it does not interpret — are framework `MetadataBlob`s
+(`oxideav_core::blob`, core 0.1.40: a `BlobKind` name, an optional
+media type and the bytes, with a format-neutral payload convention per
+well-known kind so a blob lifted from one format drops into another).
+They ride at two levels:
+
+- **stream level** — `CodecParameters::blobs`, as the demuxer declared
+  them for the stream: the file's profile, its Exif, its XMP.
+  `ImageFile::blobs()` / `icc()` / `exif()` / `xmp()` / `iptc()` /
+  `blob(&kind)` read the primary picture's stream; `stream_blobs(i)` any
+  stream.
+- **per picture** — the frame's blobs record (`VideoFrame::blobs`),
+  lifted into `Image::frame_blobs()` when the picture is built: a
+  multi-page TIFF's per-page Exif, a HEIF burst item's own profile.
+
+**Precedence (ruling):** `Image::blobs()` / `blob(&kind)` /
+`blobs_of(&kind)` / `icc()` and friends return the frame's blobs first,
+then the stream blobs of kinds the frame does not carry — a frame blob
+overrides every stream blob of the same kind. `Image::frame()` hands
+back the frame without its blobs record; `into_video_frame` re-attaches
+it, so a pipeline receives exactly what the decoder produced.
+
+**Opening:** `OpenOptions::without_metadata()` (`strip_metadata`) drops
+every blob at both levels before the decoder, the pictures or a later
+`encode` see them; `with_stripped_blobs([BlobKind::EXIF])` drops kinds.
+The container's string metadata (`ImageFile::metadata()`) is not a blob
+and is never stripped.
+
+**Saving:** `encode` / `encode_frames` hand blobs to the encoder at both
+levels. The encoder's `CodecParameters::blobs` get the first picture's
+stream blobs — and, for a single-picture encode, its frame blobs ahead
+of them (a still-format encoder reads the stream parameters, and the
+picture's own metadata is the file's) — and every frame carries its own
+frame blobs on its record. `SaveOptions::with_blob(b)` writes `b` at the
+stream level and replaces every source blob of its kind (set a profile,
+swap the XMP packet); `without_metadata()` / `with_stripped_blobs(kinds)`
+withhold the source's. Whether the format embeds a kind is the
+encoder's business: `EncodeTarget::metadata_support()` is
+`MetadataSupport::PassThrough` for every target today — the framework
+has no per-kind encoder declaration (`Declared(kinds)` is reserved for
+one) — and the *Survey* below says what each crate carries.
+
+### Palette alpha
+
+An indexed (`Pal8`) picture carries its colours in the frame's palette
+record and, since core 0.1.40, their transparency in a palette-alpha
+record beside it (one byte per entry, possibly shorter than the
+palette; uncovered entries are opaque): GIF's transparent index, PNG
+`tRNS` on colour type 3, TGA 32-bit colour maps. The gateway honours it:
+
+- `Image::palette_alpha()`, `palette_rgba(i)` (alpha `255` when absent),
+  `palette_entries()`; `has_palette_alpha()` is true when any entry is
+  not `255`, and `has_alpha()` is true for an alpha layout or such a
+  palette.
+- `to_rgba8` / `to_rgba16` — and any alpha layout through `to_format` —
+  expand the picture through `palette_rgba`: a transparent entry yields
+  alpha `0`, opaque and uncovered ones `255`; an index past the palette
+  is opaque black (as pixfmt expands it).
+- `to_rgb8` / `to_rgb16` / `to_gray8` / `to_gray16` **drop** the alpha
+  (ruling): the entry's stored RGB, never composited over anything.
+- The ladder ranks the alpha-carrying rungs first for a palette with a
+  non-opaque entry (`Rgba` before `Rgb24`, `Yuva444P` before `Yuv444P`),
+  so an RGB-only encoder receives the transparency rather than a
+  flattened picture; `EncodeTarget::ladder_for(&image, &opts)` previews
+  what `encode` tries (`ladder(PixelFormat, ..)` reads the layout alone,
+  and `Pal8` has no alpha of its own).
+- `crop` keeps both records; `from_indexed(w, h, indices, &[[r, g, b,
+  a]])` builds one, attaching the alpha record only when an entry is
+  not opaque (no record means opaque).
 
 ### Geometry
 
@@ -220,12 +296,11 @@ of parsing the header itself.
   by tag, EXR channels and the like stay under the format crates' own
   names (`oxideav_heif::HeifFile`, `oxideav_png::PngMetadata`, …). The
   gateway is the common floor.
-- **ICC / Exif / XMP.** The framework's `VideoFrame` and
-  `CodecParameters` carry a colour signal (H.273 code points + range),
-  a palette and significant bits, but no embedded profile or metadata
-  blobs; until a core side-channel or stream field exists, those are
-  Layer 1's (`XxxImage::metadata`). `ImageFile::metadata()` is the
-  container's string pairs as the demuxer reports them.
+- **Parsing metadata.** ICC / Exif / XMP / IPTC are carried as opaque
+  blobs (see *Metadata*) and routed by kind; the gateway never reads
+  inside them (orientation, colour management and tag readers are the
+  consumer's). `ImageFile::metadata()` is the container's string pairs
+  as the demuxer reports them.
 - **Guessing.** A stream without a declared pixel format, a frame whose
   plane count disagrees with it, or a probe miss is an error, not an
   inference.
@@ -234,13 +309,85 @@ of parsing the header itself.
 
 Unit tests run against a synthetic `OXIM` container + codec pair
 registered exactly like a sibling crate (probe by magic and by extension
-hint, 14 packed and planar layouts, `Pal8` with its palette, exact
+hint, 14 packed and planar layouts, `Pal8` with its palette and its
+alpha record, stream and frame blobs through open / encode with every
+precedence and strip rule, the legacy adaptations, exact
 16-bit views, multi-frame
 timing in every mode, allow / deny lists, the ladder against a layout-refusing codec, an encoder that declares
 no layouts (colour before grey) and a layout-refusing muxer, mixed
 geometries into a multi-stream container and into a one-geometry one, options, limits, every error variant). The
 umbrella's `crates/oxideav-tests/tests/image_gateway.rs` runs the gateway
 over the real format crates through `oxideav_meta::register_all`.
+
+## Survey: metadata and palette alpha across the image crates (round 476)
+
+Read-only survey of the 25 registered image crates on 2026-10-15, the
+day core 0.1.40 (blobs + palette alpha) was released. Legend — **L1**:
+the crate's standalone `Metadata { icc, exif, xmp }` / `Palette`
+carries it; **field**: the Layer-1 field exists but the format has no
+native carriage the crate reads; **—**: the format has no such thing;
+**blob**: pushed through the registry on `CodecParameters::blobs` or the
+frame record; **legacy**: reaches the registry through another public
+field; **lost**: carried at Layer 1 but dropped on the registry path.
+Every crate has the contract's `Metadata` struct; **none pushes a blob
+through the registry yet** (0 of 25), so today the gateway surfaces
+blobs only from the synthetic fixture — the per-crate asks below are
+the adoption wave.
+
+| Format | ICC | Exif | XMP | Palette alpha | Registry today | Ask (for that crate's seat) |
+|---|---|---|---|---|---|---|
+| png | L1 `iCCP` | L1 `eXIf` | L1 `iTXt XML:com.adobe.xmp` | L1 `tRNS` → **legacy** (demuxer `extradata` = `IHDR ‖ len ‖ PLTE ‖ len ‖ tRNS`), **adapted** by the gateway | no blobs; decoder attaches the palette only | demuxer pushes ICC / Exif / XMP on the stream; decoder attaches the alpha record on `Pal8` frames; encoder reads `params.blobs` + the alpha record instead of the split-less `PLTE ‖ tRNS` extradata |
+| mjpeg | L1 `APP2` | L1 `APP1` | L1 `APP1` | — | none | demuxer / decoder push the three; encoder writes them from `params.blobs` |
+| tiff | L1 tag 34675 | L1 Exif IFD | L1 tag 700 | — (colour maps are opaque) | none | per-page blobs on each frame's record (pages differ), the first page's on the stream; encoder writes from both |
+| gif | L1 `ICCRGBG1012` | L1 app ext | L1 `XMP DataXMP` | L1 transparent index → **lost** for stills (`Pal8` without alpha; `Rgba` only when the 256-entry table has no free slot); animations are composited `Rgba` | none | stills attach the alpha record (transparent index → alpha `0`); encoder maps a `Pal8` input with an alpha record to the GCE transparent index; blobs on the stream |
+| webp | L1 `ICCP` | L1 `EXIF` | L1 `XMP ` | — | none through the registry (the direct factory `make_encoder_with_metadata` embeds metadata; the registry encoder does not) | codec-only: decoder puts the three on the frame record; registry encoder reads `params.blobs` |
+| heif | L1 `colr` `prof` | L1 `Exif` item | L1 `mime` item | — | none | primary item's three on stream 0; per-item blobs on burst / sequence frames; writer embeds from `params.blobs` |
+| avif | L1 | L1 | L1 | — | none | rides heif: same ask |
+| jpegxl | L1 codestream ICC | L1 `Exif` box | L1 `xml ` box | — | none | codec-only: frame record; encoder from `params.blobs` |
+| jpeg2000 | L1 `jp2h` `colr` | field | field | — (`pclr` opaque) | **legacy, not adaptable**: demuxer string `icc = present` | push the profile bytes as a blob instead of the marker |
+| jpegxs | field | L1 file-format box | field | — | **legacy, not adaptable**: demuxer string `exif = present` | push the Exif bytes as a blob instead of the marker |
+| openexr | — | — | — | — | none | none (header attributes are not a well-known kind; a `custom("exr-attributes")` blob is the crate's call) |
+| bmp | L1 V5 embedded profile | — | — | — (`RGBQUAD.rgbReserved` is reserved, not alpha; the crate decodes entries opaque) | none | ICC on the stream; no palette-alpha ask |
+| tga | — | — | — | L1 32-bit colour map entries → **lost** (registry `to_rgb()`) | none | attach the alpha record for 32-bit colour maps; encoder writes it back |
+| pcx | — | — | — | — | none | none |
+| pbm | — | — | — | — | none | none |
+| farbfeld | — | — | — | — | none | none |
+| wbmp | — | — | — | — | none | none |
+| hdr | — | — | — | — | none | none |
+| ico | via PNG entries (L1 passes `Metadata` to the png member) | same | same | — (every entry decodes to `Rgba`; PNG `tRNS` and the BMP AND mask are applied) | none | per-entry frame blobs from PNG entries |
+| dds | — | — | — | — | none | none |
+| pict | — | — | — | — | none | none |
+| icer | — | — | — | — | none | none |
+| iff | — | — | — | L1 transparent colour key → **lost** (registry palette RGB only) | none | attach the alpha record from the key; encoder maps it back |
+| qoi | — | — | — | — | none | none |
+| svg | — | field | field | — | none | none |
+
+Totals: ICC natively carried at Layer 1 by 11 formats, Exif by 10, XMP by
+9, palette alpha by 4 (png, gif, tga, iff); as blobs through the
+registry: 0 / 0 / 0 / 0; legacy through the registry: 1 (png palette
+alpha, adapted) + 2 markers without bytes (jpeg2000, jpegxs).
+
+**Adaptations the gateway applies (read side, withdrawn once the crate
+adopts the record):**
+
+- `png` streams: the demuxer's `extradata` layout above is public and
+  unambiguous (colour type at `IHDR[9]`, both lengths always present),
+  and for colour type 3 the `tRNS` data is one alpha byte per palette
+  entry in entry order — the palette-alpha record exactly. When a `Pal8`
+  picture arrives with a palette and no alpha record, the gateway lifts
+  the `tRNS` tail into one (a tail longer than the palette, or an empty
+  one, is left alone).
+
+No other legacy field is adapted: the `present` markers carry no bytes,
+and the encoder-side `PLTE ‖ tRNS` blob of png has no split point.
+
+**Rulings recorded this round** (for `IMAGE_CRATE_API.md`): the
+precedence rule (frame blob overrides stream blob of the same kind); the
+single-picture promotion (a still's frame blobs are also the stream's
+when it is encoded alone); `SaveOptions::blobs` replace by kind; RGB and
+grey views drop palette alpha without compositing; a palette with a
+non-opaque entry counts as an alpha source for the ladder; no record
+means opaque.
 
 ## License
 
