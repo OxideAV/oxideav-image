@@ -96,7 +96,14 @@ source has none.
   the same name (png, bmp, tiff, heif, …) or the few that differ (`jpeg`
   → `mjpeg`, `dcx` → `pcx`, `ani` / `cur` → `ico`, `svgz` → `svg`,
   `iff_*` → `ilbm`); `SaveOptions::codec` overrides it (`"hevc"` or
-  `"av1"` for a HEIF sequence track, for instance).
+  `"av1"` for a HEIF sequence track, for instance). **Ruling (round
+  476):** the requested format name picks the codec when an encoder of
+  that name exists on the resolved container — a muxer serving several
+  brands through several extensions (`heic` / `avif` / `heif` on the
+  heif muxer) receives the brand asked for: `encode(img, "avif", ..)`
+  uses codec `avif`, `"heic"` / `"heif"` the container's default
+  `heif`; `EncodeTarget::codec()` reports the chosen id. No encoder of
+  the requested name → the table above, then the container's own name.
 - **Asking first:** `can_encode(&ctx, "webp")` says whether a name or
   extension resolves to something writable at all; `resolve_target`
   tells which container and encoder, the layouts the encoder declares

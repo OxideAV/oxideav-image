@@ -54,6 +54,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of the 25 image crates (ICC / Exif / XMP / palette alpha: blob, legacy
   or none, with the per-crate ask).
 
+### Fixed
+
+- `encode(img, "avif", ..)` wrote the heif container's default codec:
+  the requested name was lost once the extension resolved to the
+  container. The requested (lower-cased, dot-stripped) name now rides
+  with the resolved container and picks a registered encoder of that
+  name first (`avif` → codec `avif`; `heic` / `heif` → `heif`), before
+  the known-codec table and the container's own name;
+  `EncodeTarget::codec()` reports it and `format()` is the requested
+  name.
+
 ### Changed
 
 - The pictures of one stream share that stream's `CodecParameters`

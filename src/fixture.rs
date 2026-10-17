@@ -50,6 +50,11 @@ pub(crate) const CODEC_YUV_ONLY: &str = "oxim_yuv";
 /// 4:2:0 / 4:4:4 YCbCr and 4:0:0 grey.
 pub(crate) const CODEC_UNDECLARED: &str = "oxim_undeclared";
 pub(crate) const CODEC_NO_DECODER: &str = "oxim_nodec";
+/// One muxer serving two brands through two extensions (`.oximmux`
+/// and `.oximalt`) with an encoder registered under each name — the
+/// heif / avif shape. The muxer records the codec id it was given.
+pub(crate) const CONTAINER_MUX: &str = "oximmux";
+pub(crate) const CODEC_ALT: &str = "oximalt";
 const MAGIC: &[u8; 4] = b"OXIM";
 pub(crate) const FLAG_DURATIONS: u8 = 1;
 pub(crate) const FLAG_NO_PTS: u8 = 2;
@@ -433,6 +438,14 @@ fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     make_encoder_for(CODEC, FORMATS, params)
 }
 
+fn make_encoder_mux(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+    make_encoder_for(CONTAINER_MUX, FORMATS, params)
+}
+
+fn make_encoder_alt(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+    make_encoder_for(CODEC_ALT, FORMATS, params)
+}
+
 fn make_encoder_yuv(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     make_encoder_for(CODEC_YUV_ONLY, &[PixelFormat::Yuv420P], params)
 }
@@ -682,6 +695,13 @@ fn open_demuxer_rgb(
     open_demuxer_named(CONTAINER_RGB_ONLY, CODEC, false, input)
 }
 
+fn open_demuxer_mux(
+    input: Box<dyn ReadSeek>,
+    _codecs: &dyn CodecResolver,
+) -> Result<Box<dyn Demuxer>> {
+    open_demuxer_named(CONTAINER_MUX, CODEC, false, input)
+}
+
 fn open_demuxer_nodec(
     input: Box<dyn ReadSeek>,
     _codecs: &dyn CodecResolver,
@@ -772,6 +792,10 @@ fn open_muxer_rgb(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<
     open_muxer_named(CONTAINER_RGB_ONLY, true, false, output, streams)
 }
 
+fn open_muxer_mux(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<dyn Muxer>> {
+    open_muxer_named(CONTAINER_MUX, false, false, output, streams)
+}
+
 fn open_muxer_multi(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<dyn Muxer>> {
     open_muxer_named(CONTAINER_MULTI, false, true, output, streams)
 }
@@ -805,7 +829,7 @@ impl Muxer for OximMuxer {
                 .filter(|pkt| pkt.stream_index as usize == si)
                 .collect();
             out.extend_from_slice(&(packets.len() as u32).to_le_bytes());
-            let mut meta = format!("muxer={}\n", self.name).into_bytes();
+            let mut meta = format!("muxer={}\ncodec={}\n", self.name, p.codec_id).into_bytes();
             for (k, v) in p.options.iter() {
                 meta.extend_from_slice(format!("{k}={v}\n").as_bytes());
             }
@@ -876,6 +900,10 @@ fn probe_multi(data: &ProbeData) -> ProbeScore {
     probe_sibling(data, "oximmulti")
 }
 
+fn probe_mux(data: &ProbeData) -> ProbeScore {
+    probe_sibling(data, "oximmux").max(probe_sibling(data, "oximalt"))
+}
+
 /// Register the synthetic codec and containers into `ctx`, the way a
 /// sibling crate's `register` does.
 pub(crate) fn register(ctx: &mut RuntimeContext) {
@@ -907,7 +935,30 @@ pub(crate) fn register(ctx: &mut RuntimeContext) {
             .decoder(make_decoder)
             .encoder(make_encoder_undeclared),
     );
+    for (id, make) in [
+        (
+            CONTAINER_MUX,
+            make_encoder_mux as fn(&CodecParameters) -> Result<Box<dyn Encoder>>,
+        ),
+        (CODEC_ALT, make_encoder_alt),
+    ] {
+        ctx.codecs.register(
+            CodecInfo::new(CodecId::new(id))
+                .capabilities(
+                    CodecCapabilities::video("oxim_mux_sw")
+                        .with_intra_only(true)
+                        .with_pixel_formats(FORMATS.to_vec()),
+                )
+                .decoder(make_decoder)
+                .encoder(make),
+        );
+    }
     let c = &mut ctx.containers;
+    c.register_demuxer(CONTAINER_MUX, open_demuxer_mux);
+    c.register_muxer(CONTAINER_MUX, open_muxer_mux);
+    c.register_extension("oximmux", CONTAINER_MUX);
+    c.register_extension("oximalt", CONTAINER_MUX);
+    c.register_probe(CONTAINER_MUX, probe_mux);
     c.register_demuxer(CONTAINER, open_demuxer);
     c.register_muxer(CONTAINER, open_muxer);
     c.register_extension("oxim", CONTAINER);

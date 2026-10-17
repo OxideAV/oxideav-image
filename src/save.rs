@@ -298,7 +298,7 @@ pub fn resolve_target(
     let accepted = declared_formats(ctx, &codec);
     let options = ctx.codecs.encoder_options_schema(&codec).unwrap_or(&[]);
     let (format, container) = match target {
-        Target::Container(c) => (c.clone(), Some(c)),
+        Target::Container { name, requested } => (requested, Some(name)),
         Target::CodecOnly(c) => (c, None),
     };
     Ok(EncodeTarget {
@@ -322,7 +322,9 @@ pub fn can_encode(ctx: &RuntimeContext, format: &str) -> bool {
 fn codec_for(ctx: &RuntimeContext, target: &Target, opts: &SaveOptions) -> CodecId {
     CodecId::new(match (&opts.codec, target) {
         (Some(c), _) => c.clone(),
-        (None, Target::Container(c)) => default_codec_for_container(ctx, c, opts),
+        (None, Target::Container { name, requested }) => {
+            default_codec_for_container(ctx, name, requested, opts)
+        }
         (None, Target::CodecOnly(id)) => {
             if ctx.codecs.has_encoder(&CodecId::new(id)) {
                 id.clone()
@@ -509,8 +511,11 @@ pub fn save(
 /// Where the encoded packets go.
 #[derive(Clone, Debug)]
 enum Target {
-    /// A registered container with a muxer.
-    Container(String),
+    /// A registered container with a muxer. `requested` is the format
+    /// name as asked (lower-cased, dot-stripped): a container serving
+    /// several brands through several extensions (`heic` / `avif` /
+    /// `heif` on one muxer) picks its codec from it.
+    Container { name: String, requested: String },
     /// A codec registered without any container: its encoder writes the
     /// whole file as one packet (qoi, webp, gif, avif, exr, … register
     /// this way).
@@ -520,7 +525,12 @@ enum Target {
 impl std::fmt::Display for Target {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Target::Container(c) => write!(f, "container '{c}'"),
+            Target::Container { name, requested } if name == requested => {
+                write!(f, "container '{name}'")
+            }
+            Target::Container { name, requested } => {
+                write!(f, "container '{name}' (from '{requested}')")
+            }
             Target::CodecOnly(c) => write!(f, "codec-only format '{c}'"),
         }
     }
@@ -531,12 +541,18 @@ impl std::fmt::Display for Target {
 fn resolve_format(ctx: &RuntimeContext, format: &str) -> Result<Target> {
     let lower = format.trim_start_matches('.').to_ascii_lowercase();
     if ctx.containers.muxer_names().any(|n| n == lower) {
-        return Ok(Target::Container(lower));
+        return Ok(Target::Container {
+            name: lower.clone(),
+            requested: lower,
+        });
     }
     let by_ext = ctx.containers.container_for_extension(&lower);
     if let Some(name) = by_ext {
         if ctx.containers.muxer_names().any(|n| n == name) {
-            return Ok(Target::Container(name.to_string()));
+            return Ok(Target::Container {
+                name: name.to_string(),
+                requested: lower,
+            });
         }
     }
     // A codec registered without a container: the format's crate hands
@@ -561,14 +577,25 @@ fn resolve_format(ctx: &RuntimeContext, format: &str) -> Result<Target> {
     )))
 }
 
-/// The payload codec a container carries by default: the few containers
-/// whose codec is named differently (when that encoder is registered),
-/// else the codec of the same name (png, bmp, tiff, heif, …).
+/// The payload codec a container carries by default: a registered
+/// encoder named like the requested format when the request was a
+/// brand or extension of a multi-codec container (`avif` on the heif
+/// muxer → codec `avif`; `heic` / `heif` → `heif`); else the few
+/// containers whose codec is named differently (when that encoder is
+/// registered); else the codec of the same name (png, bmp, tiff, heif,
+/// …).
 fn default_codec_for_container(
     ctx: &RuntimeContext,
     container: &str,
+    requested: &str,
     opts: &SaveOptions,
 ) -> String {
+    // The requested name picks the codec when an encoder of that name
+    // exists on the resolved container (ruling, round 476): the brand
+    // asked for must not be lost to the container's default codec.
+    if requested != container && ctx.codecs.has_encoder(&CodecId::new(requested)) {
+        return requested.to_string();
+    }
     let known = match container {
         "jpeg" | "jpg" | "mjpeg" | "mjpeg-raw" => Some("mjpeg"),
         "jp2" | "jph" => Some("jpeg2000"),
@@ -637,7 +664,7 @@ fn encode_attempt(
 ) -> Result<Vec<u8>> {
     let time_base = opts.time_base.unwrap_or_else(|| match target {
         // The APNG muxer reads `duration` in its 1/100 s delay unit.
-        Target::Container(c) if c == "png" || c == "apng" => TimeBase::new(1, 100),
+        Target::Container { name, .. } if name == "png" || name == "apng" => TimeBase::new(1, 100),
         _ => TimeBase::MILLIS,
     });
     let default_delay = opts.default_delay.unwrap_or(DEFAULT_DELAY);
@@ -660,7 +687,7 @@ fn encode_attempt(
             g,
             gi as u32,
             &params,
-            matches!(target, Target::Container(_)),
+            matches!(target, Target::Container { .. }),
             time_base,
             default_delay,
             opts,
@@ -676,7 +703,7 @@ fn encode_attempt(
     }
 
     let container = match target {
-        Target::Container(c) => c.as_str(),
+        Target::Container { name, .. } => name.as_str(),
         Target::CodecOnly(id) => {
             // `encode_frames` admits one group here.
             let mut packets = per_group.pop().unwrap_or_default();

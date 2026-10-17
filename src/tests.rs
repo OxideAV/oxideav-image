@@ -1348,6 +1348,56 @@ fn encode_hands_blobs_to_the_encoder_at_both_levels() {
 }
 
 #[test]
+fn requested_brand_picks_the_codec_on_a_multi_codec_container() {
+    // `oximmux` serves `.oximmux` and `.oximalt`; encoders `oximmux` and
+    // `oximalt` are both registered. The requested name picks the
+    // codec; the container's own name keeps its default; an explicit
+    // codec wins over both.
+    let ctx = fixture::ctx();
+    let opts = SaveOptions::default();
+    let t = resolve_target(&ctx, "oximalt", &opts).unwrap();
+    assert_eq!(t.container(), Some("oximmux"));
+    assert_eq!(t.format(), "oximalt");
+    assert_eq!(t.codec(), "oximalt");
+    let t = resolve_target(&ctx, ".OXIMALT", &opts).unwrap();
+    assert_eq!(t.codec(), "oximalt");
+    let t = resolve_target(&ctx, "oximmux", &opts).unwrap();
+    assert_eq!(t.codec(), "oximmux");
+    assert_eq!(t.format(), "oximmux");
+    let t = resolve_target(&ctx, "oximalt", &SaveOptions::new().with_codec("oximmux")).unwrap();
+    assert_eq!(t.codec(), "oximmux");
+    // A name without an encoder of its own falls through unchanged (the
+    // `oximrgb` container has no `oximrgb` codec: still `Unsupported`
+    // without an explicit codec).
+    assert!(matches!(
+        resolve_target(&ctx, "oximrgb", &opts),
+        Err(ImageError::Unsupported(_))
+    ));
+    // The encoder actually used is the one the muxer recorded.
+    let img = Image::from_rgb8(2, 2, vec![0; 12]).unwrap();
+    let codec_of = |format: &str, opts: &SaveOptions| {
+        let bytes = encode(&ctx, &img, format, opts).unwrap();
+        decode_bytes(&ctx, &bytes)
+            .unwrap()
+            .metadata()
+            .iter()
+            .find(|(k, _)| k == "codec")
+            .map(|(_, v)| v.clone())
+            .unwrap()
+    };
+    assert_eq!(codec_of("oximalt", &opts), "oximalt");
+    assert_eq!(codec_of("oximmux", &opts), "oximmux");
+    assert_eq!(
+        codec_of("oximalt", &SaveOptions::new().with_codec("oximmux")),
+        "oximmux"
+    );
+    assert_eq!(
+        codec_of("oximmux", &SaveOptions::new().with_codec("oximalt")),
+        "oximalt"
+    );
+}
+
+#[test]
 fn metadata_support_is_pass_through() {
     let ctx = fixture::ctx();
     let target = resolve_target(&ctx, "oxim", &SaveOptions::default()).unwrap();
