@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/OxideAV/oxideav-image/compare/v0.0.3...v0.0.4) - 2026-10-17
+
+### Other
+
+- the requested format name picks the codec on a multi-brand container — "avif" on the heif muxer selects the avif encoder instead of the container's default
+- Pictures of one stream share its CodecParameters (copy on write): a stream's blobs are held once however many pages or frames; ImageFile::retain_blobs filters each shared set once
+- :retain_blobs / strip_metadata: post-open stripping on every stream and every picture, the counterpart of the OpenOptions rules
+- Metadata and Palette alpha sections, the round-476 survey of the 25 image crates (ICC / Exif / XMP / palette alpha: Layer 1, legacy or none; 0 of 25 push blobs yet) with the per-crate ask, the png tRNS adaptation and the rulings
+- core 0.1.40 adoption: metadata blobs surfaced and written through the gateway, palette alpha honoured in every RGBA view and in the ladder
+
 ### Added
 
 - **Metadata blobs surfaced** (core 0.1.40): `ImageFile::blobs()` /
