@@ -346,9 +346,86 @@ impl Image {
 
     /// True when the picture carries transparency: an alpha channel in
     /// its layout, or a palette with a non-opaque entry
-    /// ([`has_palette_alpha`](Self::has_palette_alpha)).
+    /// ([`has_palette_alpha`](Self::has_palette_alpha)). This reads the
+    /// layout, not the samples; [`is_opaque`](Self::is_opaque) reads
+    /// them.
     pub fn has_alpha(&self) -> bool {
         self.format().has_alpha() || self.has_palette_alpha()
+    }
+
+    /// True when nothing in the picture is transparent: no alpha
+    /// channel and no palette alpha, or every alpha sample at full
+    /// scale (`255`, `65535`, the layout's maximum code, `≥ 1.0` for
+    /// float) and every palette entry opaque. The ladder uses it to
+    /// offer an encoder the opaque layout of the same model ahead of an
+    /// alpha layout whose alpha is all full. Scans the alpha samples
+    /// once; a layout whose alpha the gateway cannot locate counts as
+    /// transparent.
+    pub fn is_opaque(&self) -> bool {
+        let f = self.format();
+        if f == PixelFormat::Pal8 {
+            return !self.has_palette_alpha();
+        }
+        if !f.has_alpha() {
+            return true;
+        }
+        self.alpha_samples_all_full()
+    }
+
+    /// True when the picture has something transparent — the opposite
+    /// of [`is_opaque`](Self::is_opaque).
+    pub fn has_transparency(&self) -> bool {
+        !self.is_opaque()
+    }
+
+    /// Every alpha sample of an alpha layout at its full-scale value.
+    fn alpha_samples_all_full(&self) -> bool {
+        use PixelFormat as P;
+        let f = self.format();
+        let planes = self.frame.image_planes();
+        let (w, h) = (self.width() as usize, self.height() as usize);
+        // Packed: (bytes per pixel, alpha byte offset, sample width).
+        let packed: Option<(usize, usize, Sample)> = match f {
+            P::Rgba | P::Bgra => Some((4, 3, Sample::U8)),
+            P::Argb | P::Abgr => Some((4, 0, Sample::U8)),
+            P::Ya8 => Some((2, 1, Sample::U8)),
+            P::Rgba64Le => Some((8, 6, Sample::U16(u16::MAX))),
+            P::Ya16Le => Some((4, 2, Sample::U16(u16::MAX))),
+            P::RgbaF32Le => Some((16, 12, Sample::F32)),
+            _ => None,
+        };
+        if let Some((bpp, at, sample)) = packed {
+            let Some(plane) = planes.first() else {
+                return false;
+            };
+            return (0..h).all(|y| {
+                let row = &plane.data[y * plane.stride..];
+                (0..w).all(|x| sample.is_full(&row[x * bpp + at..]))
+            });
+        }
+        // Planar: the fourth plane, at the layout's sample width.
+        let sample = match f {
+            P::Yuva420P | P::Yuva422P | P::Yuva444P | P::Gbrap8 => Sample::U8,
+            P::Yuva420P10Le | P::Yuva422P10Le | P::Yuva444P10Le | P::Gbrap10Le => Sample::U16(1023),
+            P::Yuva420P12Le | P::Yuva422P12Le | P::Yuva444P12Le | P::Gbrap12Le => Sample::U16(4095),
+            P::Gbrap14Le => Sample::U16(16383),
+            P::Yuva420P16Le | P::Yuva422P16Le | P::Yuva444P16Le | P::Gbrap16Le => {
+                Sample::U16(u16::MAX)
+            }
+            P::GbrapF32Le => Sample::F32,
+            _ => return false,
+        };
+        let Some(plane) = planes.get(3) else {
+            return false;
+        };
+        let Some((pw, ph)) = f.plane_dimensions(3, self.width(), self.height()) else {
+            return false;
+        };
+        let (pw, ph, bytes) = (pw as usize, ph as usize, sample.bytes());
+        (0..ph).all(|y| {
+            let row = &plane.data[y * plane.stride..];
+            (0..pw).all(|x| sample.is_full(&row[x * bytes..]))
+        })
     }
 
     // ---- metadata ---------------------------------------------------------
@@ -954,6 +1031,38 @@ fn deep_route(src: PixelFormat, dst: PixelFormat) -> Option<Vec<PixelFormat>> {
 
 /// `ticks` of `tb` as a `Duration`; `None` for negative ticks or an
 /// invalid time base.
+/// Alpha sample width and full-scale test for [`Image::is_opaque`].
+#[derive(Clone, Copy)]
+enum Sample {
+    U8,
+    /// Little-endian 16-bit word; the payload is the full-scale code.
+    U16(u16),
+    F32,
+}
+
+impl Sample {
+    fn bytes(self) -> usize {
+        match self {
+            Sample::U8 => 1,
+            Sample::U16(_) => 2,
+            Sample::F32 => 4,
+        }
+    }
+
+    /// `at` starts at the sample; shorter than the sample = not full.
+    fn is_full(self, at: &[u8]) -> bool {
+        match self {
+            Sample::U8 => at.first().is_some_and(|&a| a == u8::MAX),
+            Sample::U16(max) => at
+                .get(..2)
+                .is_some_and(|b| u16::from_le_bytes([b[0], b[1]]) >= max),
+            Sample::F32 => at
+                .get(..4)
+                .is_some_and(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]) >= 1.0),
+        }
+    }
+}
+
 pub(crate) fn ticks_to_duration(ticks: i64, tb: TimeBase) -> Option<Duration> {
     if ticks < 0 || tb.num() <= 0 || tb.den() <= 0 {
         return None;
@@ -991,6 +1100,8 @@ pub(crate) fn packed_row_bytes(format: PixelFormat, width: u32) -> Option<usize>
         | PixelFormat::Argb
         | PixelFormat::Abgr
         | PixelFormat::Ya16Le
+        | PixelFormat::Cmyk
+        | PixelFormat::CmykInverted
         | PixelFormat::GrayF32Le => 4,
         PixelFormat::Rgb48Le => 6,
         PixelFormat::Rgba64Le => 8,

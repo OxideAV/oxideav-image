@@ -124,17 +124,28 @@ source has none.
 encoder or the muxer refuses it, steps through other layouts pixfmt
 can reach from it. The order is a rule, not a table:
 
-1. the source layout;
-2. the colour layouts of the source's own family (RGB or YCbCr), in the
-   source's bit tier first, alpha kept when the source has it (an alpha
-   channel, or a palette with a non-opaque entry — see *Palette
-   alpha*); YCbCr
-   rungs at or below the source by decreasing chroma fidelity, then
-   above it, closest first (a 4:2:0 source offers 4:2:2 before 4:4:4);
-3. the other colour family the same way;
-4. grey (`Gray8` / `Gray16Le` / `Ya8`) **last** — only when the source
-   is grey (then it comes first, followed by RGB, which is exact for
-   grey) or when nothing colour was accepted.
+1. **colour-model distance** — the source's own model (RGB or YCbCr);
+   then the other additive model; then CMYK (a four-ink layout for a
+   three-channel picture is a last resort, never a tie-breaker on
+   channel count: it is offered only when the source *is* CMYK or
+   nothing closer is accepted); a palette rung (`Pal8`, a quantisation)
+   after CMYK; grey **last** — only when the source is grey (then it
+   comes first, followed by RGB, which is exact for grey, then YCbCr,
+   then CMYK) or when nothing colour was accepted;
+2. within a model, the source's bit tier first;
+3. **transparency** as the pixels have it: a source with something
+   transparent (an alpha sample below full, or a palette entry that is
+   not opaque — `Image::has_transparency`) keeps alpha-carrying rungs
+   ahead; a source in an alpha layout whose alpha is all full
+   (`Image::is_opaque`) is offered the opaque layout of its model,
+   tier, chroma fidelity and packing *before itself* (an opaque `Rgba`
+   picture saves as `Rgb24`, an opaque `Yuva420P` as `Yuv420P`), then
+   its own layout, then the rest; a source without alpha is never
+   offered an alpha rung ahead of an opaque one;
+4. YCbCr rungs at or below the source by decreasing chroma fidelity,
+   then above it, closest first (a 4:2:0 source offers 4:2:2 before
+   4:4:4);
+5. packed before planar (`Rgb24` before `Gbrp8`).
 
 An encoder that declares its accepted layouts
 (`CodecCapabilities::accepted_pixel_formats`) is offered exactly those,
@@ -143,11 +154,25 @@ One that declares nothing — a video codec taking 4:2:0 / 4:4:4 / 4:0:0,
 say — gets the fixed rungs `Rgba`, `Rgb24`, `Rgba64Le`, `Rgb48Le`,
 `Yuva444P`, `Yuva420P`, `Yuv444P`, `Yuv422P`, `Yuv420P`, `Yuv444P10Le`,
 `Yuv420P10Le`, `Yuv444P16Le`, `Ya8`, `Gray8`, `Gray16Le`, sorted the same
-way; an RGB picture therefore reaches such an encoder as 4:4:4 YCbCr,
-never as grey. `SaveOptions::pixel_format` replaces the ladder by a
-single layout. When every rung fails for the same reason (an unknown
-option, a muxer refusing the stream) that error is returned unchanged;
-otherwise `Unsupported` lists what each rung hit.
+way (no CMYK, no palette); an RGB picture therefore reaches such an
+encoder as 4:4:4 YCbCr, never as grey. `SaveOptions::pixel_format`
+replaces the ladder by a single layout. When every rung fails for the
+same reason (an unknown option, a muxer refusing the stream) that
+error is returned unchanged; otherwise `Unsupported` lists what each
+rung hit.
+
+`EncodeTarget::ladder(src, &opts)` is the rule applied to a layout
+alone (transparency read from the layout); `ladder_for(&image, &opts)`
+applies it to a picture, alpha samples and palette record read.
+
+**Ruling (round 478).** An `Rgba` source saved as JPEG arrived as a
+four-component CMYK JPEG: `Cmyk` and `Rgb24` tied as "RGB family, no
+alpha" and sorted by name. Colour-model distance now decides before
+anything else, an alpha source whose alpha is all `255` prefers the
+opaque three-channel layout of its model, and CMYK is offered only
+after every additive layout — pinned against a JPEG-like declared set
+(full-range and studio YCbCr, grey 8 / 16, RGB, planar GBR, CMYK) in
+the unit tests.
 
 ### Options
 

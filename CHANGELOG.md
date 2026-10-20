@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Image::is_opaque()` / `has_transparency()`: the picture's real
+  transparency — every alpha sample at full scale (8 / 16-bit, the
+  layout's maximum code for 10–14-bit planar, `≥ 1.0` float) and every
+  palette entry opaque, or not. `has_alpha()` keeps reading the layout.
+
+### Fixed
+
+- **Ladder: colour-model distance before channel count.** An `Rgba`
+  source saved to an encoder that declares CMYK among its layouts (a
+  JPEG encoder) was offered `Cmyk` before `Rgb24` — both ranked "RGB
+  family, no alpha" and sorted by name — so an opaque RGBA picture
+  became a four-component CMYK JPEG. The rank is now: the source's
+  model, the other additive model, CMYK (only for a CMYK source or when
+  nothing closer is accepted), a palette rung (a quantisation, after
+  CMYK), grey last; within a model the source's bit tier, then
+  transparency, then chroma fidelity, then packing. A palette rung used
+  to tie with `Rgb24` by name as well.
+- **Ladder: an alpha source whose alpha is all full prefers the opaque
+  layout of its model** (`EncodeTarget::ladder_for`, `encode`): an
+  opaque `Rgba` picture is offered `Rgb24` before `Rgba`, an opaque
+  `Yuva420P` picture `Yuv420P` first; a picture with any translucent
+  sample keeps its alpha layout first. `EncodeTarget::ladder` (layout
+  only, no pixels) is unchanged.
+- `Image::as_packed` / `to_packed` serve `Cmyk` / `CmykInverted` (four
+  bytes per pixel) — they answered `None` / `Unsupported`.
+
 ## [0.0.4](https://github.com/OxideAV/oxideav-image/compare/v0.0.3...v0.0.4) - 2026-10-17
 
 ### Other

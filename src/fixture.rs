@@ -50,6 +50,22 @@ pub(crate) const CODEC_YUV_ONLY: &str = "oxim_yuv";
 /// 4:2:0 / 4:4:4 YCbCr and 4:0:0 grey.
 pub(crate) const CODEC_UNDECLARED: &str = "oxim_undeclared";
 pub(crate) const CODEC_NO_DECODER: &str = "oxim_nodec";
+/// Declares the layouts a JPEG encoder declares that the fixture can
+/// carry (full-range and studio YCbCr, grey 8 / 16, RGB, planar GBR,
+/// CMYK) — the set on which an `Rgba` source used to be offered CMYK
+/// before RGB.
+pub(crate) const CODEC_JPEG_LIKE: &str = "oxim_jpeg";
+pub(crate) const JPEG_LIKE_FORMATS: &[PixelFormat] = &[
+    PixelFormat::YuvJ420P,
+    PixelFormat::Yuv444P,
+    PixelFormat::Yuv420P,
+    PixelFormat::Gray8,
+    PixelFormat::Gray16Le,
+    PixelFormat::Rgb24,
+    PixelFormat::Rgb48Le,
+    PixelFormat::Gbrp8,
+    PixelFormat::Cmyk,
+];
 /// One muxer serving two brands through two extensions (`.oximmux`
 /// and `.oximalt`) with an encoder registered under each name — the
 /// heif / avif shape. The muxer records the codec id it was given.
@@ -76,6 +92,8 @@ pub(crate) const FORMATS: &[PixelFormat] = &[
     PixelFormat::RgbaF32Le,
     PixelFormat::Yuva420P,
     PixelFormat::Gbrp8,
+    PixelFormat::Cmyk,
+    PixelFormat::YuvJ420P,
 ];
 
 fn tag_of(f: PixelFormat) -> Option<u8> {
@@ -448,6 +466,10 @@ fn make_encoder_alt(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
 
 fn make_encoder_yuv(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     make_encoder_for(CODEC_YUV_ONLY, &[PixelFormat::Yuv420P], params)
+}
+
+fn make_encoder_jpeg_like(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+    make_encoder_for(CODEC_JPEG_LIKE, JPEG_LIKE_FORMATS, params)
 }
 
 fn make_encoder_undeclared(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
@@ -928,6 +950,16 @@ pub(crate) fn register(ctx: &mut RuntimeContext) {
             )
             .decoder(make_decoder)
             .encoder(make_encoder_yuv),
+    );
+    ctx.codecs.register(
+        CodecInfo::new(CodecId::new(CODEC_JPEG_LIKE))
+            .capabilities(
+                CodecCapabilities::video("oxim_jpeg_sw")
+                    .with_intra_only(true)
+                    .with_pixel_formats(JPEG_LIKE_FORMATS.to_vec()),
+            )
+            .decoder(make_decoder)
+            .encoder(make_encoder_jpeg_like),
     );
     ctx.codecs.register(
         CodecInfo::new(CodecId::new(CODEC_UNDECLARED))

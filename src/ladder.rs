@@ -1,26 +1,35 @@
 //! The pixel-format ladder: which input layouts `encode` offers an
 //! encoder, in which order.
 //!
-//! The rule (README, *Pixel-format ladder*): the source layout first;
-//! then the colour layouts of the source's own family by decreasing
-//! fidelity; then the other colour family; grey only when the source is
-//! grey or nothing colour is accepted. An encoder that declares its
-//! accepted layouts (`CodecCapabilities::accepted_pixel_formats`) gets
-//! exactly those, in the same order; one that declares nothing gets the
-//! fixed rung list below, ordered the same way.
+//! The rule (README, *Pixel-format ladder*): colour-model distance
+//! first — the source's own model, then the other additive colour
+//! model (RGB ↔ YCbCr), then CMYK, grey last (a grey source walks
+//! grey → RGB → YCbCr → CMYK); within a model the source's bit tier
+//! first, the source's transparency kept (an alpha layout whose
+//! samples are all opaque prefers the opaque layout of the same model,
+//! ahead of itself), YCbCr rungs at or below the source by decreasing
+//! chroma fidelity, then above it closest first, packed before planar.
+//! An encoder that declares its accepted layouts
+//! (`CodecCapabilities::accepted_pixel_formats`) gets exactly those,
+//! in that order; one that declares nothing gets the fixed rung list
+//! below, ordered the same way.
 
 use oxideav_core::PixelFormat;
 use oxideav_pixfmt::supports;
 
-/// Colour family of a layout.
+/// Colour model of a layout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Family {
     Rgb,
     Yuv,
+    Cmyk,
     Gray,
 }
 
 fn family(f: PixelFormat) -> Family {
+    if matches!(f, PixelFormat::Cmyk | PixelFormat::CmykInverted) {
+        return Family::Cmyk;
+    }
     if f.chroma_subsampling().is_some() {
         return Family::Yuv;
     }
@@ -29,6 +38,26 @@ fn family(f: PixelFormat) -> Family {
         Family::Gray
     } else {
         Family::Rgb
+    }
+}
+
+/// Colour-model distance from a source model to a candidate's: the
+/// source's own model is 0; the additive models are each other's
+/// nearest neighbour; CMYK is reachable from RGB / YCbCr only after
+/// both (a four-ink layout for a three-channel picture is a last
+/// resort, never a tie-breaker on channel count); grey is last for
+/// every colour source, and a grey source walks RGB (exact for grey)
+/// before YCbCr before CMYK.
+fn model_distance(src: Family, f: Family) -> u8 {
+    use Family::*;
+    if src == f {
+        return 0;
+    }
+    match (src, f) {
+        (Rgb, Yuv) | (Yuv, Rgb) | (Cmyk, Rgb) | (Gray, Rgb) => 1,
+        (Rgb, Cmyk) | (Yuv, Cmyk) | (Cmyk, Yuv) | (Gray, Yuv) => 2,
+        (_, Gray) | (Gray, Cmyk) => 3,
+        _ => 3,
     }
 }
 
@@ -74,49 +103,76 @@ const RUNGS: &[PixelFormat] = &[
     PixelFormat::Gray16Le,
 ];
 
-/// Sort key of a candidate layout `f` for a source `src` (`src_alpha`:
-/// the source carries transparency — its layout has alpha, or its
-/// palette has a non-opaque entry): lower first.
-fn rank(src: PixelFormat, src_alpha: bool, f: PixelFormat) -> (u8, u8, u8, u8, u8, String) {
-    let sf = family(src);
-    let ff = family(f);
-    // Family: the source's own first; grey last unless the source is
-    // grey (then grey first, RGB — exact for grey — before YUV).
-    let fam = match (sf, ff) {
-        (a, b) if a == b => 0,
-        (Family::Gray, Family::Rgb) => 1,
-        (Family::Gray, Family::Yuv) => 2,
-        (_, Family::Gray) => 2,
-        _ => 1,
+/// Sort key of a candidate layout `f` for a source `src`
+/// (`transparent`: the source carries transparency — an alpha sample
+/// below full, or a palette entry that is not opaque): lower first.
+fn rank(
+    src: PixelFormat,
+    transparent: bool,
+    f: PixelFormat,
+) -> (u8, u8, u8, u8, u8, u8, u8, String) {
+    // Colour model: distance from the source's, doubled to leave room
+    // for a palette rung — quantising to 256 entries loses more than
+    // any model change, so `Pal8` ranks after CMYK and before grey for
+    // every source that is not itself indexed.
+    let fam = if f.is_palette() && f != src {
+        5
+    } else {
+        2 * model_distance(family(src), family(f))
     };
     // Tier: the source's own bit tier first.
     let tier = u8::from(is_deep(f) != is_deep(src));
-    // Alpha: keep it when the source has it, do not invent it otherwise.
-    let alpha = u8::from(f.has_alpha() != src_alpha);
     // Fidelity: at or below the source by decreasing fidelity, then
     // above it, closest first.
     let (s, c) = (fidelity(src), fidelity(f));
     let fid = if c <= s { s - c } else { 4 + (c - s) };
+    // An opaque picture in an alpha layout: the opaque layouts of its
+    // model, tier, fidelity and packing come ahead of the source itself
+    // (`Rgb24` before an all-opaque `Rgba`, `Yuv420P` before `Yuva420P`).
+    let opaque_first = u8::from(
+        !(src.has_alpha()
+            && !transparent
+            && !f.has_alpha()
+            && fid == 0
+            && f.is_planar() == src.is_planar()),
+    );
+    // The source itself leads the rest.
+    let own = u8::from(f != src);
+    // Alpha: keep it when the source is transparent, do not invent it
+    // otherwise.
+    let alpha = u8::from(f.has_alpha() != transparent);
     // Packed before planar within RGB (Rgb24 before Gbrp8).
     let planar = u8::from(f.is_planar());
-    (fam, tier, alpha, fid, planar, format!("{f:?}"))
+    (
+        fam,
+        tier,
+        opaque_first,
+        own,
+        alpha,
+        fid,
+        planar,
+        format!("{f:?}"),
+    )
 }
 
 /// The layouts to offer an encoder for a picture in `src`, in order.
 /// `declared` is the encoder's accepted set (empty = undeclared, use
 /// the fixed rungs). Every rung but the source itself must be reachable
 /// through `oxideav-pixfmt`. The source's transparency is read from its
-/// layout; [`ladder_with_alpha`] takes it explicitly (palette alpha).
+/// layout; [`ladder_with_alpha`] takes it explicitly (palette alpha,
+/// an alpha channel that is fully opaque).
 pub(crate) fn ladder(src: PixelFormat, declared: &[PixelFormat]) -> Vec<PixelFormat> {
     ladder_with_alpha(src, src.has_alpha(), declared)
 }
 
 /// [`ladder`] for a source whose transparency is known independently of
 /// its layout: a `Pal8` picture with a transparent palette entry ranks
-/// the alpha-carrying rungs first (`Rgba` before `Rgb24`).
+/// the alpha-carrying rungs first (`Rgba` before `Rgb24`); an `Rgba`
+/// picture whose alpha samples are all full (`transparent = false`)
+/// ranks `Rgb24` ahead of `Rgba` itself.
 pub(crate) fn ladder_with_alpha(
     src: PixelFormat,
-    src_alpha: bool,
+    transparent: bool,
     declared: &[PixelFormat],
 ) -> Vec<PixelFormat> {
     let mut rungs: Vec<PixelFormat> = if declared.is_empty() {
@@ -124,14 +180,14 @@ pub(crate) fn ladder_with_alpha(
     } else {
         declared.to_vec()
     };
-    rungs.sort_by_cached_key(|f| rank(src, src_alpha, *f));
-    rungs.dedup();
-    let mut out = Vec::with_capacity(rungs.len() + 1);
     if declared.is_empty() || declared.contains(&src) {
-        out.push(src);
+        rungs.push(src);
     }
+    rungs.sort_by_cached_key(|f| rank(src, transparent, *f));
+    rungs.dedup();
+    let mut out = Vec::with_capacity(rungs.len());
     for f in rungs {
-        if !out.contains(&f) && supports(src, f) {
+        if !out.contains(&f) && (f == src || supports(src, f)) {
             out.push(f);
         }
     }
@@ -227,6 +283,108 @@ mod tests {
         );
     }
 
+    /// The layouts a JPEG encoder declares (8 / 12-bit YCbCr, grey
+    /// 8–16, RGB-coded, planar GBR, CMYK) — the set that exposed the
+    /// defect: an `Rgba` source ranked `Cmyk` before `Rgb24` because
+    /// both are "RGB family, no alpha" and `C` sorts before `R`.
+    const JPEG_LIKE: &[P] = &[
+        P::YuvJ444P,
+        P::YuvJ422P,
+        P::YuvJ420P,
+        P::Yuv444P,
+        P::Yuv422P,
+        P::Yuv420P,
+        P::Yuv440P,
+        P::Yuv444P12Le,
+        P::Yuv422P12Le,
+        P::Yuv420P12Le,
+        P::Gray8,
+        P::Gray12Le,
+        P::Gray16Le,
+        P::Rgb24,
+        P::Rgb48Le,
+        P::Gbrp8,
+        P::Gbrp12Le,
+        P::Cmyk,
+        P::CmykInverted,
+    ];
+
+    #[test]
+    fn cmyk_is_a_last_resort_for_three_channel_sources() {
+        // Rgba (transparent or not) → Rgb24 first, YCbCr next, CMYK after
+        // every additive rung, grey last.
+        for transparent in [true, false] {
+            let l = ladder_with_alpha(P::Rgba, transparent, JPEG_LIKE);
+            assert_eq!(l[0], P::Rgb24, "{l:?}");
+            assert_eq!(l[1], P::Gbrp8, "{l:?}");
+            assert!(pos(&l, P::YuvJ444P) < pos(&l, P::Cmyk), "{l:?}");
+            assert!(pos(&l, P::Yuv420P12Le) < pos(&l, P::Cmyk), "{l:?}");
+            assert!(pos(&l, P::Cmyk) < pos(&l, P::Gray8), "{l:?}");
+            assert!(pos(&l, P::CmykInverted) < pos(&l, P::Gray8), "{l:?}");
+        }
+        // The undeclared rungs never contain CMYK at all.
+        assert!(!ladder(P::Rgba, &[]).contains(&P::Cmyk));
+        // A YCbCr source: its own model, RGB, then CMYK, then grey.
+        let l = ladder(P::Yuv420P, JPEG_LIKE);
+        assert_eq!(&l[..2], &[P::Yuv420P, P::YuvJ420P]);
+        assert!(pos(&l, P::Rgb24) < pos(&l, P::Cmyk));
+        assert!(pos(&l, P::Cmyk) < pos(&l, P::Gray8));
+        // A grey source: grey, RGB, YCbCr, CMYK.
+        let l = ladder(P::Gray8, JPEG_LIKE);
+        assert_eq!(&l[..3], &[P::Gray8, P::Gray12Le, P::Gray16Le]);
+        assert!(pos(&l, P::Rgb24) < pos(&l, P::YuvJ444P));
+        assert!(pos(&l, P::YuvJ444P) < pos(&l, P::Cmyk));
+        assert_eq!(*l.last().unwrap(), P::CmykInverted);
+        // CMYK is first only for a CMYK source, then RGB, YCbCr, grey.
+        let l = ladder(P::Cmyk, JPEG_LIKE);
+        assert_eq!(&l[..2], &[P::Cmyk, P::CmykInverted]);
+        assert!(pos(&l, P::Rgb24) < pos(&l, P::YuvJ444P));
+        assert!(pos(&l, P::YuvJ444P) < pos(&l, P::Gray8));
+        // Nothing closer accepted: CMYK is taken rather than grey.
+        assert_eq!(
+            ladder(P::Rgb24, &[P::Gray8, P::Cmyk]),
+            vec![P::Cmyk, P::Gray8]
+        );
+        // A palette rung is a quantisation: after every true-colour
+        // layout, CMYK included, before grey — unless the source is
+        // indexed itself.
+        assert_eq!(
+            ladder(P::Rgb24, &[P::Pal8, P::Gray8, P::Cmyk, P::Yuv420P, P::Rgba]),
+            vec![P::Rgba, P::Yuv420P, P::Cmyk, P::Pal8, P::Gray8]
+        );
+        assert_eq!(ladder(P::Pal8, &[P::Pal8, P::Rgb24])[0], P::Pal8);
+    }
+
+    #[test]
+    fn opaque_alpha_source_prefers_the_opaque_layout_of_its_model() {
+        // Every alpha sample full: Rgb24 leads, the source's own layout
+        // follows (still ahead of every other alpha layout).
+        let l = ladder_with_alpha(P::Rgba, false, &[]);
+        assert_eq!(&l[..3], &[P::Rgb24, P::Rgba, P::Rgb48Le]);
+        assert!(pos(&l, P::Yuv444P) < pos(&l, P::Yuva444P));
+        let l = ladder_with_alpha(P::Rgba64Le, false, &[]);
+        assert_eq!(&l[..2], &[P::Rgb48Le, P::Rgba64Le]);
+        let l = ladder_with_alpha(P::Yuva420P, false, &[]);
+        assert_eq!(&l[..2], &[P::Yuv420P, P::Yuva420P]);
+        // Transparent: the source leads as before.
+        let l = ladder_with_alpha(P::Rgba, true, &[]);
+        assert_eq!(&l[..2], &[P::Rgba, P::Rgb24]);
+        // Declared sets: the same, and the source only when declared.
+        let declared = [P::Gray8, P::Rgba, P::Rgb24, P::Bgra];
+        assert_eq!(
+            ladder_with_alpha(P::Rgba, false, &declared),
+            vec![P::Rgb24, P::Rgba, P::Bgra, P::Gray8]
+        );
+        assert_eq!(
+            ladder_with_alpha(P::Rgba, true, &declared),
+            vec![P::Rgba, P::Bgra, P::Rgb24, P::Gray8]
+        );
+        assert_eq!(
+            ladder_with_alpha(P::Rgba, false, &[P::Bgra, P::Rgb24]),
+            vec![P::Rgb24, P::Bgra]
+        );
+    }
+
     #[test]
     fn families_and_tiers() {
         assert_eq!(family(P::YuvJ420P), Family::Yuv);
@@ -235,8 +393,26 @@ mod tests {
         assert_eq!(family(P::Pal8), Family::Rgb);
         assert_eq!(family(P::Ya16Le), Family::Gray);
         assert_eq!(family(P::MonoBlack), Family::Gray);
+        assert_eq!(family(P::Cmyk), Family::Cmyk);
+        assert_eq!(family(P::CmykInverted), Family::Cmyk);
         assert!(is_deep(P::Yuv420P10Le));
         assert!(is_deep(P::RgbaF32Le));
         assert!(!is_deep(P::Bgra));
+        assert_eq!(model_distance(Family::Rgb, Family::Rgb), 0);
+        assert!(
+            model_distance(Family::Rgb, Family::Yuv) < model_distance(Family::Rgb, Family::Cmyk)
+        );
+        assert!(
+            model_distance(Family::Rgb, Family::Cmyk) < model_distance(Family::Rgb, Family::Gray)
+        );
+        assert!(
+            model_distance(Family::Gray, Family::Rgb) < model_distance(Family::Gray, Family::Yuv)
+        );
+        assert!(
+            model_distance(Family::Gray, Family::Yuv) < model_distance(Family::Gray, Family::Cmyk)
+        );
+        assert!(
+            model_distance(Family::Cmyk, Family::Rgb) < model_distance(Family::Cmyk, Family::Yuv)
+        );
     }
 }

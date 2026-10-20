@@ -261,11 +261,16 @@ impl EncodeTarget {
     }
 
     /// [`ladder`](Self::ladder) for an actual picture: what [`encode`]
-    /// tries for it, palette alpha accounted for ([`Image::has_alpha`]).
+    /// tries for it, the picture's real transparency accounted for
+    /// ([`Image::is_opaque`]: palette alpha counts, an alpha channel
+    /// whose samples are all full does not — such a picture is offered
+    /// the opaque layout of its model first).
     pub fn ladder_for(&self, image: &Image, opts: &SaveOptions) -> Vec<PixelFormat> {
         match opts.pixel_format {
             Some(f) => vec![f],
-            None => ladder::ladder_with_alpha(image.format(), image.has_alpha(), &self.accepted),
+            None => {
+                ladder::ladder_with_alpha(image.format(), image.has_transparency(), &self.accepted)
+            }
         }
     }
 
@@ -622,8 +627,8 @@ fn default_codec_for_container(
 
 /// Encoder input layouts to try, in order: the forced one, else the
 /// ladder of [`crate::ladder`] for the picture's own layout (and its
-/// transparency, palette alpha included) and the encoder's declared
-/// accepted set.
+/// real transparency: palette alpha included, an all-opaque alpha
+/// channel excluded) and the encoder's declared accepted set.
 fn candidates(
     ctx: &RuntimeContext,
     codec_id: &CodecId,
@@ -635,7 +640,7 @@ fn candidates(
     }
     ladder::ladder_with_alpha(
         first.format(),
-        first.has_alpha(),
+        first.has_transparency(),
         &declared_formats(ctx, codec_id),
     )
 }

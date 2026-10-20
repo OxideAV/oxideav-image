@@ -1546,3 +1546,187 @@ fn palette_alpha_survives_the_registry_and_ranks_alpha_rungs_first() {
     assert_eq!(back.primary().format(), PixelFormat::Yuv444P);
     assert!(!back.primary().has_alpha());
 }
+
+#[test]
+fn is_opaque_reads_the_alpha_samples() {
+    use PixelFormat as P;
+    // No alpha at all.
+    assert!(Image::from_rgb8(2, 1, vec![0; 6]).unwrap().is_opaque());
+    // Packed 8-bit: every alpha byte full, or one short.
+    let full = Image::from_rgba8(2, 2, [7, 8, 9, 255].repeat(4)).unwrap();
+    assert!(full.is_opaque());
+    assert!(!full.has_transparency());
+    assert!(full.has_alpha(), "the layout still has an alpha channel");
+    let mut px = [7, 8, 9, 255].repeat(4);
+    px[15] = 254;
+    let one = Image::from_rgba8(2, 2, px).unwrap();
+    assert!(!one.is_opaque());
+    assert!(one.has_transparency());
+    for f in [P::Bgra, P::Argb, P::Abgr] {
+        let i = Image::from_raw(2, 1, f, vec![255; 8]).unwrap();
+        assert!(i.is_opaque(), "{f:?}");
+        let mut px = vec![255; 8];
+        px[if f == P::Bgra { 3 } else { 4 }] = 0;
+        assert!(!Image::from_raw(2, 1, f, px).unwrap().is_opaque(), "{f:?}");
+    }
+    assert!(Image::from_raw(2, 1, P::Ya8, vec![1, 255, 2, 255])
+        .unwrap()
+        .is_opaque());
+    assert!(!Image::from_raw(2, 1, P::Ya8, vec![1, 255, 2, 0])
+        .unwrap()
+        .is_opaque());
+    // 16-bit and float packed.
+    let mut w = Vec::new();
+    for _ in 0..2 {
+        for v in [1u16, 2, 3, u16::MAX] {
+            w.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    assert!(Image::from_raw(2, 1, P::Rgba64Le, w.clone())
+        .unwrap()
+        .is_opaque());
+    w[14] = 0xFE;
+    assert!(!Image::from_raw(2, 1, P::Rgba64Le, w).unwrap().is_opaque());
+    let mut fl = Vec::new();
+    for v in [0.1f32, 0.2, 0.3, 1.0] {
+        fl.extend_from_slice(&v.to_le_bytes());
+    }
+    assert!(Image::from_raw(1, 1, P::RgbaF32Le, fl.clone())
+        .unwrap()
+        .is_opaque());
+    fl[12..16].copy_from_slice(&0.999f32.to_le_bytes());
+    assert!(!Image::from_raw(1, 1, P::RgbaF32Le, fl).unwrap().is_opaque());
+    // Planar: the fourth plane.
+    let mut planes = fixture::gradient_planes(4, 2, P::Yuva420P, 0);
+    planes[3].data.fill(255);
+    let img = Image::from_planes(4, 2, P::Yuva420P, planes.clone()).unwrap();
+    assert!(img.is_opaque());
+    planes[3].data[5] = 1;
+    assert!(!Image::from_planes(4, 2, P::Yuva420P, planes)
+        .unwrap()
+        .is_opaque());
+    // Palette: the record decides.
+    assert!(!indexed_with_alpha().is_opaque());
+    let opaque_pal = Image::from_indexed(1, 1, vec![0], &[[1, 2, 3, 255]]).unwrap();
+    assert!(opaque_pal.is_opaque());
+}
+
+#[test]
+fn opaque_alpha_saves_as_the_opaque_layout_of_its_model() {
+    // Ruling (round 478): an alpha source whose alpha is all full is
+    // offered the opaque layout of the same model first; a transparent
+    // one keeps its own layout first.
+    let ctx = fixture::ctx();
+    let rgb: Vec<u8> = (0..4 * 4 * 3).map(|i| (i * 5) as u8).collect();
+    let opaque: Vec<u8> = rgb
+        .chunks(3)
+        .flat_map(|p| [p[0], p[1], p[2], 255])
+        .collect();
+    let img = Image::from_rgba8(4, 4, opaque.clone()).unwrap();
+    let t = resolve_target(&ctx, "oxim", &SaveOptions::default()).unwrap();
+    let l = t.ladder_for(&img, &SaveOptions::default());
+    assert_eq!(&l[..2], &[PixelFormat::Rgb24, PixelFormat::Rgba], "{l:?}");
+    let back = decode_bytes(
+        &ctx,
+        &encode(&ctx, &img, "oxim", &SaveOptions::default()).unwrap(),
+    )
+    .unwrap()
+    .into_primary();
+    assert_eq!(back.format(), PixelFormat::Rgb24);
+    assert_eq!(back.as_packed(), Some(rgb.as_slice()));
+    // One translucent sample: the alpha layout stays first.
+    let mut px = opaque;
+    px[3] = 200;
+    let img = Image::from_rgba8(4, 4, px.clone()).unwrap();
+    let l = t.ladder_for(&img, &SaveOptions::default());
+    assert_eq!(l[0], PixelFormat::Rgba, "{l:?}");
+    let at = |f: PixelFormat| l.iter().position(|x| *x == f).unwrap();
+    assert!(at(PixelFormat::Bgra) < at(PixelFormat::Rgb24), "{l:?}");
+    assert!(at(PixelFormat::Rgb24) < at(PixelFormat::Gbrp8), "{l:?}");
+    let back = decode_bytes(
+        &ctx,
+        &encode(&ctx, &img, "oxim", &SaveOptions::default()).unwrap(),
+    )
+    .unwrap()
+    .into_primary();
+    assert_eq!(back.format(), PixelFormat::Rgba);
+    assert_eq!(back.as_packed(), Some(px.as_slice()));
+    // The layout-only ladder (no pixels) keeps the layout's word.
+    assert_eq!(
+        t.ladder(PixelFormat::Rgba, &SaveOptions::default())[0],
+        PixelFormat::Rgba
+    );
+    // A forced layout is still the only candidate.
+    let forced = SaveOptions::new().with_pixel_format(PixelFormat::Rgba);
+    let back = decode_bytes(&ctx, &encode(&ctx, &back, "oxim", &forced).unwrap())
+        .unwrap()
+        .into_primary();
+    assert_eq!(back.format(), PixelFormat::Rgba);
+}
+
+#[test]
+fn cmyk_is_offered_only_after_every_additive_layout() {
+    // The round-477 defect: an `Rgba` source saved to a JPEG encoder
+    // (which declares CMYK among its layouts) arrived as four-ink CMYK
+    // because `Cmyk` and `Rgb24` tied as "RGB-family, no alpha" and
+    // sorted by name. Colour-model distance now decides first.
+    let ctx = fixture::ctx();
+    let opts = SaveOptions::new().with_codec(fixture::CODEC_JPEG_LIKE);
+    let t = resolve_target(&ctx, "oxim", &opts).unwrap();
+    assert_eq!(t.accepted_pixel_formats(), fixture::JPEG_LIKE_FORMATS);
+    let rgb: Vec<u8> = (0..4 * 4 * 3).map(|i| (i * 5) as u8).collect();
+    for alpha in [255u8, 10] {
+        let px: Vec<u8> = rgb
+            .chunks(3)
+            .flat_map(|p| [p[0], p[1], p[2], alpha])
+            .collect();
+        let img = Image::from_rgba8(4, 4, px).unwrap();
+        let l = t.ladder_for(&img, &opts);
+        assert_eq!(l[0], PixelFormat::Rgb24, "alpha {alpha}: {l:?}");
+        let cmyk = l.iter().position(|f| *f == PixelFormat::Cmyk).unwrap();
+        for f in [
+            PixelFormat::Gbrp8,
+            PixelFormat::Rgb48Le,
+            PixelFormat::YuvJ420P,
+            PixelFormat::Yuv444P,
+            PixelFormat::Yuv420P,
+        ] {
+            let at = l.iter().position(|x| *x == f).unwrap();
+            assert!(at < cmyk, "alpha {alpha}: {f:?} after Cmyk in {l:?}");
+        }
+        let grey = l.iter().position(|f| *f == PixelFormat::Gray8).unwrap();
+        assert!(cmyk < grey, "alpha {alpha}: {l:?}");
+        let back = decode_bytes(&ctx, &encode(&ctx, &img, "oxim", &opts).unwrap())
+            .unwrap()
+            .into_primary();
+        assert_eq!(back.format(), PixelFormat::Rgb24, "alpha {alpha}");
+        assert_eq!(back.as_packed(), Some(rgb.as_slice()), "alpha {alpha}");
+    }
+    // A YCbCr source stays in its model; grey stays grey; CMYK stays
+    // CMYK — and a CMYK source offered no CMYK rung goes to RGB, not
+    // grey.
+    let yuv = decode_bytes(&ctx, &still(PixelFormat::Yuv420P).encode())
+        .unwrap()
+        .into_primary();
+    let l = t.ladder_for(&yuv, &opts);
+    assert_eq!(&l[..2], &[PixelFormat::Yuv420P, PixelFormat::YuvJ420P]);
+    let back = decode_bytes(&ctx, &encode(&ctx, &yuv, "oxim", &opts).unwrap()).unwrap();
+    assert_eq!(back.primary().format(), PixelFormat::Yuv420P);
+    let grey = Image::from_raw(4, 4, PixelFormat::Gray8, vec![9; 16]).unwrap();
+    let back = decode_bytes(&ctx, &encode(&ctx, &grey, "oxim", &opts).unwrap()).unwrap();
+    assert_eq!(back.primary().format(), PixelFormat::Gray8);
+    let cmyk = decode_bytes(&ctx, &still(PixelFormat::Cmyk).encode())
+        .unwrap()
+        .into_primary();
+    assert_eq!(t.ladder_for(&cmyk, &opts)[0], PixelFormat::Cmyk);
+    let back = decode_bytes(&ctx, &encode(&ctx, &cmyk, "oxim", &opts).unwrap()).unwrap();
+    assert_eq!(back.primary().format(), PixelFormat::Cmyk);
+    let rgb_only = SaveOptions::new().with_codec(fixture::CODEC_UNDECLARED);
+    let back = decode_bytes(&ctx, &encode(&ctx, &cmyk, "oxim", &rgb_only).unwrap()).unwrap();
+    assert_eq!(back.primary().format(), PixelFormat::Yuv444P);
+    // Through the undeclared rungs CMYK is never offered.
+    let u = resolve_target(&ctx, "oxim", &rgb_only).unwrap();
+    assert!(!u
+        .ladder(PixelFormat::Rgba, &rgb_only)
+        .contains(&PixelFormat::Cmyk));
+}
