@@ -7,8 +7,9 @@ use oxideav_core::{BlobKind, ExecutionContext, MetadataBlob, PixelFormat, TimeBa
 
 use crate::fixture::{self, Fixture, FORMATS};
 use crate::{
-    can_encode, decode_bytes, decode_bytes_with, decode_vec, encode, encode_frames,
-    encoder_options, resolve_target, Image, ImageError, MetadataSupport, OpenOptions, SaveOptions,
+    can_encode, can_open, codec_only_formats, decode_bytes, decode_bytes_with, decode_vec, encode,
+    encode_frames, encoder_options, resolve_target, support, Image, ImageError, MetadataSupport,
+    OpenOptions, SaveOptions,
 };
 
 fn still(format: PixelFormat) -> Fixture {
@@ -1939,4 +1940,69 @@ fn decoder_output_label_wins_over_the_stream_label() {
     // and the stream's agree, nothing to refuse.)
     let planar = decode_bytes(&ctx, &still(PixelFormat::Yuv420P).encode()).unwrap();
     assert_eq!(planar.primary().format(), PixelFormat::Yuv420P);
+}
+
+#[test]
+fn support_answers_the_registry_questions_without_a_file() {
+    let ctx = fixture::ctx();
+    let full = support(&ctx, ".OXIM");
+    assert_eq!(full.format(), "oxim");
+    assert_eq!(full.container(), Some("oxim"));
+    assert!(full.has_demuxer() && full.has_muxer());
+    assert!(full.has_decoder() && full.has_encoder());
+    assert!(full.can_open() && full.can_save());
+    assert!(!full.is_codec_only() && !full.is_unknown());
+    assert!(can_open(&ctx, "oxim") && can_encode(&ctx, "oxim"));
+    // Demuxer only, and its stream codec has no decoder.
+    let nodec = support(&ctx, "oximnodec");
+    assert_eq!(nodec.container(), Some("oximnodec"));
+    assert!(nodec.has_demuxer() && !nodec.has_muxer());
+    assert!(!nodec.has_decoder() && !nodec.has_encoder());
+    assert!(nodec.can_open() && !nodec.can_save());
+    assert!(!nodec.is_codec_only());
+    assert!(can_open(&ctx, "oximnodec") && !can_encode(&ctx, "oximnodec"));
+    // A codec registered without a container.
+    let yuv = support(&ctx, fixture::CODEC_YUV_ONLY);
+    assert_eq!(yuv.container(), None);
+    assert!(yuv.has_decoder() && yuv.has_encoder());
+    assert!(yuv.is_codec_only());
+    assert!(!yuv.can_open() && yuv.can_save());
+    assert!(!can_open(&ctx, fixture::CODEC_YUV_ONLY));
+    assert!(can_encode(&ctx, fixture::CODEC_YUV_ONLY));
+    // A brand of a multi-codec container resolves through the
+    // requested-name rule.
+    let alt = support(&ctx, "oximalt");
+    assert_eq!(alt.container(), Some("oximmux"));
+    assert!(alt.has_encoder() && alt.can_save() && alt.can_open());
+    // Nothing at all.
+    let none = support(&ctx, "nope");
+    assert!(none.is_unknown());
+    assert!(!none.can_open() && !none.can_save() && !none.is_codec_only());
+    assert_eq!(
+        codec_only_formats(
+            &ctx,
+            [
+                "oxim",
+                fixture::CODEC_YUV_ONLY,
+                "oximnodec",
+                "nope",
+                ".OXIM_YUV"
+            ]
+        ),
+        vec!["oxim_yuv".to_string(), "oxim_yuv".to_string()]
+    );
+    // `can_open` and `can_encode` agree with what open / encode do.
+    let img = Image::from_rgb8(1, 1, vec![0; 3]).unwrap();
+    for name in [
+        "oxim",
+        "oximrgb",
+        "oximnodec",
+        fixture::CODEC_YUV_ONLY,
+        "nope",
+    ] {
+        let s = support(&ctx, name);
+        let saved = encode(&ctx, &img, name, &SaveOptions::default());
+        assert_eq!(s.can_save(), saved.is_ok(), "{name}: {saved:?}");
+        assert_eq!(s.can_save(), can_encode(&ctx, name), "{name}");
+    }
 }

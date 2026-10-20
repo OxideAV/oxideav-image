@@ -59,6 +59,7 @@ assert_eq!(indexed.to_rgba8()?[7], 0);           // palette alpha reaches the RG
 | `Image::from_rgb8` / `from_rgba8` / `from_indexed` / `from_raw` / `from_planes` / `from_video_frame` | Fallible constructors: geometry, plane count, stride and length are validated; `from_indexed` takes RGBA palette entries. |
 | `encode(&ctx, &Image, "png", &SaveOptions)` / `encode_frames(&ctx, &[Image], ..)` / `save(&ctx, &Image, path, ..)` | Encoder + muxer by container name or extension; see *Format resolution*, *Pixel-format ladder* and *Geometry*. |
 | `encoder_options(&ctx, format, &SaveOptions)` | The option schema of the encoder `encode` would use (names for `SaveOptions::with_option`). |
+| `support(&ctx, format)` → `FormatSupport` / `can_open(&ctx, format)` / `codec_only_formats(&ctx, names)` | The registry's answer for a name or extension without touching a file: `container()`, `has_demuxer()` / `has_muxer()` / `has_decoder()` / `has_encoder()`, `can_open()` / `can_save()`, `is_codec_only()` / `is_unknown()`. |
 | `can_encode(&ctx, format)` / `resolve_target(&ctx, format, &SaveOptions)` | "Will this save?" before decoding: `can_encode` is a yes / no; `resolve_target` returns the `EncodeTarget` (`format()`, `container()` / `is_codec_only()`, `codec()`, `accepted_pixel_formats()`, `options()`, `ladder(src, &opts)` / `ladder_for(&image, &opts)`, `metadata_support()`) or the error `encode` would return before looking at a picture. |
 | `OpenOptions` | `execution` (`with_execution_context(ctx)` / `with_threads(n)` / `serial()`, see *Execution budget*), `max_frames`, `ext_hint`, `decoder_options`, `max_pixels`, `allow_containers` / `deny_containers` / `allow_codecs` / `deny_codecs`, `strip_metadata` / `strip_blobs` (`without_metadata()`, `with_stripped_blobs(kinds)`). |
 | `SaveOptions` | `execution` (`with_execution_context(ctx)` / `with_threads(n)` / `serial()`), `quality`, `pixel_format`, `codec`, `options`, `time_base`, `default_delay`, `blobs` (`with_blob(s)`), `strip_metadata` / `strip_blobs` (`without_metadata()`, `with_stripped_blobs(kinds)`). |
@@ -118,13 +119,22 @@ source has none.
   and the ladder a given source layout would walk — so a converter can
   refuse a target before decoding a large source, and a renderer can
   pick the output layout it will produce. Neither touches pixels.
-- **Codec-only formats:** some image crates register a codec and an
-  extension but no container (qoi, webp, gif, avif, openexr, pict, icer,
-  jpeg2000, jpegxs, jpegxl). `encode` / `save` write the encoder's
-  single packet as the file for them (prefixed encoder variants resolve
-  too: `webp` → `webp_vp8l`, or `webp_vp8` when a quality is asked).
-  Opening such a file through the registry is not possible until the
-  crate grows a demuxer; `UnknownFormat` says so.
+- **Codec-only formats** are a registry question, not a list:
+  `support(&ctx, name)` says whether a name or extension resolves to a
+  container (demuxer / muxer registered) or to a codec standing alone
+  (`FormatSupport::is_codec_only`), `can_open` / `can_encode` answer
+  the two directions, and `codec_only_formats(&ctx, names)` filters a
+  list. For a codec registered without any container `encode` / `save`
+  write the encoder's single packet as the file (prefixed encoder
+  variants resolve too: `webp` → `webp_vp8l`, or `webp_vp8` when a
+  quality is asked) and `open` answers `UnknownFormat` naming the
+  codec. **Survey (round 478, `oxideav list` on the umbrella registry):
+  none of the 25 image crates is codec-only any more** — every one
+  registers a demuxer and a muxer (gif since 0.0.14; `avif` is a codec
+  on the `heif` container; `ani`, `mjpeg-raw` and the `iff_acbm` /
+  `iff_tvpp` brands are demux-only, which is a different thing). The
+  umbrella's gateway test re-surveys with `support` rather than
+  trusting this sentence.
 
 ### Pixel-format ladder
 
@@ -210,10 +220,13 @@ the context still gets it; a caller-set `threads` option wins on that
 channel. A codec with no internal parallelism ignores the budget, as
 the contract allows.
 
-Measured on a 12 MP iPhone HEIC (`docs/image/heif/device-samples`,
-HEVC still, 4:2:0) opened through the gateway on an 8-core host: see
-*Timing* in the CHANGELOG entry for round 478 — the serial decode
-versus the budgeted one.
+Measured (round 478, gateway `open`, best of 3, 18-logical-core host)
+on the two iPhone HEICs under `docs/image/heif/device-samples`: the
+12 MP `iphone_13_pro_max.HEIC` (48 HEVC tiles) opens in 0.481 s serial,
+0.271 s at 2 workers, 0.174 s at 4, 0.103 s at 8 and 0.077 s at the
+host default; the 8.5 MP `IMG_5195.HEIC` (42 tiles) in 0.274 / 0.146 /
+0.086 / 0.050 / 0.036 s. Before round 478 the gateway set no budget, so
+every open ran serial.
 
 ### Metadata
 
@@ -385,15 +398,21 @@ of parsing the header itself.
 
 Unit tests run against a synthetic `OXIM` container + codec pair
 registered exactly like a sibling crate (probe by magic and by extension
-hint, 14 packed and planar layouts, `Pal8` with its palette and its
-alpha record, stream and frame blobs through open / encode with every
-precedence and strip rule, the legacy adaptations, exact
-16-bit views, multi-frame
-timing in every mode, allow / deny lists, the ladder against a layout-refusing codec, an encoder that declares
-no layouts (colour before grey) and a layout-refusing muxer, mixed
-geometries into a multi-stream container and into a one-geometry one, options, limits, every error variant). The
-umbrella's `crates/oxideav-tests/tests/image_gateway.rs` runs the gateway
-over the real format crates through `oxideav_meta::register_all`.
+hint, 16 packed and planar layouts including CMYK, `Pal8` with its
+palette and its alpha record, stream and frame blobs through open /
+encode with every precedence, replacement and strip rule, the legacy
+adaptations, exact 16-bit views, multi-frame timing in every mode,
+allow / deny lists, the execution budget reaching every decoder and
+encoder through the context and the `threads` option, a decoder whose
+output label differs from — or replaces a missing — stream label, the
+ladder against a layout-refusing codec, a JPEG-like declared set with
+CMYK, an all-opaque alpha source, an encoder that declares no layouts
+(colour before grey) and a layout-refusing muxer, mixed geometries into
+a multi-stream container and into a one-geometry one, `support` /
+`can_open` / `codec_only_formats`, options, limits, every error
+variant). The umbrella's `crates/oxideav-tests/tests/image_gateway*.rs`
+run the gateway over the real format crates through
+`oxideav_meta::register_all`.
 
 ## Survey: metadata and palette alpha across the image crates (round 476)
 
@@ -405,10 +424,25 @@ native carriage the crate reads; **—**: the format has no such thing;
 **blob**: pushed through the registry on `CodecParameters::blobs` or the
 frame record; **legacy**: reaches the registry through another public
 field; **lost**: carried at Layer 1 but dropped on the registry path.
-Every crate has the contract's `Metadata` struct; **none pushes a blob
-through the registry yet** (0 of 25), so today the gateway surfaces
-blobs only from the synthetic fixture — the per-crate asks below are
-the adoption wave.
+Every crate has the contract's `Metadata` struct; on survey day **none
+pushed a blob through the registry yet** (0 of 25), so the gateway
+surfaced blobs only from the synthetic fixture — the per-crate asks
+below were the adoption wave.
+
+**Round 478 update** (from the round-477 rulings in
+`IMAGE_CRATE_API.md`, not re-measured here): tiff, mjpeg (JPEG still +
+MJPEG), jpegxl, gif, tga and iff now push ICC / Exif / XMP (tiff also
+IPTC) through the registry as blobs — stream-level from the demuxer,
+per picture on the frame record — and their registry encoders write
+them back with the frame blob overriding the stream blob of the same
+kind; format-native extras ride as custom kinds named
+`<crate>-<chunk>` (`gif-comment`, `tga-extension-area`, `iff-anno`,
+…). gif, tga and iff attach the palette-alpha record and stay `Pal8`.
+The table below is the round-476 baseline; the six rows above are
+closed asks. Note the "codec-only" wording in the webp / jpegxl cells
+was already wrong on survey day — both register a container (see
+*Format resolution*); the blobs land on the frame record and
+`params.blobs` as the cells say.
 
 | Format | ICC | Exif | XMP | Palette alpha | Registry today | Ask (for that crate's seat) |
 |---|---|---|---|---|---|---|
@@ -438,10 +472,13 @@ the adoption wave.
 | qoi | — | — | — | — | none | none |
 | svg | — | field | field | — | none | none |
 
-Totals: ICC natively carried at Layer 1 by 11 formats, Exif by 10, XMP by
-9, palette alpha by 4 (png, gif, tga, iff); as blobs through the
-registry: 0 / 0 / 0 / 0; legacy through the registry: 1 (png palette
-alpha, adapted) + 2 markers without bytes (jpeg2000, jpegxs).
+Totals on survey day: ICC natively carried at Layer 1 by 11 formats,
+Exif by 10, XMP by 9, palette alpha by 4 (png, gif, tga, iff); as blobs
+through the registry: 0 / 0 / 0 / 0; legacy through the registry: 1
+(png palette alpha, adapted) + 2 markers without bytes (jpeg2000,
+jpegxs). After round 477: blobs through the registry from 6 crates
+(tiff, mjpeg, jpegxl, gif, tga, iff), the palette-alpha record from 3
+(gif, tga, iff; png still legacy-adapted).
 
 **Adaptations the gateway applies (read side, withdrawn once the crate
 adopts the record):**

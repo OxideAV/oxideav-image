@@ -19,6 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the codec's declared option schema has a `threads` option the caller
   did not set, the budget is forwarded through it too (a caller-set
   option wins on that channel). `ExecutionContext` is re-exported.
+  *Timing* (gateway `open`, best of 3, 18-logical-core host,
+  `docs/image/heif/device-samples`): the 12 MP `iphone_13_pro_max.HEIC`
+  (48 HEVC tiles) 0.481 s serial → 0.271 s at 2 workers → 0.174 s at 4
+  → 0.103 s at 8 → 0.077 s at the host default; the 8.5 MP
+  `IMG_5195.HEIC` (42 tiles) 0.274 s → 0.146 s → 0.086 s → 0.050 s →
+  0.036 s. Before this release the gateway never set a budget, so every
+  open ran serial.
 - **Decoder output labels.** A picture is labelled with the decoder's
   `output_pixel_format()` when it reports one, else the stream's
   `pixel_format`: the gateway never reports a layout the decoder did
@@ -27,6 +34,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   opens when its decoder knows the layout — it was `InvalidData`; it
   still is when neither knows. The relabelled parameters stay shared by
   the stream's pictures.
+- `support(&ctx, format)` → `FormatSupport` (`container()`,
+  `has_demuxer()` / `has_muxer()` / `has_decoder()` / `has_encoder()`,
+  `can_open()` / `can_save()`, `is_codec_only()` / `is_unknown()`),
+  `can_open(&ctx, format)` and `codec_only_formats(&ctx, names)`: the
+  registry's answer for a name or extension without touching a file, so
+  consumers and the umbrella tests survey which formats are codec-only
+  instead of trusting a hand-maintained list.
 - `Image::is_opaque()` / `has_transparency()`: the picture's real
   transparency — every alpha sample at full scale (8 / 16-bit, the
   layout's maximum code for 10–14-bit planar, `≥ 1.0` float) and every
@@ -34,6 +48,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- README: the "codec-only formats" list (qoi, webp, gif, avif, openexr,
+  pict, icer, jpeg2000, jpegxs, jpegxl) was stale — every one of the 25
+  image crates registers a demuxer and a muxer today (gif since 0.0.14;
+  `avif` is a codec on the `heif` container); the paragraph now points
+  at `support` and records the round-478 registry survey. The webp /
+  jpegxl survey cells said "codec-only" too. The round-476 survey
+  carries a round-478 update for the six crates that adopted blobs.
 - **Ladder: colour-model distance before channel count.** An `Rgba`
   source saved to an encoder that declares CMYK among its layouts (a
   JPEG encoder) was offered `Cmyk` before `Rgb24` — both ranked "RGB

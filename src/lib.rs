@@ -61,8 +61,9 @@ pub use open::{
     ImageFile, OpenOptions,
 };
 pub use save::{
-    can_encode, encode, encode_frames, encoder_options, resolve_target, save, EncodeTarget,
-    MetadataSupport, SaveOptions, DEFAULT_DELAY,
+    can_encode, can_open, codec_only_formats, encode, encode_frames, encoder_options,
+    resolve_target, save, support, EncodeTarget, FormatSupport, MetadataSupport, SaveOptions,
+    DEFAULT_DELAY,
 };
 
 /// Re-exported for convenience: the framework's pixel layouts and colour

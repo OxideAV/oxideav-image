@@ -361,6 +361,150 @@ pub fn can_encode(ctx: &RuntimeContext, format: &str) -> bool {
     resolve_target(ctx, format, &SaveOptions::default()).is_ok()
 }
 
+/// Whether [`open`](crate::open) can open a file of `format` (a
+/// container name or file extension) at all: a demuxer is registered
+/// for the container the name resolves to. Which codec the file's
+/// streams carry is known only after the header parse, so this is the
+/// container question, not the decoder one.
+pub fn can_open(ctx: &RuntimeContext, format: &str) -> bool {
+    support(ctx, format).can_open()
+}
+
+/// What the registries in `ctx` can do for a format name or file
+/// extension, from [`support`]: the container it resolves to and which
+/// halves are registered. The gateway's README used to hand-maintain
+/// the list of *codec-only* formats (a codec and an extension but no
+/// container); this is the registry's own answer, re-surveyed at test
+/// time by consumers instead.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FormatSupport {
+    format: String,
+    container: Option<String>,
+    demuxer: bool,
+    muxer: bool,
+    decoder: bool,
+    encoder: bool,
+}
+
+impl FormatSupport {
+    /// The name as resolved (lower-case, no leading dot).
+    pub fn format(&self) -> &str {
+        &self.format
+    }
+
+    /// The registered container the name or extension maps to (a
+    /// demuxer or muxer of that name, or an extension registered for
+    /// it); `None` when no container claims the name.
+    pub fn container(&self) -> Option<&str> {
+        self.container.as_deref()
+    }
+
+    /// A demuxer is registered for the container.
+    pub fn has_demuxer(&self) -> bool {
+        self.demuxer
+    }
+
+    /// A muxer is registered for the container.
+    pub fn has_muxer(&self) -> bool {
+        self.muxer
+    }
+
+    /// A decoder is registered for the codec the name denotes (the
+    /// container's default codec, or the codec of that name).
+    pub fn has_decoder(&self) -> bool {
+        self.decoder
+    }
+
+    /// An encoder is registered for the codec the name denotes (or a
+    /// `<name>_<variant>` family of them).
+    pub fn has_encoder(&self) -> bool {
+        self.encoder
+    }
+
+    /// [`open`](crate::open) can open it: see [`can_open`].
+    pub fn can_open(&self) -> bool {
+        self.demuxer
+    }
+
+    /// [`encode`] can write it: see [`can_encode`].
+    pub fn can_save(&self) -> bool {
+        self.muxer && self.encoder || self.is_codec_only() && self.encoder
+    }
+
+    /// A codec registered without any container: `encode` writes its
+    /// single packet as the file, `open` cannot read it through the
+    /// registry (`UnknownFormat` says so).
+    pub fn is_codec_only(&self) -> bool {
+        self.container.is_none() && (self.decoder || self.encoder)
+    }
+
+    /// Nothing registered claims the name.
+    pub fn is_unknown(&self) -> bool {
+        self.container.is_none() && !self.decoder && !self.encoder
+    }
+}
+
+/// Ask the registries what they can do for `format` (a container name,
+/// a file extension with or without the dot, or a codec id), without
+/// touching any file.
+pub fn support(ctx: &RuntimeContext, format: &str) -> FormatSupport {
+    let lower = format.trim_start_matches('.').to_ascii_lowercase();
+    let is_container = |n: &str| {
+        ctx.containers.demuxer_names().any(|d| d == n)
+            || ctx.containers.muxer_names().any(|m| m == n)
+    };
+    let container: Option<String> = if is_container(&lower) {
+        Some(lower.clone())
+    } else {
+        ctx.containers
+            .container_for_extension(&lower)
+            .filter(|n| is_container(n))
+            .map(str::to_string)
+    };
+    let (demuxer, muxer) = match &container {
+        Some(c) => (
+            ctx.containers.demuxer_names().any(|d| d == c),
+            ctx.containers.muxer_names().any(|m| m == c),
+        ),
+        None => (false, false),
+    };
+    // The codec the name denotes: through the container's default
+    // (the requested-name rule included), else the name itself.
+    let codec = match &container {
+        Some(c) => default_codec_for_container(ctx, c, &lower, &SaveOptions::default()),
+        None => ctx
+            .containers
+            .container_for_extension(&lower)
+            .map(str::to_string)
+            .unwrap_or_else(|| lower.clone()),
+    };
+    let id = CodecId::new(codec.as_str());
+    let decoder = ctx.codecs.has_decoder(&id);
+    let encoder = ctx.codecs.has_encoder(&id) || !prefixed_encoders(ctx, &codec).is_empty();
+    FormatSupport {
+        format: lower,
+        container,
+        demuxer,
+        muxer,
+        decoder,
+        encoder,
+    }
+}
+
+/// Of `names`, the ones that are codec-only in `ctx`
+/// ([`FormatSupport::is_codec_only`]), in the order given.
+pub fn codec_only_formats<'a>(
+    ctx: &RuntimeContext,
+    names: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    names
+        .into_iter()
+        .filter(|n| support(ctx, n).is_codec_only())
+        .map(|n| n.trim_start_matches('.').to_ascii_lowercase())
+        .collect()
+}
+
 /// The codec [`encode`] uses for a resolved target.
 fn codec_for(ctx: &RuntimeContext, target: &Target, opts: &SaveOptions) -> CodecId {
     CodecId::new(match (&opts.codec, target) {
