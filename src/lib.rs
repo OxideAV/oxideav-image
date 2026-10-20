@@ -66,6 +66,9 @@ pub use save::{
 };
 
 /// Re-exported for convenience: the framework's pixel layouts and colour
-/// description, which [`Image`] reports, and the metadata-blob types
-/// its `icc()` / `exif()` / `xmp()` / `blob()` accessors are built on.
-pub use oxideav_core::{BlobKind, ColorSignal, MetadataBlob, PixelFormat, RuntimeContext};
+/// description, which [`Image`] reports, the metadata-blob types its
+/// `icc()` / `exif()` / `xmp()` / `blob()` accessors are built on, and
+/// the execution budget [`OpenOptions`] / [`SaveOptions`] hand to codecs.
+pub use oxideav_core::{
+    BlobKind, ColorSignal, ExecutionContext, MetadataBlob, PixelFormat, RuntimeContext,
+};

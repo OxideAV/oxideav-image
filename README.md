@@ -60,8 +60,8 @@ assert_eq!(indexed.to_rgba8()?[7], 0);           // palette alpha reaches the RG
 | `encode(&ctx, &Image, "png", &SaveOptions)` / `encode_frames(&ctx, &[Image], ..)` / `save(&ctx, &Image, path, ..)` | Encoder + muxer by container name or extension; see *Format resolution*, *Pixel-format ladder* and *Geometry*. |
 | `encoder_options(&ctx, format, &SaveOptions)` | The option schema of the encoder `encode` would use (names for `SaveOptions::with_option`). |
 | `can_encode(&ctx, format)` / `resolve_target(&ctx, format, &SaveOptions)` | "Will this save?" before decoding: `can_encode` is a yes / no; `resolve_target` returns the `EncodeTarget` (`format()`, `container()` / `is_codec_only()`, `codec()`, `accepted_pixel_formats()`, `options()`, `ladder(src, &opts)` / `ladder_for(&image, &opts)`, `metadata_support()`) or the error `encode` would return before looking at a picture. |
-| `OpenOptions` | `max_frames`, `ext_hint`, `decoder_options`, `max_pixels`, `allow_containers` / `deny_containers` / `allow_codecs` / `deny_codecs`, `strip_metadata` / `strip_blobs` (`without_metadata()`, `with_stripped_blobs(kinds)`). |
-| `SaveOptions` | `quality`, `pixel_format`, `codec`, `options`, `time_base`, `default_delay`, `blobs` (`with_blob(s)`), `strip_metadata` / `strip_blobs` (`without_metadata()`, `with_stripped_blobs(kinds)`). |
+| `OpenOptions` | `execution` (`with_execution_context(ctx)` / `with_threads(n)` / `serial()`, see *Execution budget*), `max_frames`, `ext_hint`, `decoder_options`, `max_pixels`, `allow_containers` / `deny_containers` / `allow_codecs` / `deny_codecs`, `strip_metadata` / `strip_blobs` (`without_metadata()`, `with_stripped_blobs(kinds)`). |
+| `SaveOptions` | `execution` (`with_execution_context(ctx)` / `with_threads(n)` / `serial()`), `quality`, `pixel_format`, `codec`, `options`, `time_base`, `default_delay`, `blobs` (`with_blob(s)`), `strip_metadata` / `strip_blobs` (`without_metadata()`, `with_stripped_blobs(kinds)`). |
 | `BlobKind` / `MetadataBlob` / `MetadataSupport` | The framework's blob types, re-exported; `MetadataSupport` is what `EncodeTarget::metadata_support()` answers. |
 | `ImageError` (`Error`) | `#[non_exhaustive]`: see *Errors*. |
 
@@ -90,7 +90,15 @@ source has none.
   registry's first decoder; other streams are skipped. Pictures come
   back in packet order; `Image::stream()` says which stream each came
   from (a HEIF with a primary item and a sequence track yields the
-  still from stream 0 and the track's frames from stream 1).
+  still from stream 0 and the track's frames from stream 1). **The
+  decoder's word on the layout wins:** a picture is labelled with
+  `Decoder::output_pixel_format()` when the decoder reports one (a
+  hardware decoder's negotiated layout, a codec that reads its
+  configuration record), else with the stream's `pixel_format`; the
+  gateway never reports a layout the decoder did not emit, and a
+  stream with no label opens when its decoder knows the layout. The
+  relabelled parameters are shared by the stream's pictures as usual
+  (`Image::params().pixel_format` says what the picture is).
 - **Saving:** the format name or extension resolves to a container with
   a muxer. The payload codec is the container's default: the codec of
   the same name (png, bmp, tiff, heif, …) or the few that differ (`jpeg`
@@ -182,6 +190,30 @@ options strictly; a lossless encoder would reject the unknown name).
 `SaveOptions::with_option(name, value)` is forwarded verbatim; names
 come from `encoder_options`. `OpenOptions::with_decoder_option` does the
 same on the decoding side.
+
+### Execution budget
+
+Every decoder and encoder the gateway creates is handed an
+`oxideav_core::ExecutionContext` through `set_execution_context`
+(before its first packet or frame — the framework's threading
+contract), so budgeted codecs (HEIF / AVIF / AV1 / H.265 tile- and
+slice-parallel decodes) parallelise through the gateway. The budget
+is `OpenOptions::execution` / `SaveOptions::execution`: `None` — the
+default — is the host's parallelism (`ExecutionContext::auto()`,
+`std::thread::available_parallelism`), `with_threads(n)` caps it,
+`serial()` pins the codec to one worker, `with_execution_context(ctx)`
+hands one through; `execution_context()` tells what the codecs will
+get. Where a codec's declared option schema has a `threads` option the
+caller did not set, the same budget is forwarded through that option
+as well, so a codec that reads its budget from an option rather than
+the context still gets it; a caller-set `threads` option wins on that
+channel. A codec with no internal parallelism ignores the budget, as
+the contract allows.
+
+Measured on a 12 MP iPhone HEIC (`docs/image/heif/device-samples`,
+HEVC still, 4:2:0) opened through the gateway on an 8-core host: see
+*Timing* in the CHANGELOG entry for round 478 — the serial decode
+versus the budgeted one.
 
 ### Metadata
 
@@ -329,7 +361,7 @@ of parsing the header itself.
 | `UnknownFormat` | No container probed the input, the name / extension matches nothing with a muxer, or the extension belongs to a codec-only crate with no demuxer. |
 | `NoImage` | A container matched but holds no video stream with a registered decoder, or decoded no picture. |
 | `Unsupported` | No encoder for the codec, no layout of the ladder accepted, mixed geometries into a one-geometry container or a codec-only format, a planar layout asked for as packed bytes, a `crop` origin off the chroma grid or on a bit-packed layout. |
-| `InvalidData` | Caller data inconsistent with its geometry (buffer length, plane count, stride), a crop window outside the picture, a stream without a pixel format. |
+| `InvalidData` | Caller data inconsistent with its geometry (buffer length, plane count, stride), a crop window outside the picture, a stream without a pixel format whose decoder reports none. |
 | `LimitExceeded` | `max_pixels` would be exceeded. |
 | `Restricted` | The probed container or a video stream's codec is refused by the allow / deny lists; nothing was decoded. |
 | `Core` | A registry, demuxer, decoder, muxer or encoder error, unchanged. |
@@ -345,9 +377,9 @@ of parsing the header itself.
   inside them (orientation, colour management and tag readers are the
   consumer's). `ImageFile::metadata()` is the container's string pairs
   as the demuxer reports them.
-- **Guessing.** A stream without a declared pixel format, a frame whose
-  plane count disagrees with it, or a probe miss is an error, not an
-  inference.
+- **Guessing.** A stream without a declared pixel format whose decoder
+  reports none either, a frame whose plane count disagrees with the
+  label, or a probe miss is an error, not an inference.
 
 ## Testing
 

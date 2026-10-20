@@ -8,7 +8,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use oxideav_core::{
-    BlobKind, CodecParameters, Decoder, Frame, MetadataBlob, ReadSeek, RuntimeContext, StreamInfo,
+    BlobKind, CodecParameters, Decoder, ExecutionContext, Frame, MetadataBlob, PixelFormat,
+    ReadSeek, RuntimeContext, StreamInfo,
 };
 
 use crate::image::ticks_to_duration;
@@ -243,12 +244,44 @@ pub struct OpenOptions {
     /// Blob kinds dropped at both levels when `strip_metadata` is off
     /// (`BlobKind::EXIF` to shed location data, say).
     pub strip_blobs: Vec<BlobKind>,
+    /// Execution budget handed to every decoder the gateway creates
+    /// (`Decoder::set_execution_context`, before the first packet),
+    /// so budgeted codecs parallelise through the gateway. `None` (the
+    /// default) is the host's parallelism (`ExecutionContext::auto()`);
+    /// `ExecutionContext::serial()` pins a decode to one worker. Where
+    /// the decoder's declared option schema has a `threads` option the
+    /// caller did not set, the budget is forwarded through it as well.
+    pub execution: Option<ExecutionContext>,
 }
 
 impl OpenOptions {
     /// Defaults: every frame, no extension hint.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Hand this execution budget to every decoder (see the field).
+    pub fn with_execution_context(mut self, ctx: ExecutionContext) -> Self {
+        self.execution = Some(ctx);
+        self
+    }
+
+    /// Budget every decoder to at most `n` workers (`0` and `1` mean
+    /// serial).
+    pub fn with_threads(self, n: usize) -> Self {
+        self.with_execution_context(ExecutionContext::with_threads(n))
+    }
+
+    /// Run every decoder single-threaded.
+    pub fn serial(self) -> Self {
+        self.with_execution_context(ExecutionContext::serial())
+    }
+
+    /// The budget decoders receive: the configured one, else the host's.
+    pub fn execution_context(&self) -> ExecutionContext {
+        self.execution
+            .clone()
+            .unwrap_or_else(ExecutionContext::auto)
     }
 
     /// Decode at most `n` pictures.
@@ -486,11 +519,13 @@ pub fn decode_reader(
     }
 
     // The pictures of a stream share its parameters (one copy of the
-    // stream's blobs, however many pages or frames).
-    let shared: Vec<Arc<CodecParameters>> =
+    // stream's blobs, however many pages or frames). A decoder that
+    // reports its own output layout relabels its stream's copy.
+    let mut shared: Vec<Arc<CodecParameters>> =
         streams.iter().map(|s| Arc::new(s.params.clone())).collect();
     // One decoder per video stream; other streams are skipped.
     let budget = opts.max_pixels.unwrap_or(u64::MAX);
+    let execution = opts.execution_context();
     let mut decoders: Vec<Option<Box<dyn Decoder>>> = Vec::with_capacity(streams.len());
     for s in &streams {
         let dec = if s.params.media_type == oxideav_core::MediaType::Video {
@@ -504,10 +539,22 @@ pub fn decode_reader(
                 )));
             }
             let mut params = s.params.clone();
+            // The budget travels as the `threads` option too, where the
+            // decoder declares one and the caller set none.
+            let declares_threads = ctx
+                .codecs
+                .decoder_options_schema(&params.codec_id)
+                .is_some_and(|schema| schema.iter().any(|f| f.name == "threads"));
+            if declares_threads && !opts.decoder_options.iter().any(|(k, _)| k == "threads") {
+                params.options = params.options.set("threads", execution.threads.to_string());
+            }
             for (k, v) in &opts.decoder_options {
                 params.options = params.options.set(k.clone(), v.clone());
             }
-            ctx.codecs.first_decoder(&params).ok()
+            ctx.codecs.first_decoder(&params).ok().map(|mut dec| {
+                dec.set_execution_context(&execution);
+                dec
+            })
         } else {
             None
         };
@@ -540,7 +587,7 @@ pub fn decode_reader(
                     dec.send_packet(&pkt)?;
                     drain(
                         dec.as_mut(),
-                        (&streams[idx], &shared[idx]),
+                        (&streams[idx], &mut shared[idx]),
                         idx,
                         &mut timing[idx],
                         &mut images,
@@ -556,7 +603,7 @@ pub fn decode_reader(
                         let _ = dec.flush();
                         drain(
                             dec.as_mut(),
-                            (&streams[i], &shared[i]),
+                            (&streams[i], &mut shared[i]),
                             i,
                             &mut timing[i],
                             &mut images,
@@ -589,7 +636,7 @@ pub fn decode_reader(
 #[allow(clippy::too_many_arguments)]
 fn drain(
     dec: &mut dyn Decoder,
-    (info, shared): (&StreamInfo, &Arc<CodecParameters>),
+    (info, shared): (&StreamInfo, &mut Arc<CodecParameters>),
     stream_index: usize,
     timing: &mut VecDeque<(Option<i64>, Option<i64>)>,
     images: &mut Vec<Image>,
@@ -625,18 +672,24 @@ fn drain(
                     Some((p, d)) => (p.or(vf.pts), d),
                     None => (vf.pts, None),
                 };
-                // The stream's parameters are authoritative: every image
-                // demuxer declares its native layout on the stream
-                // (IMAGE_CRATE_API fleet-sweep ruling), so a missing
-                // pixel format is a demuxer defect, not something to
-                // guess from the plane count (Rgba vs Bgra vs Yuv444P are
+                // The layout the picture is reported in: the decoder's
+                // own word (`Decoder::output_pixel_format`) when it has
+                // one — the gateway never labels a picture with a layout
+                // the decoder did not emit — else the stream's. Every
+                // image demuxer declares its native layout on the stream
+                // (IMAGE_CRATE_API fleet-sweep ruling), so neither
+                // knowing it is a defect, not something to guess from
+                // the plane count (Rgba vs Bgra vs Yuv444P are
                 // indistinguishable by geometry).
-                if stream.pixel_format.is_none() {
+                let label = dec.output_pixel_format().or(stream.pixel_format);
+                if label.is_none() {
                     return Err(Error::invalid(format!(
-                        "stream of codec '{}' declares no pixel format",
+                        "stream of codec '{}' declares no pixel format and its decoder \
+                         reports none",
                         stream.codec_id
                     )));
                 }
+                relabel(shared, label);
                 let index = images.len();
                 let mut img = Image::from_video_frame_shared(vf, shared.clone())?.with_index(index);
                 crate::adapt::adapt(&mut img, stream);
@@ -658,6 +711,17 @@ fn drain(
             Err(oxideav_core::Error::NeedMore) | Err(oxideav_core::Error::Eof) => return Ok(()),
             Err(e) => return Err(e.into()),
         }
+    }
+}
+
+/// Point a stream's shared parameters at a copy labelled `label` when
+/// they say otherwise (copy on write: the pictures already built keep
+/// the parameters they were built with).
+fn relabel(shared: &mut Arc<CodecParameters>, label: Option<PixelFormat>) {
+    if shared.pixel_format != label {
+        let mut p = (**shared).clone();
+        p.pixel_format = label;
+        *shared = Arc::new(p);
     }
 }
 

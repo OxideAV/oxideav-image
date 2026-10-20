@@ -31,11 +31,11 @@ use std::io::{Read, Seek, SeekFrom, Write};
 
 use oxideav_core::blob::{decode_blobs, encode_blobs};
 use oxideav_core::{
-    parse_options, CodecCapabilities, CodecId, CodecInfo, CodecOptionsStruct, CodecParameters,
-    CodecResolver, Decoder, Demuxer, Encoder, Error, Frame, MediaType, MetadataBlob, Muxer,
-    OptionField, OptionKind, OptionValue, Packet, PixelFormat, ProbeData, ProbeScore, ReadSeek,
-    Result, RuntimeContext, StreamInfo, TimeBase, VideoFrame, VideoPlane, WriteSeek,
-    MAX_PROBE_SCORE, PROBE_SCORE_EXTENSION,
+    parse_options, BlobKind, CodecCapabilities, CodecId, CodecInfo, CodecOptionsStruct,
+    CodecParameters, CodecResolver, Decoder, Demuxer, Encoder, Error, Frame, MediaType,
+    MetadataBlob, Muxer, OptionField, OptionKind, OptionValue, Packet, PixelFormat, ProbeData,
+    ProbeScore, ReadSeek, Result, RuntimeContext, StreamInfo, TimeBase, VideoFrame, VideoPlane,
+    WriteSeek, MAX_PROBE_SCORE, PROBE_SCORE_EXTENSION,
 };
 
 pub(crate) const CONTAINER: &str = "oxim";
@@ -71,6 +71,20 @@ pub(crate) const JPEG_LIKE_FORMATS: &[PixelFormat] = &[
 /// heif / avif shape. The muxer records the codec id it was given.
 pub(crate) const CONTAINER_MUX: &str = "oximmux";
 pub(crate) const CODEC_ALT: &str = "oximalt";
+/// The same files, but the demuxer labels the stream with a sibling
+/// layout of the same shape (`Rgb24` → `Bgr24`, `Rgba` → `Bgra`,
+/// `Gray8` → `Pal8`) and puts the true layout's tag in `extradata`,
+/// which the decoder reports through `Decoder::output_pixel_format` —
+/// a container whose label is not what the codec emits.
+pub(crate) const CONTAINER_MISLABELLED: &str = "oximlabel";
+/// The same files with no stream label at all (`pixel_format = None`);
+/// only the decoder knows the layout (`extradata` tag).
+pub(crate) const CONTAINER_UNLABELLED: &str = "oximnolabel";
+/// Custom blob kinds the decoder attaches when the `report_threads`
+/// decoder option is set: the `threads` option it was given and the
+/// budget `set_execution_context` announced.
+pub(crate) const BLOB_THREADS_OPTION: &str = "oxim-threads";
+pub(crate) const BLOB_BUDGET: &str = "oxim-budget";
 const MAGIC: &[u8; 4] = b"OXIM";
 pub(crate) const FLAG_DURATIONS: u8 = 1;
 pub(crate) const FLAG_NO_PTS: u8 = 2;
@@ -293,14 +307,45 @@ fn rd_u32(b: &[u8], at: usize) -> Result<u32> {
 struct OximDecoder {
     id: CodecId,
     params: CodecParameters,
+    /// The layout the codec knows it emits (from `extradata`), when the
+    /// container carries one — reported by `output_pixel_format`.
+    known: Option<PixelFormat>,
+    /// What `set_execution_context` announced, if it was called.
+    budget: Option<usize>,
     pending: Option<VideoFrame>,
     eof: bool,
 }
 
+/// Declared decoder options of codec `oxim`: a `threads` knob the
+/// gateway forwards its budget through when the caller set none.
+#[derive(Default)]
+pub(crate) struct OximDecOpts {
+    pub threads: u32,
+}
+
+impl CodecOptionsStruct for OximDecOpts {
+    const SCHEMA: &'static [OptionField] = &[OptionField {
+        name: "threads",
+        kind: OptionKind::U32,
+        default: OptionValue::U32(0),
+        help: "worker budget (recorded, never applied)",
+    }];
+
+    fn apply(&mut self, key: &str, value: &OptionValue) -> Result<()> {
+        if key == "threads" {
+            self.threads = value.as_u32()?;
+        }
+        Ok(())
+    }
+}
+
 fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
+    let known = params.extradata.first().and_then(|t| format_of(*t));
     Ok(Box::new(OximDecoder {
         id: CodecId::new(CODEC),
         params: params.clone(),
+        known,
+        budget: None,
         pending: None,
         eof: false,
     }))
@@ -311,11 +356,19 @@ impl Decoder for OximDecoder {
         &self.id
     }
 
+    fn set_execution_context(&mut self, ctx: &oxideav_core::ExecutionContext) {
+        self.budget = Some(ctx.threads);
+    }
+
+    fn output_pixel_format(&self) -> Option<PixelFormat> {
+        self.known
+    }
+
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
         let (w, h, f) = match (
             self.params.width,
             self.params.height,
-            self.params.pixel_format,
+            self.known.or(self.params.pixel_format),
         ) {
             (Some(w), Some(h), Some(f)) => (w, h, f),
             _ => return Err(Error::invalid("oxim decoder: stream geometry missing")),
@@ -359,6 +412,22 @@ impl Decoder for OximDecoder {
         if self.params.options.get("stamp_color").is_some() {
             frame.set_color_signal(self.params.color_signal);
         }
+        if self.params.options.get("report_threads").is_some() {
+            let mut blobs = frame.blobs();
+            if let Some(t) = self.params.options.get("threads") {
+                blobs.push(MetadataBlob::new(
+                    BlobKind::custom(BLOB_THREADS_OPTION),
+                    t.to_string().into_bytes(),
+                ));
+            }
+            if let Some(b) = self.budget {
+                blobs.push(MetadataBlob::new(
+                    BlobKind::custom(BLOB_BUDGET),
+                    b.to_string().into_bytes(),
+                ));
+            }
+            frame.set_blobs(blobs);
+        }
         self.pending = Some(frame);
         Ok(())
     }
@@ -388,19 +457,30 @@ impl Decoder for OximDecoder {
 #[derive(Default)]
 pub(crate) struct OximEncOpts {
     pub quality: u32,
+    pub threads: u32,
 }
 
 impl CodecOptionsStruct for OximEncOpts {
-    const SCHEMA: &'static [OptionField] = &[OptionField {
-        name: "quality",
-        kind: OptionKind::U32,
-        default: OptionValue::U32(0),
-        help: "advisory quality 0..=100 (recorded, never applied)",
-    }];
+    const SCHEMA: &'static [OptionField] = &[
+        OptionField {
+            name: "quality",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(0),
+            help: "advisory quality 0..=100 (recorded, never applied)",
+        },
+        OptionField {
+            name: "threads",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(0),
+            help: "worker budget (recorded, never applied)",
+        },
+    ];
 
     fn apply(&mut self, key: &str, value: &OptionValue) -> Result<()> {
-        if key == "quality" {
-            self.quality = value.as_u32()?;
+        match key {
+            "quality" => self.quality = value.as_u32()?,
+            "threads" => self.threads = value.as_u32()?,
+            _ => {}
         }
         Ok(())
     }
@@ -440,6 +520,11 @@ fn make_encoder_for(
             out_params.options = out_params
                 .options
                 .set("quality", parsed.quality.to_string());
+        }
+        if params.options.get("threads").is_some() {
+            out_params.options = out_params
+                .options
+                .set("threads", parsed.threads.to_string());
         }
     } else if let Some((k, _)) = params.options.iter().next() {
         return Err(Error::invalid(format!("unknown option '{k}'")));
@@ -487,6 +572,13 @@ fn make_encoder_undeclared(params: &CodecParameters) -> Result<Box<dyn Encoder>>
 impl Encoder for OximEncoder {
     fn codec_id(&self) -> &CodecId {
         &self.id
+    }
+
+    /// Echo the announced budget as `budget=N` on the output
+    /// parameters (the muxer writes them as file metadata).
+    fn set_execution_context(&mut self, ctx: &oxideav_core::ExecutionContext) {
+        let options = std::mem::take(&mut self.out_params.options);
+        self.out_params.options = options.set("budget", ctx.threads.to_string());
     }
 
     fn output_params(&self) -> &CodecParameters {
@@ -665,7 +757,7 @@ fn open_demuxer_named(
     codec: &str,
     multi: bool,
     mut input: Box<dyn ReadSeek>,
-) -> Result<Box<dyn Demuxer>> {
+) -> Result<OximDemuxer> {
     input.seek(SeekFrom::Start(0))?;
     let mut buf = Vec::new();
     input.read_to_end(&mut buf)?;
@@ -689,46 +781,108 @@ fn open_demuxer_named(
     }
     let flags = flags.unwrap_or(0);
     let n = streams.len();
-    Ok(Box::new(OximDemuxer {
+    Ok(OximDemuxer {
         name,
         streams,
         metadata,
         frames,
         flags,
         pts: vec![0; n],
-    }))
+    })
 }
 
 fn open_demuxer(input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
-    open_demuxer_named(CONTAINER, CODEC, false, input)
+    Ok(Box::new(open_demuxer_named(
+        CONTAINER, CODEC, false, input,
+    )?))
 }
 
 fn open_demuxer_multi(
     input: Box<dyn ReadSeek>,
     _codecs: &dyn CodecResolver,
 ) -> Result<Box<dyn Demuxer>> {
-    open_demuxer_named(CONTAINER_MULTI, CODEC, true, input)
+    Ok(Box::new(open_demuxer_named(
+        CONTAINER_MULTI,
+        CODEC,
+        true,
+        input,
+    )?))
 }
 
 fn open_demuxer_rgb(
     input: Box<dyn ReadSeek>,
     _codecs: &dyn CodecResolver,
 ) -> Result<Box<dyn Demuxer>> {
-    open_demuxer_named(CONTAINER_RGB_ONLY, CODEC, false, input)
+    Ok(Box::new(open_demuxer_named(
+        CONTAINER_RGB_ONLY,
+        CODEC,
+        false,
+        input,
+    )?))
 }
 
 fn open_demuxer_mux(
     input: Box<dyn ReadSeek>,
     _codecs: &dyn CodecResolver,
 ) -> Result<Box<dyn Demuxer>> {
-    open_demuxer_named(CONTAINER_MUX, CODEC, false, input)
+    // Streams carry the container's own codec id, which has a decoder
+    // but declares no decoder options (unlike `oxim`).
+    Ok(Box::new(open_demuxer_named(
+        CONTAINER_MUX,
+        CONTAINER_MUX,
+        false,
+        input,
+    )?))
+}
+
+/// A sibling label of the same plane shape, for the mislabelling demuxer.
+fn mislabel(f: PixelFormat) -> PixelFormat {
+    match f {
+        PixelFormat::Rgb24 => PixelFormat::Bgr24,
+        PixelFormat::Rgba => PixelFormat::Bgra,
+        PixelFormat::Gray8 => PixelFormat::Pal8,
+        other => other,
+    }
+}
+
+fn open_demuxer_labelled(
+    name: &'static str,
+    unlabelled: bool,
+    input: Box<dyn ReadSeek>,
+) -> Result<Box<dyn Demuxer>> {
+    let mut dm = open_demuxer_named(name, CODEC, false, input)?;
+    for s in &mut dm.streams {
+        let f = s.params.pixel_format.expect("oxim streams are labelled");
+        s.params.extradata = vec![tag_of(f).expect("fixture format has a tag")];
+        s.params.pixel_format = if unlabelled { None } else { Some(mislabel(f)) };
+    }
+    Ok(Box::new(dm))
+}
+
+fn open_demuxer_mislabelled(
+    input: Box<dyn ReadSeek>,
+    _codecs: &dyn CodecResolver,
+) -> Result<Box<dyn Demuxer>> {
+    open_demuxer_labelled(CONTAINER_MISLABELLED, false, input)
+}
+
+fn open_demuxer_unlabelled(
+    input: Box<dyn ReadSeek>,
+    _codecs: &dyn CodecResolver,
+) -> Result<Box<dyn Demuxer>> {
+    open_demuxer_labelled(CONTAINER_UNLABELLED, true, input)
 }
 
 fn open_demuxer_nodec(
     input: Box<dyn ReadSeek>,
     _codecs: &dyn CodecResolver,
 ) -> Result<Box<dyn Demuxer>> {
-    open_demuxer_named(CONTAINER_NO_DECODER, CODEC_NO_DECODER, false, input)
+    Ok(Box::new(open_demuxer_named(
+        CONTAINER_NO_DECODER,
+        CODEC_NO_DECODER,
+        false,
+        input,
+    )?))
 }
 
 impl Demuxer for OximDemuxer {
@@ -922,6 +1076,14 @@ fn probe_multi(data: &ProbeData) -> ProbeScore {
     probe_sibling(data, "oximmulti")
 }
 
+fn probe_mislabelled(data: &ProbeData) -> ProbeScore {
+    probe_sibling(data, "oximlabel")
+}
+
+fn probe_unlabelled(data: &ProbeData) -> ProbeScore {
+    probe_sibling(data, "oximnolabel")
+}
+
 fn probe_mux(data: &ProbeData) -> ProbeScore {
     probe_sibling(data, "oximmux").max(probe_sibling(data, "oximalt"))
 }
@@ -939,7 +1101,8 @@ pub(crate) fn register(ctx: &mut RuntimeContext) {
             )
             .decoder(make_decoder)
             .encoder(make_encoder)
-            .encoder_options::<OximEncOpts>(),
+            .encoder_options::<OximEncOpts>()
+            .decoder_options::<OximDecOpts>(),
     );
     ctx.codecs.register(
         CodecInfo::new(CodecId::new(CODEC_YUV_ONLY))
@@ -1002,6 +1165,12 @@ pub(crate) fn register(ctx: &mut RuntimeContext) {
     c.register_demuxer(CONTAINER_NO_DECODER, open_demuxer_nodec);
     c.register_extension("oximnodec", CONTAINER_NO_DECODER);
     c.register_probe(CONTAINER_NO_DECODER, probe_nodec);
+    c.register_demuxer(CONTAINER_MISLABELLED, open_demuxer_mislabelled);
+    c.register_extension("oximlabel", CONTAINER_MISLABELLED);
+    c.register_probe(CONTAINER_MISLABELLED, probe_mislabelled);
+    c.register_demuxer(CONTAINER_UNLABELLED, open_demuxer_unlabelled);
+    c.register_extension("oximnolabel", CONTAINER_UNLABELLED);
+    c.register_probe(CONTAINER_UNLABELLED, probe_unlabelled);
     c.register_demuxer(CONTAINER_MULTI, open_demuxer_multi);
     c.register_muxer(CONTAINER_MULTI, open_muxer_multi);
     c.register_extension("oximmulti", CONTAINER_MULTI);

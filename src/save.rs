@@ -10,8 +10,8 @@ use crate::error::{Error, Result};
 use crate::image::{duration_to_ticks, Image};
 use crate::ladder;
 use oxideav_core::{
-    BlobKind, CodecId, CodecParameters, Frame, MediaType, MetadataBlob, OptionField, Packet,
-    PixelFormat, RuntimeContext, StreamInfo, TimeBase,
+    BlobKind, CodecId, CodecParameters, ExecutionContext, Frame, MediaType, MetadataBlob,
+    OptionField, Packet, PixelFormat, RuntimeContext, StreamInfo, TimeBase,
 };
 
 /// Knobs for [`encode`] / [`encode_frames`] / [`save`].
@@ -52,12 +52,44 @@ pub struct SaveOptions {
     /// Source blob kinds withheld from the encoder when
     /// `strip_metadata` is off.
     pub strip_blobs: Vec<BlobKind>,
+    /// Execution budget handed to every encoder the gateway creates
+    /// (`Encoder::set_execution_context`, before the first frame), so
+    /// budgeted codecs parallelise through the gateway. `None` (the
+    /// default) is the host's parallelism (`ExecutionContext::auto()`);
+    /// `ExecutionContext::serial()` pins an encode to one worker. Where
+    /// the encoder's declared option schema has a `threads` option the
+    /// caller did not set, the budget is forwarded through it as well.
+    pub execution: Option<ExecutionContext>,
 }
 
 impl SaveOptions {
     /// Defaults everywhere.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Hand this execution budget to every encoder (see the field).
+    pub fn with_execution_context(mut self, ctx: ExecutionContext) -> Self {
+        self.execution = Some(ctx);
+        self
+    }
+
+    /// Budget every encoder to at most `n` workers (`0` and `1` mean
+    /// serial).
+    pub fn with_threads(self, n: usize) -> Self {
+        self.with_execution_context(ExecutionContext::with_threads(n))
+    }
+
+    /// Run every encoder single-threaded.
+    pub fn serial(self) -> Self {
+        self.with_execution_context(ExecutionContext::serial())
+    }
+
+    /// The budget encoders receive: the configured one, else the host's.
+    pub fn execution_context(&self) -> ExecutionContext {
+        self.execution
+            .clone()
+            .unwrap_or_else(ExecutionContext::auto)
     }
 
     /// Advisory quality `0..=100`.
@@ -800,14 +832,22 @@ fn encoder_params(
         params.color_signal = sig;
     }
     params.blobs = opts.stream_blobs(first, single);
-    if let Some(q) = opts.quality {
-        let declared = ctx
-            .codecs
+    let declares = |name: &str| {
+        ctx.codecs
             .encoder_options_schema(codec_id)
-            .is_some_and(|schema| schema.iter().any(|f| f.name == "quality"));
-        if declared {
+            .is_some_and(|schema| schema.iter().any(|f| f.name == name))
+    };
+    if let Some(q) = opts.quality {
+        if declares("quality") {
             params.options = params.options.set("quality", q.to_string());
         }
+    }
+    // The budget travels as the `threads` option too, where the encoder
+    // declares one and the caller set none.
+    if declares("threads") && !opts.options.iter().any(|(k, _)| k == "threads") {
+        params.options = params
+            .options
+            .set("threads", opts.execution_context().threads.to_string());
     }
     for (k, v) in &opts.options {
         params.options = params.options.set(k.clone(), v.clone());
@@ -834,7 +874,9 @@ fn encode_group(
     let codec_id = &params.codec_id;
     let dst = params.pixel_format.unwrap_or(PixelFormat::Rgba);
     let n = group.members.len();
+    let execution = opts.execution_context();
     let mut encoder = ctx.codecs.first_encoder(params)?;
+    encoder.set_execution_context(&execution);
     let mut packets: Vec<Packet> = Vec::new();
     let mut pts: i64 = 0;
     let mut ticks: Vec<(i64, i64)> = Vec::with_capacity(n);
@@ -871,6 +913,7 @@ fn encode_group(
         packets.clear();
         for &i in &group.members {
             let mut enc = ctx.codecs.first_encoder(params)?;
+            enc.set_execution_context(&execution);
             let (mut frame, _) = images[i].to_format(dst)?.into_video_frame();
             frame.set_blobs(opts.frame_blobs(&images[i]));
             frame.pts = Some(0);

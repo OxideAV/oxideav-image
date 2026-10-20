@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Execution budget.** `OpenOptions::execution` / `SaveOptions::execution`
+  (`with_execution_context(ctx)`, `with_threads(n)`, `serial()`,
+  `execution_context()`): every decoder and encoder the gateway creates
+  receives an `oxideav_core::ExecutionContext` through
+  `set_execution_context` before its first packet / frame, so budgeted
+  codecs (heif, avif, av1, h265) parallelise through the gateway. The
+  default is the host's parallelism (`ExecutionContext::auto()`). Where
+  the codec's declared option schema has a `threads` option the caller
+  did not set, the budget is forwarded through it too (a caller-set
+  option wins on that channel). `ExecutionContext` is re-exported.
+- **Decoder output labels.** A picture is labelled with the decoder's
+  `output_pixel_format()` when it reports one, else the stream's
+  `pixel_format`: the gateway never reports a layout the decoder did
+  not emit (hardware decoders negotiate their own; some codecs read
+  theirs from the configuration record). A stream without a label
+  opens when its decoder knows the layout — it was `InvalidData`; it
+  still is when neither knows. The relabelled parameters stay shared by
+  the stream's pictures.
 - `Image::is_opaque()` / `has_transparency()`: the picture's real
   transparency — every alpha sample at full scale (8 / 16-bit, the
   layout's maximum code for 10–14-bit planar, `≥ 1.0` float) and every

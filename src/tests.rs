@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use oxideav_core::{BlobKind, MetadataBlob, PixelFormat, TimeBase, VideoPlane};
+use oxideav_core::{BlobKind, ExecutionContext, MetadataBlob, PixelFormat, TimeBase, VideoPlane};
 
 use crate::fixture::{self, Fixture, FORMATS};
 use crate::{
@@ -800,8 +800,9 @@ fn quality_reaches_only_encoders_that_declare_it() {
     assert!(meta_of(&bytes).contains(&("quality".to_string(), "42".to_string())));
     // Discovery.
     let schema = encoder_options(&ctx, "oxim", &SaveOptions::default()).unwrap();
-    assert_eq!(schema.len(), 1);
+    assert_eq!(schema.len(), 2);
     assert_eq!(schema[0].name, "quality");
+    assert_eq!(schema[1].name, "threads");
     let none = encoder_options(
         &ctx,
         "oxim",
@@ -845,7 +846,7 @@ fn can_encode_and_resolve_target_answer_without_pixels() {
     assert!(!t.is_codec_only());
     assert_eq!(t.codec(), fixture::CODEC);
     assert_eq!(t.accepted_pixel_formats(), FORMATS);
-    assert_eq!(t.options().len(), 1);
+    assert_eq!(t.options().len(), 2);
     assert_eq!(t.options()[0].name, "quality");
     // The ladder a declared set yields: only declared layouts.
     let l = t.ladder(PixelFormat::Rgb24, &SaveOptions::default());
@@ -1751,4 +1752,191 @@ fn cmyk_is_offered_only_after_every_additive_layout() {
     assert!(!u
         .ladder(PixelFormat::Rgba, &rgb_only)
         .contains(&PixelFormat::Cmyk));
+}
+
+/// The value of a custom blob the fixture decoder attaches.
+fn report(img: &Image, kind: &str) -> Option<usize> {
+    img.blob(&BlobKind::custom(kind))
+        .map(|b| String::from_utf8_lossy(&b.data).parse().unwrap())
+}
+
+#[test]
+fn execution_budget_reaches_every_decoder_and_encoder() {
+    let ctx = fixture::ctx();
+    let bytes = still(PixelFormat::Rgb24).encode();
+    let host = ExecutionContext::auto().threads;
+    // Default: the host's parallelism, through `set_execution_context`
+    // and through the decoder's declared `threads` option alike.
+    let opts = OpenOptions::new().with_decoder_option("report_threads", "1");
+    let img = decode_bytes_with(&ctx, &bytes, &opts)
+        .unwrap()
+        .into_primary();
+    assert_eq!(report(&img, fixture::BLOB_BUDGET), Some(host));
+    assert_eq!(report(&img, fixture::BLOB_THREADS_OPTION), Some(host));
+    assert_eq!(opts.execution_context().threads, host);
+    // Explicit budgets.
+    let img = decode_bytes_with(&ctx, &bytes, &opts.clone().with_threads(3))
+        .unwrap()
+        .into_primary();
+    assert_eq!(report(&img, fixture::BLOB_BUDGET), Some(3));
+    assert_eq!(report(&img, fixture::BLOB_THREADS_OPTION), Some(3));
+    let img = decode_bytes_with(&ctx, &bytes, &opts.clone().serial())
+        .unwrap()
+        .into_primary();
+    assert_eq!(report(&img, fixture::BLOB_BUDGET), Some(1));
+    assert_eq!(report(&img, fixture::BLOB_THREADS_OPTION), Some(1));
+    let img = decode_bytes_with(
+        &ctx,
+        &bytes,
+        &opts
+            .clone()
+            .with_execution_context(ExecutionContext::with_threads(0)),
+    )
+    .unwrap()
+    .into_primary();
+    assert_eq!(report(&img, fixture::BLOB_BUDGET), Some(1), "clamped up");
+    // A caller-set `threads` option wins over the forwarded budget on
+    // that channel; the context channel still carries the budget.
+    let img = decode_bytes_with(
+        &ctx,
+        &bytes,
+        &opts
+            .clone()
+            .with_threads(6)
+            .with_decoder_option("threads", "2"),
+    )
+    .unwrap()
+    .into_primary();
+    assert_eq!(report(&img, fixture::BLOB_THREADS_OPTION), Some(2));
+    assert_eq!(report(&img, fixture::BLOB_BUDGET), Some(6));
+    // A decoder that declares no `threads` option gets the context only
+    // (no unknown option is ever set): the `oximmux` container's streams
+    // name its own codec, which declares no decoder options.
+    assert!(ctx
+        .codecs
+        .decoder_options_schema(&oxideav_core::CodecId::new(fixture::CONTAINER_MUX))
+        .is_none());
+    let img = decode_bytes_with(
+        &ctx,
+        &bytes,
+        &opts.clone().with_threads(5).with_ext_hint("oximmux"),
+    )
+    .unwrap()
+    .into_primary();
+    assert_eq!(report(&img, fixture::BLOB_BUDGET), Some(5));
+    assert_eq!(report(&img, fixture::BLOB_THREADS_OPTION), None);
+
+    // Encoders: the budget is echoed as `budget=N` (context) and
+    // `threads=N` (declared option) in the file metadata.
+    let meta = |bytes: &[u8]| -> Vec<(String, String)> {
+        decode_bytes(&ctx, bytes).unwrap().metadata().to_vec()
+    };
+    let src = Image::from_rgb8(2, 2, vec![1; 12]).unwrap();
+    let m = meta(&encode(&ctx, &src, "oxim", &SaveOptions::default()).unwrap());
+    assert!(m.contains(&("budget".into(), host.to_string())), "{m:?}");
+    assert!(m.contains(&("threads".into(), host.to_string())), "{m:?}");
+    let m = meta(&encode(&ctx, &src, "oxim", &SaveOptions::new().with_threads(4)).unwrap());
+    assert!(m.contains(&("budget".into(), "4".into())), "{m:?}");
+    assert!(m.contains(&("threads".into(), "4".into())), "{m:?}");
+    let m = meta(&encode(&ctx, &src, "oxim", &SaveOptions::new().serial()).unwrap());
+    assert!(m.contains(&("budget".into(), "1".into())), "{m:?}");
+    let m = meta(
+        &encode(
+            &ctx,
+            &src,
+            "oxim",
+            &SaveOptions::new()
+                .with_threads(4)
+                .with_option("threads", "2"),
+        )
+        .unwrap(),
+    );
+    assert!(m.contains(&("threads".into(), "2".into())), "{m:?}");
+    assert!(m.contains(&("budget".into(), "4".into())), "{m:?}");
+    // An encoder without a `threads` option: context only, no option
+    // (it would refuse an unknown name).
+    let m = meta(
+        &encode(
+            &ctx,
+            &src,
+            "oxim",
+            &SaveOptions::new()
+                .with_codec(fixture::CODEC_YUV_ONLY)
+                .with_threads(7),
+        )
+        .unwrap(),
+    );
+    assert!(m.contains(&("budget".into(), "7".into())), "{m:?}");
+    assert!(!m.iter().any(|(k, _)| k == "threads"), "{m:?}");
+    // Multi-picture encodes reach every encoder the gateway creates.
+    let mut fx = Fixture::new(2, 2, PixelFormat::Rgb24);
+    fx.push_gradient(40, 1).push_gradient(40, 2);
+    let file = decode_bytes(&ctx, &fx.encode()).unwrap();
+    let m = meta(
+        &encode_frames(
+            &ctx,
+            file.frames(),
+            "oxim",
+            &SaveOptions::new().with_threads(2),
+        )
+        .unwrap(),
+    );
+    assert!(m.contains(&("budget".into(), "2".into())), "{m:?}");
+}
+
+#[test]
+fn decoder_output_label_wins_over_the_stream_label() {
+    let ctx = fixture::ctx();
+    for (f, wrong) in [
+        (PixelFormat::Rgb24, PixelFormat::Bgr24),
+        (PixelFormat::Rgba, PixelFormat::Bgra),
+        (PixelFormat::Gray8, PixelFormat::Pal8),
+    ] {
+        let fx = still(f);
+        let bytes = fx.encode();
+        // Through the honest container the stream label stands.
+        let plain = decode_bytes(&ctx, &bytes).unwrap();
+        assert_eq!(plain.primary().format(), f);
+        assert_eq!(plain.primary().params().pixel_format, Some(f));
+        // The mislabelling container says `wrong`; the decoder knows
+        // better and the picture is reported as what it emitted.
+        let opts = OpenOptions::new().with_ext_hint("oximlabel");
+        let file = decode_bytes_with(&ctx, &bytes, &opts).unwrap();
+        assert_eq!(file.container(), fixture::CONTAINER_MISLABELLED);
+        let img = file.primary();
+        assert_eq!(img.format(), f, "{f:?} labelled {wrong:?}");
+        assert_eq!(img.params().pixel_format, Some(f));
+        assert_eq!(
+            img.as_packed(),
+            Some(fx.frames[0].planes[0].data.as_slice())
+        );
+        assert_ne!(img.format(), wrong);
+        // A stream with no label at all opens when the decoder reports
+        // one (it was `InvalidData` before).
+        let opts = OpenOptions::new().with_ext_hint("oximnolabel");
+        let file = decode_bytes_with(&ctx, &bytes, &opts).unwrap();
+        assert_eq!(file.container(), fixture::CONTAINER_UNLABELLED);
+        assert_eq!(file.primary().format(), f);
+        assert_eq!(file.stream_blobs(0).len(), 0);
+    }
+    // Pictures of one stream keep sharing one parameter set after the
+    // relabel; stream blobs survive it.
+    let mut fx = Fixture::new(3, 2, PixelFormat::Rgb24);
+    fx.push_gradient(40, 1).push_gradient(40, 2);
+    let bytes = fx.with_blobs(vec![blob(BlobKind::ICC, b"acsp")]).encode();
+    let opts = OpenOptions::new().with_ext_hint("oximlabel");
+    let file = decode_bytes_with(&ctx, &bytes, &opts).unwrap();
+    assert_eq!(file.len(), 2);
+    assert!(file.iter().all(|i| i.format() == PixelFormat::Rgb24));
+    assert!(std::ptr::eq(
+        file.frames()[0].params(),
+        file.frames()[1].params()
+    ));
+    assert_eq!(file.icc(), Some(&b"acsp"[..]));
+    assert_eq!(file.frames()[1].icc(), Some(&b"acsp"[..]));
+    // A label the frame cannot be (wrong plane count) is still refused.
+    // (The honest container with a planar source: the decoder's label
+    // and the stream's agree, nothing to refuse.)
+    let planar = decode_bytes(&ctx, &still(PixelFormat::Yuv420P).encode()).unwrap();
+    assert_eq!(planar.primary().format(), PixelFormat::Yuv420P);
 }
