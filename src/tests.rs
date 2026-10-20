@@ -1300,6 +1300,28 @@ fn encode_hands_blobs_to_the_encoder_at_both_levels() {
     assert_eq!(back.iptc(), Some(&b"\x1c\x02"[..]));
     assert_eq!(back.xmp(), Some(&b"<x/>"[..]));
     assert_eq!(back.blobs().len(), 3);
+    // Ruling (round 478): a blob set on the options is the one that
+    // gets written, at both levels — the frame record of the same kind
+    // is replaced too, so a reopen cannot let the old frame blob win.
+    let opts = SaveOptions::new().with_blob(blob(BlobKind::EXIF, b"II*\0set"));
+    let back = decode_bytes(
+        &ctx,
+        &encode(&ctx, &file.frames()[1], "oxim", &opts).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(back.exif(), Some(&b"II*\0set"[..]));
+    assert_eq!(back.primary().exif(), Some(&b"II*\0set"[..]));
+    assert!(back.primary().frame_blobs().is_empty());
+    assert_eq!(back.primary().blobs_of(&BlobKind::EXIF).len(), 1);
+    let back = decode_bytes(
+        &ctx,
+        &encode_frames(&ctx, file.frames(), "oxim", &opts).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(back.exif(), Some(&b"II*\0set"[..]));
+    assert!(back.frames()[1].frame_blobs().is_empty());
+    assert_eq!(back.frames()[1].exif(), Some(&b"II*\0set"[..]));
+    assert_eq!(back.icc(), Some(&b"acsp"[..]), "other kinds pass through");
     let opts = SaveOptions::new()
         .without_metadata()
         .with_blob(blob(BlobKind::ICC, b"only"));

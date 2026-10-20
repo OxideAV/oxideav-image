@@ -34,6 +34,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only, no pixels) is unchanged.
 - `Image::as_packed` / `to_packed` serve `Cmyk` / `CmykInverted` (four
   bytes per pixel) — they answered `None` / `Unsupported`.
+- **`SaveOptions::blobs` replace by kind at both levels.** A blob set on
+  the options replaced the source blob of its kind on the encoder's
+  stream parameters only; a picture's frame record kept its own blob of
+  that kind, which won on reopen (frame over stream). The frame records
+  handed to the encoder now drop every kind the options set, so the
+  options' blob is the one written, period.
 
 ## [0.0.4](https://github.com/OxideAV/oxideav-image/compare/v0.0.3...v0.0.4) - 2026-10-17
 

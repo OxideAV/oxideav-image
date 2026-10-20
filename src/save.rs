@@ -41,8 +41,9 @@ pub struct SaveOptions {
     pub default_delay: Option<Duration>,
     /// Blobs written into the encoder's stream parameters on top of
     /// the pictures' own (README, *Metadata*): a blob here replaces
-    /// every source blob of the same kind (set an ICC profile, swap
-    /// the XMP packet); other kinds pass through untouched.
+    /// every source blob of the same kind at both levels — the stream's
+    /// and every picture's frame record (set an ICC profile, swap the
+    /// XMP packet); other kinds pass through untouched.
     pub blobs: Vec<MetadataBlob>,
     /// Hand no source blob to the encoder — neither the pictures'
     /// stream-level ones nor their per-picture ones. `blobs` above are
@@ -133,12 +134,17 @@ impl SaveOptions {
         !self.strip_metadata && !self.strip_blobs.iter().any(|k| blob.is(k))
     }
 
-    /// The per-picture blobs handed to the encoder with `image`'s frame.
+    /// The per-picture blobs handed to the encoder with `image`'s frame:
+    /// the frame's own, minus the strip rules, minus every kind
+    /// `self.blobs` sets — a blob set on the options is the one that
+    /// gets written, at both levels, so no frame record carries a
+    /// competing blob of its kind (a frame blob would override the
+    /// stream blob on reopen).
     fn frame_blobs(&self, image: &Image) -> Vec<MetadataBlob> {
         image
             .frame_blobs()
             .iter()
-            .filter(|b| self.keeps(b))
+            .filter(|b| self.keeps(b) && !self.blobs.iter().any(|o| o.kind == b.kind))
             .cloned()
             .collect()
     }
