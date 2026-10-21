@@ -210,7 +210,10 @@ contract), so budgeted codecs (HEIF / AVIF / AV1 / H.265 tile- and
 slice-parallel decodes) parallelise through the gateway. The budget
 is `OpenOptions::execution` / `SaveOptions::execution`: `None` — the
 default — is the host's parallelism (`ExecutionContext::auto()`,
-`std::thread::available_parallelism`), `with_threads(n)` caps it,
+`std::thread::available_parallelism`; a caller-set `threads` decoder /
+encoder option counts as the budget when no explicit one is given, so
+a codec reading both channels hears one number), `with_threads(n)`
+caps it,
 `serial()` pins the codec to one worker, `with_execution_context(ctx)`
 hands one through; `execution_context()` tells what the codecs will
 get. Where a codec's declared option schema has a `threads` option the

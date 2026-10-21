@@ -18,7 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default is the host's parallelism (`ExecutionContext::auto()`). Where
   the codec's declared option schema has a `threads` option the caller
   did not set, the budget is forwarded through it too (a caller-set
-  option wins on that channel). `ExecutionContext` is re-exported.
+  option wins on that channel, and with no explicit budget it *is* the
+  budget, so a codec reading both channels hears one number).
+  `ExecutionContext` is re-exported.
   *Timing* (gateway `open`, best of 3, 18-logical-core host,
   `docs/image/heif/device-samples`): the 12 MP `iphone_13_pro_max.HEIC`
   (48 HEVC tiles) 0.481 s serial → 0.271 s at 2 workers → 0.174 s at 4

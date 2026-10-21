@@ -1810,6 +1810,23 @@ fn execution_budget_reaches_every_decoder_and_encoder() {
     .into_primary();
     assert_eq!(report(&img, fixture::BLOB_THREADS_OPTION), Some(2));
     assert_eq!(report(&img, fixture::BLOB_BUDGET), Some(6));
+    // A caller-set `threads` option with no explicit budget is the
+    // budget: a codec reading both channels hears one number.
+    let only_option = opts.clone().with_decoder_option("threads", "2");
+    assert_eq!(only_option.execution_context().threads, 2);
+    let img = decode_bytes_with(&ctx, &bytes, &only_option)
+        .unwrap()
+        .into_primary();
+    assert_eq!(report(&img, fixture::BLOB_THREADS_OPTION), Some(2));
+    assert_eq!(report(&img, fixture::BLOB_BUDGET), Some(2));
+    assert_eq!(
+        opts.clone()
+            .with_decoder_option("threads", "many")
+            .execution_context()
+            .threads,
+        host,
+        "an unparsable option is left to the decoder; the budget stays the host's"
+    );
     // A decoder that declares no `threads` option gets the context only
     // (no unknown option is ever set): the `oximmux` container's streams
     // name its own codec, which declares no decoder options.
@@ -1854,6 +1871,17 @@ fn execution_budget_reaches_every_decoder_and_encoder() {
     );
     assert!(m.contains(&("threads".into(), "2".into())), "{m:?}");
     assert!(m.contains(&("budget".into(), "4".into())), "{m:?}");
+    let m = meta(
+        &encode(
+            &ctx,
+            &src,
+            "oxim",
+            &SaveOptions::new().with_option("threads", "3"),
+        )
+        .unwrap(),
+    );
+    assert!(m.contains(&("threads".into(), "3".into())), "{m:?}");
+    assert!(m.contains(&("budget".into(), "3".into())), "{m:?}");
     // An encoder without a `threads` option: context only, no option
     // (it would refuse an unknown name).
     let m = meta(

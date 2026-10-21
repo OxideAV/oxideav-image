@@ -55,7 +55,8 @@ pub struct SaveOptions {
     /// Execution budget handed to every encoder the gateway creates
     /// (`Encoder::set_execution_context`, before the first frame), so
     /// budgeted codecs parallelise through the gateway. `None` (the
-    /// default) is the host's parallelism (`ExecutionContext::auto()`);
+    /// default) is a caller-set `threads` encoder option when there is
+    /// one, else the host's parallelism (`ExecutionContext::auto()`);
     /// `ExecutionContext::serial()` pins an encode to one worker. Where
     /// the encoder's declared option schema has a `threads` option the
     /// caller did not set, the budget is forwarded through it as well.
@@ -85,10 +86,13 @@ impl SaveOptions {
         self.with_execution_context(ExecutionContext::serial())
     }
 
-    /// The budget encoders receive: the configured one, else the host's.
+    /// The budget encoders receive: the configured one; else a
+    /// caller-set `threads` encoder option, so a codec that reads both
+    /// channels hears one number; else the host's.
     pub fn execution_context(&self) -> ExecutionContext {
         self.execution
             .clone()
+            .or_else(|| crate::open::threads_option(&self.options))
             .unwrap_or_else(ExecutionContext::auto)
     }
 

@@ -247,7 +247,8 @@ pub struct OpenOptions {
     /// Execution budget handed to every decoder the gateway creates
     /// (`Decoder::set_execution_context`, before the first packet),
     /// so budgeted codecs parallelise through the gateway. `None` (the
-    /// default) is the host's parallelism (`ExecutionContext::auto()`);
+    /// default) is a caller-set `threads` decoder option when there is
+    /// one, else the host's parallelism (`ExecutionContext::auto()`);
     /// `ExecutionContext::serial()` pins a decode to one worker. Where
     /// the decoder's declared option schema has a `threads` option the
     /// caller did not set, the budget is forwarded through it as well.
@@ -277,10 +278,13 @@ impl OpenOptions {
         self.with_execution_context(ExecutionContext::serial())
     }
 
-    /// The budget decoders receive: the configured one, else the host's.
+    /// The budget decoders receive: the configured one; else a
+    /// caller-set `threads` decoder option, so a codec that reads both
+    /// channels hears one number; else the host's.
     pub fn execution_context(&self) -> ExecutionContext {
         self.execution
             .clone()
+            .or_else(|| threads_option(&self.decoder_options))
             .unwrap_or_else(ExecutionContext::auto)
     }
 
@@ -391,6 +395,15 @@ impl OpenOptions {
             params.blobs.retain(|b| self.keeps(b));
         }
     }
+}
+
+/// A caller-set `threads` option as a budget, when it parses.
+pub(crate) fn threads_option(options: &[(String, String)]) -> Option<ExecutionContext> {
+    options
+        .iter()
+        .find(|(k, _)| k == "threads")
+        .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+        .map(ExecutionContext::with_threads)
 }
 
 /// The allow / deny rule: a denied name loses; otherwise an allow list,

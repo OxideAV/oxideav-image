@@ -385,6 +385,78 @@ mod tests {
         );
     }
 
+    /// A PNG-like declared set (grey / RGB, 8 and 16-bit, alpha, indexed).
+    const PNG_LIKE: &[P] = &[
+        P::Gray8,
+        P::Gray16Le,
+        P::Ya8,
+        P::Ya16Le,
+        P::Rgb24,
+        P::Rgb48Le,
+        P::Rgba,
+        P::Rgba64Le,
+        P::Pal8,
+    ];
+
+    /// A WebP-like declared set (lossless RGB(A), lossy 4:2:0).
+    const WEBP_LIKE: &[P] = &[P::Rgba, P::Rgb24, P::Yuv420P];
+
+    #[test]
+    fn png_like_and_webp_like_declared_sets() {
+        // Opaque RGBA → Rgb24 then itself; transparent → itself first;
+        // a transparent palette source keeps Pal8 (declared) first, then
+        // the alpha rungs; grey and deep sources stay in their tier.
+        assert_eq!(
+            &ladder_with_alpha(P::Rgba, false, PNG_LIKE)[..3],
+            &[P::Rgb24, P::Rgba, P::Rgb48Le]
+        );
+        assert_eq!(
+            &ladder_with_alpha(P::Rgba, true, PNG_LIKE)[..3],
+            &[P::Rgba, P::Rgb24, P::Rgba64Le]
+        );
+        assert_eq!(
+            &ladder_with_alpha(P::Pal8, true, PNG_LIKE)[..3],
+            &[P::Pal8, P::Rgba, P::Rgb24]
+        );
+        assert_eq!(
+            &ladder_with_alpha(P::Pal8, false, PNG_LIKE)[..3],
+            &[P::Pal8, P::Rgb24, P::Rgba]
+        );
+        // Grey: its own tier (an opaque alpha channel is harmless) before
+        // the deeper one, every grey rung before RGB, the palette last.
+        let l = ladder(P::Gray8, PNG_LIKE);
+        assert_eq!(&l[..3], &[P::Gray8, P::Ya8, P::Gray16Le]);
+        assert!(pos(&l, P::Rgb24) > pos(&l, P::Ya16Le));
+        assert!(pos(&l, P::Pal8) > pos(&l, P::Rgba64Le));
+        assert_eq!(
+            &ladder(P::Rgb48Le, PNG_LIKE)[..3],
+            &[P::Rgb48Le, P::Rgba64Le, P::Rgb24]
+        );
+        assert_eq!(
+            &ladder_with_alpha(P::Rgba64Le, false, PNG_LIKE)[..2],
+            &[P::Rgb48Le, P::Rgba64Le]
+        );
+        // A YCbCr source into PNG: RGB (the other additive model), its
+        // tier first, never grey while colour is accepted.
+        let l = ladder(P::Yuv420P, PNG_LIKE);
+        assert_eq!(l[0], P::Rgb24);
+        assert!(pos(&l, P::Rgba64Le) < pos(&l, P::Gray8));
+        assert!(pos(&l, P::Pal8) < pos(&l, P::Gray8));
+        // WebP: 4:2:0 stays 4:2:0, RGBA stays RGBA, grey goes RGB before
+        // YCbCr, opaque RGBA goes Rgb24.
+        assert_eq!(ladder(P::Yuv420P, WEBP_LIKE)[0], P::Yuv420P);
+        assert_eq!(&ladder(P::Rgba, WEBP_LIKE)[..2], &[P::Rgba, P::Rgb24]);
+        assert_eq!(
+            ladder(P::Gray8, WEBP_LIKE),
+            vec![P::Rgb24, P::Rgba, P::Yuv420P]
+        );
+        assert_eq!(
+            &ladder_with_alpha(P::Rgba, false, WEBP_LIKE)[..2],
+            &[P::Rgb24, P::Rgba]
+        );
+        assert_eq!(ladder(P::Yuv444P, WEBP_LIKE)[0], P::Yuv420P);
+    }
+
     #[test]
     fn families_and_tiers() {
         assert_eq!(family(P::YuvJ420P), Family::Yuv);
