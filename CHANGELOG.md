@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-image/compare/v0.0.4...v0.0.5) - 2026-10-21
+
+### Other
+
+- A caller-set threads option is the budget when no explicit one is given (one number on both channels); PNG-like and WebP-like declared sets pinned on the ladder
+- support / can_open / codec_only_formats: the registry's answer for a name or extension; README codec-only list replaced by the registry survey (none of the 25 image crates is codec-only), budget timings recorded
+- Execution budget on OpenOptions / SaveOptions (set_execution_context on every decoder and encoder, threads option forwarded where declared; default = host parallelism) and decoder output labels (Decoder::output_pixel_format wins over the stream label; unlabelled streams open when the decoder knows)
+- :blobs replace by kind at both levels: the frame records handed to the encoder drop every kind the options set, so a same-kind frame blob cannot win on reopen
+- colour-model distance before channel count, opaque alpha prefers the opaque layout, CMYK and palette rungs last — an opaque Rgba source saved as JPEG no longer becomes four-ink CMYK
+
 ### Added
 
 - **Execution budget.** `OpenOptions::execution` / `SaveOptions::execution`
