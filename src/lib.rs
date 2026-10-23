@@ -57,13 +57,12 @@ mod tests;
 pub use error::{Error, ImageError, Result};
 pub use image::Image;
 pub use open::{
-    decode_bytes, decode_bytes_with, decode_reader, decode_vec, decode_vec_with, open, open_with,
-    ImageFile, OpenOptions,
+    ImageFile, OpenOptions, decode_bytes, decode_bytes_with, decode_reader, decode_vec,
+    decode_vec_with, open, open_with,
 };
 pub use save::{
-    can_encode, can_open, codec_only_formats, encode, encode_frames, encoder_options,
-    resolve_target, save, support, EncodeTarget, FormatSupport, MetadataSupport, SaveOptions,
-    DEFAULT_DELAY,
+    DEFAULT_DELAY, EncodeTarget, FormatSupport, MetadataSupport, SaveOptions, can_encode, can_open,
+    codec_only_formats, encode, encode_frames, encoder_options, resolve_target, save, support,
 };
 
 /// Re-exported for convenience: the framework's pixel layouts and colour

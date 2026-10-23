@@ -5,11 +5,11 @@ use std::time::Duration;
 
 use oxideav_core::{BlobKind, ExecutionContext, MetadataBlob, PixelFormat, TimeBase, VideoPlane};
 
-use crate::fixture::{self, Fixture, FORMATS};
+use crate::fixture::{self, FORMATS, Fixture};
 use crate::{
-    can_encode, can_open, codec_only_formats, decode_bytes, decode_bytes_with, decode_vec, encode,
-    encode_frames, encoder_options, resolve_target, support, Image, ImageError, MetadataSupport,
-    OpenOptions, SaveOptions,
+    Image, ImageError, MetadataSupport, OpenOptions, SaveOptions, can_encode, can_open,
+    codec_only_formats, decode_bytes, decode_bytes_with, decode_vec, encode, encode_frames,
+    encoder_options, resolve_target, support,
 };
 
 fn still(format: PixelFormat) -> Fixture {
@@ -489,10 +489,11 @@ fn encode_frames_round_trips_delays() {
     let plain: Vec<Image> = frames.iter().map(|f| f.clone().with_delay(None)).collect();
     let bytes = encode_frames(&ctx, &plain, "oxim", &SaveOptions::default()).unwrap();
     let back = decode_bytes(&ctx, &bytes).unwrap();
-    assert!(back
-        .frames()
-        .iter()
-        .all(|i| i.delay() == Some(crate::DEFAULT_DELAY)));
+    assert!(
+        back.frames()
+            .iter()
+            .all(|i| i.delay() == Some(crate::DEFAULT_DELAY))
+    );
     let bytes = encode_frames(
         &ctx,
         &plain,
@@ -705,12 +706,14 @@ fn decoder_options_reach_the_decoder() {
         .into_primary();
     assert!(stamped.frame().color_signal().is_some());
     let opts = OpenOptions::new().with_decoder_options(vec![("stamp_color".into(), "1".into())]);
-    assert!(decode_bytes_with(&ctx, &bytes, &opts)
-        .unwrap()
-        .primary()
-        .frame()
-        .color_signal()
-        .is_some());
+    assert!(
+        decode_bytes_with(&ctx, &bytes, &opts)
+            .unwrap()
+            .primary()
+            .frame()
+            .color_signal()
+            .is_some()
+    );
 }
 
 #[test]
@@ -907,12 +910,14 @@ fn allow_and_deny_lists_refuse_before_decoding() {
     let msg = restricted(&OpenOptions::new().with_deny_containers(["OXIM"]));
     assert!(msg.contains("container 'oxim'"), "{msg}");
     restricted(&OpenOptions::new().with_allow_containers(["png", "oximrgb"]));
-    assert!(decode_bytes_with(
-        &ctx,
-        &bytes,
-        &OpenOptions::new().with_allow_containers(["Oxim"])
-    )
-    .is_ok());
+    assert!(
+        decode_bytes_with(
+            &ctx,
+            &bytes,
+            &OpenOptions::new().with_allow_containers(["Oxim"])
+        )
+        .is_ok()
+    );
     restricted(
         &OpenOptions::new()
             .with_allow_containers(["oxim"])
@@ -930,12 +935,14 @@ fn allow_and_deny_lists_refuse_before_decoding() {
         "{msg}"
     );
     restricted(&OpenOptions::new().with_allow_codecs(["png"]));
-    assert!(decode_bytes_with(
-        &ctx,
-        &bytes,
-        &OpenOptions::new().with_allow_codecs(["OXIM"])
-    )
-    .is_ok());
+    assert!(
+        decode_bytes_with(
+            &ctx,
+            &bytes,
+            &OpenOptions::new().with_allow_codecs(["OXIM"])
+        )
+        .is_ok()
+    );
     // A stream whose codec nobody decodes is still refused by its id
     // (Restricted outranks NoImage: the list is checked first).
     let opts = OpenOptions::new()
@@ -1181,24 +1188,27 @@ fn pictures_of_a_stream_share_its_parameters() {
     let mut file = decode_bytes(&ctx, &fx.encode()).unwrap();
     assert_eq!(file.len(), 40);
     let first = file.primary().params() as *const _;
-    assert!(file
-        .frames()
-        .iter()
-        .all(|i| std::ptr::eq(i.params(), first)));
+    assert!(
+        file.frames()
+            .iter()
+            .all(|i| std::ptr::eq(i.params(), first))
+    );
     file.retain_blobs(|b| !b.is(&BlobKind::EXIF));
     let first = file.primary().params() as *const _;
-    assert!(file
-        .frames()
-        .iter()
-        .all(|i| std::ptr::eq(i.params(), first)));
+    assert!(
+        file.frames()
+            .iter()
+            .all(|i| std::ptr::eq(i.params(), first))
+    );
     assert!(file.frames()[39].frame_blobs().is_empty());
     assert_eq!(file.frames()[39].icc().map(<[u8]>::len), Some(64 * 1024));
     file.retain_blobs(|b| !b.is(&BlobKind::XMP));
     let first = file.primary().params() as *const _;
-    assert!(file
-        .frames()
-        .iter()
-        .all(|i| std::ptr::eq(i.params(), first)));
+    assert!(
+        file.frames()
+            .iter()
+            .all(|i| std::ptr::eq(i.params(), first))
+    );
     assert_eq!(file.blobs().len(), 1);
     assert_eq!(file.frames()[5].stream_blobs().len(), 1);
     // A picture given its own stream blobs stops sharing, alone.
@@ -1473,7 +1483,9 @@ fn palette_alpha_reaches_the_rgba_views_and_not_the_rgb_ones() {
     assert!(img.has_alpha());
     assert_eq!(
         img.to_rgba8().unwrap(),
-        vec![10, 20, 30, 255, 40, 50, 60, 0, 70, 80, 90, 128, 1, 2, 3, 255]
+        vec![
+            10, 20, 30, 255, 40, 50, 60, 0, 70, 80, 90, 128, 1, 2, 3, 255
+        ]
     );
     // Alpha widens like any sample (0 → 0, 128 → 0x8080, 255 → 0xffff).
     let wide = img.to_rgba16().unwrap();
@@ -1593,12 +1605,16 @@ fn is_opaque_reads_the_alpha_samples() {
         px[if f == P::Bgra { 3 } else { 4 }] = 0;
         assert!(!Image::from_raw(2, 1, f, px).unwrap().is_opaque(), "{f:?}");
     }
-    assert!(Image::from_raw(2, 1, P::Ya8, vec![1, 255, 2, 255])
-        .unwrap()
-        .is_opaque());
-    assert!(!Image::from_raw(2, 1, P::Ya8, vec![1, 255, 2, 0])
-        .unwrap()
-        .is_opaque());
+    assert!(
+        Image::from_raw(2, 1, P::Ya8, vec![1, 255, 2, 255])
+            .unwrap()
+            .is_opaque()
+    );
+    assert!(
+        !Image::from_raw(2, 1, P::Ya8, vec![1, 255, 2, 0])
+            .unwrap()
+            .is_opaque()
+    );
     // 16-bit and float packed.
     let mut w = Vec::new();
     for _ in 0..2 {
@@ -1606,18 +1622,22 @@ fn is_opaque_reads_the_alpha_samples() {
             w.extend_from_slice(&v.to_le_bytes());
         }
     }
-    assert!(Image::from_raw(2, 1, P::Rgba64Le, w.clone())
-        .unwrap()
-        .is_opaque());
+    assert!(
+        Image::from_raw(2, 1, P::Rgba64Le, w.clone())
+            .unwrap()
+            .is_opaque()
+    );
     w[14] = 0xFE;
     assert!(!Image::from_raw(2, 1, P::Rgba64Le, w).unwrap().is_opaque());
     let mut fl = Vec::new();
     for v in [0.1f32, 0.2, 0.3, 1.0] {
         fl.extend_from_slice(&v.to_le_bytes());
     }
-    assert!(Image::from_raw(1, 1, P::RgbaF32Le, fl.clone())
-        .unwrap()
-        .is_opaque());
+    assert!(
+        Image::from_raw(1, 1, P::RgbaF32Le, fl.clone())
+            .unwrap()
+            .is_opaque()
+    );
     fl[12..16].copy_from_slice(&0.999f32.to_le_bytes());
     assert!(!Image::from_raw(1, 1, P::RgbaF32Le, fl).unwrap().is_opaque());
     // Planar: the fourth plane.
@@ -1626,9 +1646,11 @@ fn is_opaque_reads_the_alpha_samples() {
     let img = Image::from_planes(4, 2, P::Yuva420P, planes.clone()).unwrap();
     assert!(img.is_opaque());
     planes[3].data[5] = 1;
-    assert!(!Image::from_planes(4, 2, P::Yuva420P, planes)
-        .unwrap()
-        .is_opaque());
+    assert!(
+        !Image::from_planes(4, 2, P::Yuva420P, planes)
+            .unwrap()
+            .is_opaque()
+    );
     // Palette: the record decides.
     assert!(!indexed_with_alpha().is_opaque());
     let opaque_pal = Image::from_indexed(1, 1, vec![0], &[[1, 2, 3, 255]]).unwrap();
@@ -1750,9 +1772,10 @@ fn cmyk_is_offered_only_after_every_additive_layout() {
     assert_eq!(back.primary().format(), PixelFormat::Yuv444P);
     // Through the undeclared rungs CMYK is never offered.
     let u = resolve_target(&ctx, "oxim", &rgb_only).unwrap();
-    assert!(!u
-        .ladder(PixelFormat::Rgba, &rgb_only)
-        .contains(&PixelFormat::Cmyk));
+    assert!(
+        !u.ladder(PixelFormat::Rgba, &rgb_only)
+            .contains(&PixelFormat::Cmyk)
+    );
 }
 
 /// The value of a custom blob the fixture decoder attaches.
@@ -1830,10 +1853,11 @@ fn execution_budget_reaches_every_decoder_and_encoder() {
     // A decoder that declares no `threads` option gets the context only
     // (no unknown option is ever set): the `oximmux` container's streams
     // name its own codec, which declares no decoder options.
-    assert!(ctx
-        .codecs
-        .decoder_options_schema(&oxideav_core::CodecId::new(fixture::CONTAINER_MUX))
-        .is_none());
+    assert!(
+        ctx.codecs
+            .decoder_options_schema(&oxideav_core::CodecId::new(fixture::CONTAINER_MUX))
+            .is_none()
+    );
     let img = decode_bytes_with(
         &ctx,
         &bytes,

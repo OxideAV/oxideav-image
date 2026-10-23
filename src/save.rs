@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::error::{Error, Result};
-use crate::image::{duration_to_ticks, Image};
+use crate::image::{Image, duration_to_ticks};
 use crate::ladder;
 use oxideav_core::{
     BlobKind, CodecId, CodecParameters, ExecutionContext, Frame, MediaType, MetadataBlob,
@@ -738,13 +738,13 @@ fn resolve_format(ctx: &RuntimeContext, format: &str) -> Result<Target> {
         });
     }
     let by_ext = ctx.containers.container_for_extension(&lower);
-    if let Some(name) = by_ext {
-        if ctx.containers.muxer_names().any(|n| n == name) {
-            return Ok(Target::Container {
-                name: name.to_string(),
-                requested: lower,
-            });
-        }
+    if let Some(name) = by_ext
+        && ctx.containers.muxer_names().any(|n| n == name)
+    {
+        return Ok(Target::Container {
+            name: name.to_string(),
+            requested: lower,
+        });
     }
     // A codec registered without a container: the format's crate hands
     // whole files to its codec, so the encoder's packet is the file.
@@ -985,10 +985,10 @@ fn encoder_params(
             .encoder_options_schema(codec_id)
             .is_some_and(|schema| schema.iter().any(|f| f.name == name))
     };
-    if let Some(q) = opts.quality {
-        if declares("quality") {
-            params.options = params.options.set("quality", q.to_string());
-        }
+    if let Some(q) = opts.quality
+        && declares("quality")
+    {
+        params.options = params.options.set("quality", q.to_string());
     }
     // The budget travels as the `threads` option too, where the encoder
     // declares one and the caller set none.

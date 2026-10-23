@@ -8,7 +8,7 @@ use oxideav_core::{
     BlobKind, CodecId, CodecParameters, ColorSignal, MediaType, MetadataBlob, PixelFormat,
     TimeBase, VideoFrame, VideoPlane,
 };
-use oxideav_pixfmt::{convert_with, supports_direct, ConvertContext, ConvertOptions, FrameInfo};
+use oxideav_pixfmt::{ConvertContext, ConvertOptions, FrameInfo, convert_with, supports_direct};
 
 use crate::error::{Error, Result};
 
@@ -707,10 +707,10 @@ impl Image {
             return Ok(self.clone());
         }
         let mut cx = ConvertContext::new();
-        if self.frame.color_signal().is_none() {
-            if let Some(sig) = self.color_signal() {
-                cx = cx.with_signal(sig);
-            }
+        if self.frame.color_signal().is_none()
+            && let Some(sig) = self.color_signal()
+        {
+            cx = cx.with_signal(sig);
         }
         let (w, h) = (self.width(), self.height());
         let mut cur = src;
@@ -889,15 +889,15 @@ impl Image {
             )));
         }
         let sub = format.chroma_subsampling();
-        if let Some((ssx, ssy)) = sub {
-            if x % (1 << ssx) != 0 || y % (1 << ssy) != 0 {
-                return Err(Error::unsupported(format!(
-                    "crop origin ({x}, {y}) is not on the chroma grid of {format:?} \
+        if let Some((ssx, ssy)) = sub
+            && (!x.is_multiple_of(1 << ssx) || !y.is_multiple_of(1 << ssy))
+        {
+            return Err(Error::unsupported(format!(
+                "crop origin ({x}, {y}) is not on the chroma grid of {format:?} \
                      ({}x{} pixels)",
-                    1 << ssx,
-                    1 << ssy
-                )));
-            }
+                1 << ssx,
+                1 << ssy
+            )));
         }
         let mut planes = Vec::with_capacity(format.plane_count());
         for (p, plane) in self.frame.image_planes().iter().enumerate() {
@@ -1080,11 +1080,7 @@ pub(crate) fn duration_to_ticks(d: Duration, tb: TimeBase) -> i64 {
     let num = tb.num() as i128 * 1_000_000_000;
     let ticks = (d.as_nanos() as i128 * tb.den() as i128 + num / 2) / num;
     let ticks = ticks.clamp(0, i64::MAX as i128) as i64;
-    if ticks == 0 && !d.is_zero() {
-        1
-    } else {
-        ticks
-    }
+    if ticks == 0 && !d.is_zero() { 1 } else { ticks }
 }
 
 /// Bytes per row of a packed (single-plane) layout, or `None` for

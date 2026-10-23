@@ -31,11 +31,11 @@ use std::io::{Read, Seek, SeekFrom, Write};
 
 use oxideav_core::blob::{decode_blobs, encode_blobs};
 use oxideav_core::{
-    parse_options, BlobKind, CodecCapabilities, CodecId, CodecInfo, CodecOptionsStruct,
-    CodecParameters, CodecResolver, Decoder, Demuxer, Encoder, Error, Frame, MediaType,
-    MetadataBlob, Muxer, OptionField, OptionKind, OptionValue, Packet, PixelFormat, ProbeData,
-    ProbeScore, ReadSeek, Result, RuntimeContext, StreamInfo, TimeBase, VideoFrame, VideoPlane,
-    WriteSeek, MAX_PROBE_SCORE, PROBE_SCORE_EXTENSION,
+    BlobKind, CodecCapabilities, CodecId, CodecInfo, CodecOptionsStruct, CodecParameters,
+    CodecResolver, Decoder, Demuxer, Encoder, Error, Frame, MAX_PROBE_SCORE, MediaType,
+    MetadataBlob, Muxer, OptionField, OptionKind, OptionValue, PROBE_SCORE_EXTENSION, Packet,
+    PixelFormat, ProbeData, ProbeScore, ReadSeek, Result, RuntimeContext, StreamInfo, TimeBase,
+    VideoFrame, VideoPlane, WriteSeek, parse_options,
 };
 
 pub(crate) const CONTAINER: &str = "oxim";
@@ -526,8 +526,10 @@ fn make_encoder_for(
                 .options
                 .set("threads", parsed.threads.to_string());
         }
-    } else if let Some((k, _)) = params.options.iter().next() {
-        return Err(Error::invalid(format!("unknown option '{k}'")));
+    } else {
+        if let Some((k, _)) = params.options.iter().next() {
+            return Err(Error::invalid(format!("unknown option '{k}'")));
+        }
     }
     Ok(Box::new(OximEncoder {
         id: CodecId::new(id),
