@@ -61,6 +61,16 @@ pub struct SaveOptions {
     /// the encoder's declared option schema has a `threads` option the
     /// caller did not set, the budget is forwarded through it as well.
     pub execution: Option<ExecutionContext>,
+    /// Number of times an animation plays, `0` = forever (the
+    /// `Imagick::setImageIterations` count). `None` leaves the format's
+    /// default. Handed to the format as its `loop_count` option — the
+    /// encoder's when its declared schema has one, and the muxer's
+    /// stream parameters — in the format's own unit: a GIF counts the
+    /// repeats after the first pass (NETSCAPE2.0, so `1` play writes no
+    /// looping block and `n` writes `n − 1`), APNG `num_plays` and WebP
+    /// Loop Count count the plays. A caller-set `loop_count` option
+    /// wins.
+    pub loop_count: Option<u32>,
 }
 
 impl SaveOptions {
@@ -118,6 +128,28 @@ impl SaveOptions {
     pub fn with_option(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.options.push((name.into(), value.into()));
         self
+    }
+
+    /// Plays of an animation, `0` = forever (see the field).
+    pub fn with_loop_count(mut self, plays: u32) -> Self {
+        self.loop_count = Some(plays);
+        self
+    }
+
+    /// The `loop_count` option value for a target of `codec` /
+    /// `container`, unless the caller set the option itself.
+    pub(crate) fn loop_option(&self, codec: &CodecId, container: Option<&str>) -> Option<String> {
+        let plays = self.loop_count?;
+        if self.options.iter().any(|(k, _)| k == "loop_count") {
+            return None;
+        }
+        let gif = codec.as_str() == "gif" || container == Some("gif");
+        Some(match (gif, plays) {
+            (true, 0) => "0".to_string(),
+            (true, 1) => "-1".to_string(),
+            (true, n) => (n - 1).to_string(),
+            (false, n) => n.to_string(),
+        })
     }
 
     /// Time base for the written stream (see the field).
@@ -596,9 +628,20 @@ pub fn encode_frames(
     format: &str,
     opts: &SaveOptions,
 ) -> Result<Vec<u8>> {
-    let first = images
-        .first()
-        .ok_or_else(|| Error::invalid("encode_frames: no image"))?;
+    if images.is_empty() {
+        return Err(Error::invalid("encode_frames: no image"));
+    }
+    // A layered list (sub-rectangle frames, or frames that dispose
+    // their rectangle) is written as it is displayed: the framework has
+    // no per-frame placement record an encoder or muxer could read, so
+    // every frame goes out as its full canvas.
+    let coalesced;
+    let images = if crate::layer::is_layered(images) {
+        coalesced = crate::layers::coalesce(images)?;
+        coalesced.as_slice()
+    } else {
+        images
+    };
     let target = resolve_format(ctx, format)?;
     let codec_id = codec_for(ctx, &target, opts);
     if !ctx.codecs.has_encoder(&codec_id) {
@@ -616,7 +659,7 @@ pub fn encode_frames(
         )));
     }
 
-    let candidates = candidates(ctx, &codec_id, first, opts);
+    let candidates = candidates(ctx, &codec_id, images, opts);
     let mut first_err: Option<Error> = None;
     let mut same = true;
     let mut attempts: Vec<String> = Vec::new();
@@ -812,21 +855,24 @@ fn default_codec_for_container(
 }
 
 /// Encoder input layouts to try, in order: the forced one, else the
-/// ladder of [`crate::ladder`] for the picture's own layout (and its
-/// real transparency: palette alpha included, an all-opaque alpha
-/// channel excluded) and the encoder's declared accepted set.
+/// ladder of [`crate::ladder`] for the first picture's layout and the
+/// pictures' real transparency — any picture's (palette alpha included,
+/// an all-opaque alpha channel excluded), so an animation whose first
+/// frame is opaque keeps the alpha a later frame needs — and the
+/// encoder's declared accepted set.
 fn candidates(
     ctx: &RuntimeContext,
     codec_id: &CodecId,
-    first: &Image,
+    images: &[Image],
     opts: &SaveOptions,
 ) -> Vec<PixelFormat> {
     if let Some(f) = opts.pixel_format {
         return vec![f];
     }
+    let transparent = images.iter().any(Image::has_transparency);
     ladder::ladder_with_alpha(
-        first.format(),
-        first.has_transparency(),
+        images[0].format(),
+        transparent,
         &declared_formats(ctx, codec_id),
     )
 }
@@ -883,6 +929,13 @@ fn encode_attempt(
             default_delay,
             opts,
         )?;
+        let mut out_params = out_params;
+        if let Target::Container { name, .. } = target
+            && let Some(v) = opts.loop_option(codec_id, Some(name))
+        {
+            // The muxer writes the animation-level loop field.
+            out_params.options = out_params.options.set("loop_count", v);
+        }
         streams.push(StreamInfo {
             index: gi as u32,
             time_base,
@@ -996,6 +1049,11 @@ fn encoder_params(
         params.options = params
             .options
             .set("threads", opts.execution_context().threads.to_string());
+    }
+    if declares("loop_count")
+        && let Some(v) = opts.loop_option(codec_id, None)
+    {
+        params.options = params.options.set("loop_count", v);
     }
     for (k, v) in &opts.options {
         params.options = params.options.set(k.clone(), v.clone());

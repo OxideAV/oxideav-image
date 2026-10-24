@@ -45,6 +45,32 @@ impl ImageFile {
         &self.metadata
     }
 
+    /// The animation's loop count as the container states it (`0` =
+    /// loop forever), from the demuxer's `("loop_count", n)` metadata
+    /// pair (GIF NETSCAPE2.0 / ANIMEXTS1.0 *Looping* sub-block, APNG
+    /// `acTL` `num_plays`, WebP `ANIM` Loop Count, JPEG XL `num_loops`);
+    /// `None` when the file states none (a GIF without a looping block
+    /// plays once).
+    ///
+    /// The count is the number of plays, as `Imagick::getImageIterations`
+    /// reports it: APNG `num_plays`, WebP Loop Count (RFC 9649 §2.7.2:
+    /// "Loop Count - 1" repetitions) and JPEG XL `num_loops` pass
+    /// through; a GIF's NETSCAPE2.0 field counts the repeats *after* the
+    /// first pass (`docs/image/gif/netscape2.0-loop-extension.md`), so
+    /// `n` reads as `n + 1` plays (`0` stays forever).
+    pub fn loop_count(&self) -> Option<u32> {
+        let raw: u32 = self
+            .metadata
+            .iter()
+            .find(|(k, _)| k == "loop_count")
+            .and_then(|(_, v)| v.trim().parse().ok())?;
+        Some(if self.container == "gif" && raw > 0 {
+            raw.saturating_add(1)
+        } else {
+            raw
+        })
+    }
+
     /// The file's metadata blobs: the stream-level blobs of the stream
     /// the primary picture came from (what the demuxer put on that
     /// stream's `CodecParameters` — the ICC profile, Exif, XMP of the
@@ -704,7 +730,12 @@ fn drain(
                 }
                 relabel(shared, label);
                 let index = images.len();
-                let mut img = Image::from_video_frame_shared(vf, shared.clone())?.with_index(index);
+                // A decoded picture is the whole canvas as displayed (the
+                // format crates composite their animations): drawn onto a
+                // canvas it replaces what was there.
+                let mut img = Image::from_video_frame_shared(vf, shared.clone())?
+                    .with_index(index)
+                    .with_blend(crate::layer::Blend::Source);
                 crate::adapt::adapt(&mut img, stream);
                 // The stream level was filtered before decoding; only
                 // the frame's own blobs are left to check.
@@ -784,12 +815,21 @@ fn resolve_delays(images: &mut [Image], streams: usize) {
             let tb = images[i].time_base();
             let (pts, dur) = images[i].raw_timing();
             let next_pts = idx.get(k + 1).and_then(|&j| images[j].raw_timing().0);
-            // A non-positive duration says nothing (stills are often
-            // stamped 0); fall through to the pts gap.
-            let ticks = dur.filter(|d| *d > 0).or_else(|| match (pts, next_pts) {
-                (Some(a), Some(b)) if b > a => Some(b - a),
+            let gap = match (pts, next_pts) {
+                (Some(a), Some(b)) if b >= a => Some(b - a),
                 _ => None,
-            });
+            };
+            // A positive duration is the delay. A zero one is a real
+            // "show the next picture at once" (GIF89a §23.c.vii Delay
+            // Time 0, APNG `delay_num` 0) when the timestamps agree (the
+            // next picture starts at the same tick, or there is none);
+            // a zero contradicted by a later timestamp says nothing and
+            // the gap wins.
+            let ticks = match dur {
+                Some(d) if d > 0 => Some(d),
+                Some(0) if gap.is_none_or(|g| g == 0) => Some(0),
+                _ => gap.filter(|g| *g > 0),
+            };
             let delay = ticks.and_then(|t| ticks_to_duration(t, tb)).or(prev);
             images[i].set_delay(delay);
             prev = delay;

@@ -46,16 +46,21 @@ mod adapt;
 mod error;
 mod image;
 mod ladder;
+mod layer;
+pub mod layers;
 mod open;
 mod save;
 
 #[cfg(test)]
 mod fixture;
 #[cfg(test)]
+mod layer_tests;
+#[cfg(test)]
 mod tests;
 
 pub use error::{Error, ImageError, Result};
 pub use image::Image;
+pub use layer::{Blend, Dispose, Page};
 pub use open::{
     ImageFile, OpenOptions, decode_bytes, decode_bytes_with, decode_reader, decode_vec,
     decode_vec_with, open, open_with,

@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - edition 2024, MSRV 1.95
 
+### Added
+
+- **Layer record on every `Image`** (`Page`, `Dispose`, `Blend`, all
+  `#[non_exhaustive]`): `page` / `with_page` / `with_offset` /
+  `offset` / `canvas_size` / `is_full_canvas`, `dispose` /
+  `with_dispose`, `blend` / `with_blend`, `ticks_per_second` /
+  `delay_ticks` / `with_delay_ticks`. Decoded pictures are full
+  canvases with `Blend::Source`. `ImageFile::loop_count()` (plays,
+  `0` = forever; a GIF's NETSCAPE2.0 repeat count reads `n + 1`) and
+  `SaveOptions::with_loop_count(plays)` (the encoder's and the muxer
+  stream's `loop_count` option, in each format's unit).
+- **`layers` module**: `coalesce`, `apply_disposal`, `compare_any` /
+  `deconstruct`, `compare_clear`, `compare_overlay`, `optimize`,
+  `optimize_frame`, `optimize_plus`, `optimize_transparency`,
+  `remove_dups`, `remove_zero`, `flatten`, `mosaic`, `merge`,
+  `trim_bounds`, `composite_layers`, `layers(frames, LayerMethod, ..)`,
+  `LayerOptions` (background). Geometry, disposal and pixels match
+  `magick` 7.1.2 (black box) on 519 generated animations and 18 GIFs;
+  the deliberate departures are listed in the README (*Layers*).
+- `encode_frames` writes a layered list (sub-rectangle frames or
+  frames disposing their rectangle) coalesced, as one animation at the
+  canvas size, instead of one stream per frame geometry.
+
+### Fixed
+
+- A multi-picture encode picks its layout from every picture's
+  transparency, not the first one's: an animation whose first frame is
+  opaque no longer loses the alpha of later frames to an `Rgb24` rung.
+- A zero packet duration is a zero delay when the timestamps agree
+  (GIF Delay Time 0, APNG `delay_num` 0) instead of repeating the
+  previous delay.
+
 ## [0.0.5](https://github.com/OxideAV/oxideav-image/compare/v0.0.4...v0.0.5) - 2026-10-21
 
 ### Other

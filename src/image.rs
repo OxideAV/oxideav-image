@@ -11,6 +11,7 @@ use oxideav_core::{
 use oxideav_pixfmt::{ConvertContext, ConvertOptions, FrameInfo, convert_with, supports_direct};
 
 use crate::error::{Error, Result};
+use crate::layer::{Blend, Dispose, Layer, Page};
 
 /// A decoded picture: a framework [`VideoFrame`] in its native layout
 /// plus the [`CodecParameters`] that describe it (dimensions, pixel
@@ -53,6 +54,9 @@ pub struct Image {
     /// The stream's `start_time`, subtracted from `pts` for
     /// [`timestamp`](Self::timestamp).
     start: i64,
+    /// Page geometry, disposal, blending, delay ticks (see
+    /// [`crate::layers`]).
+    layer: Layer,
 }
 
 impl Image {
@@ -104,6 +108,7 @@ impl Image {
             duration: None,
             time_base: TimeBase::MILLIS,
             start: 0,
+            layer: Layer::default(),
         })
     }
 
@@ -149,6 +154,7 @@ impl Image {
             duration: None,
             time_base: TimeBase::MILLIS,
             start: 0,
+            layer: Layer::default(),
         })
     }
 
@@ -648,6 +654,7 @@ impl Image {
             duration: self.duration,
             time_base: self.time_base,
             start: self.start,
+            layer: self.layer,
         }
     }
 
@@ -655,6 +662,170 @@ impl Image {
     pub fn with_delay(mut self, delay: Option<Duration>) -> Self {
         self.delay = delay;
         self
+    }
+
+    // ---- layer record ----------------------------------------------------
+
+    /// The picture's page: the animation's virtual canvas and the
+    /// picture's offset on it, as recorded (`0×0+0+0` when never set —
+    /// the picture is its own canvas). See [`canvas_size`](Self::canvas_size)
+    /// for the effective canvas.
+    pub fn page(&self) -> Page {
+        self.layer.page
+    }
+
+    /// Set the page (canvas size and offset).
+    pub fn set_page(&mut self, page: Page) {
+        self.layer.page = page;
+    }
+
+    /// [`set_page`](Self::set_page), builder style.
+    pub fn with_page(mut self, page: Page) -> Self {
+        self.layer.page = page;
+        self
+    }
+
+    /// Move the picture to `(x, y)` on its canvas, keeping the canvas
+    /// size.
+    pub fn with_offset(mut self, x: i32, y: i32) -> Self {
+        self.layer.page = self.layer.page.with_offset(x, y);
+        self
+    }
+
+    /// The picture's offset on its canvas (`(0, 0)` when never set).
+    pub fn offset(&self) -> (i32, i32) {
+        (self.layer.page.x, self.layer.page.y)
+    }
+
+    /// The effective canvas: the page's size, or the picture's own
+    /// width / height for a side the page leaves at `0`.
+    pub fn canvas_size(&self) -> (u32, u32) {
+        let p = self.layer.page;
+        (
+            if p.width == 0 { self.width() } else { p.width },
+            if p.height == 0 {
+                self.height()
+            } else {
+                p.height
+            },
+        )
+    }
+
+    /// `true` when the picture covers its whole canvas at `+0+0` — what
+    /// every decoded frame is, and what a coalesced frame is.
+    pub fn is_full_canvas(&self) -> bool {
+        self.offset() == (0, 0) && self.canvas_size() == (self.width(), self.height())
+    }
+
+    /// What happens to the picture's rectangle after its delay.
+    pub fn dispose(&self) -> Dispose {
+        self.layer.dispose
+    }
+
+    /// Set the disposal.
+    pub fn set_dispose(&mut self, dispose: Dispose) {
+        self.layer.dispose = dispose;
+    }
+
+    /// [`set_dispose`](Self::set_dispose), builder style.
+    pub fn with_dispose(mut self, dispose: Dispose) -> Self {
+        self.layer.dispose = dispose;
+        self
+    }
+
+    /// How the picture is combined with the canvas.
+    pub fn blend(&self) -> Blend {
+        self.layer.blend
+    }
+
+    /// Set the blending.
+    pub fn set_blend(&mut self, blend: Blend) {
+        self.layer.blend = blend;
+    }
+
+    /// [`set_blend`](Self::set_blend), builder style.
+    pub fn with_blend(mut self, blend: Blend) -> Self {
+        self.layer.blend = blend;
+        self
+    }
+
+    /// The tick rate of [`delay_ticks`](Self::delay_ticks): the rate set
+    /// by [`with_delay_ticks`](Self::with_delay_ticks), else the stream
+    /// time base when it is a whole number of ticks per second (a GIF's
+    /// 100, a WebP's 1000), else 100 — the GIF centisecond every
+    /// animation tool counts in.
+    pub fn ticks_per_second(&self) -> u32 {
+        if let Some(t) = self.layer.ticks_per_second {
+            return t;
+        }
+        let (num, den) = (self.time_base.num(), self.time_base.den());
+        if self.pts.is_some() && num > 0 && den > 0 && den % num == 0 {
+            u32::try_from(den / num).unwrap_or(100)
+        } else {
+            100
+        }
+    }
+
+    /// The delay in [`ticks_per_second`](Self::ticks_per_second) ticks,
+    /// rounded to nearest (`0` without a delay).
+    pub fn delay_ticks(&self) -> u64 {
+        let tps = u128::from(self.ticks_per_second());
+        let nanos = self.delay.map_or(0, |d| d.as_nanos());
+        u64::try_from((nanos * tps + 500_000_000) / 1_000_000_000).unwrap_or(u64::MAX)
+    }
+
+    /// Set the delay to `ticks` of `1 / ticks_per_second` s and remember
+    /// the rate (`ticks_per_second = 0` is taken as 100).
+    pub fn with_delay_ticks(mut self, ticks: u64, ticks_per_second: u32) -> Self {
+        let tps = if ticks_per_second == 0 {
+            100
+        } else {
+            ticks_per_second
+        };
+        let nanos = u128::from(ticks) * 1_000_000_000 / u128::from(tps);
+        self.delay = Some(Duration::from_nanos(
+            u64::try_from(nanos).unwrap_or(u64::MAX),
+        ));
+        self.layer.ticks_per_second = Some(tps);
+        self
+    }
+
+    /// A packed picture of `format` built from `data`, carrying this
+    /// picture's timing, blobs, layer record, stream parameters and
+    /// colour signal (the palette records are not carried: the layer
+    /// operations hand out RGBA).
+    pub(crate) fn with_pixels(
+        &self,
+        width: u32,
+        height: u32,
+        format: PixelFormat,
+        data: Vec<u8>,
+    ) -> Result<Image> {
+        let row = packed_row_bytes(format, width)
+            .ok_or_else(|| Error::unsupported(format!("{format:?} is not a packed layout")))?;
+        if width == 0 || height == 0 || data.len() != row * height as usize {
+            return Err(Error::invalid(format!(
+                "{} bytes for a {width}x{height} {format:?} picture",
+                data.len()
+            )));
+        }
+        let mut params = (*self.params).clone();
+        params.width = Some(width);
+        params.height = Some(height);
+        params.pixel_format = Some(format);
+        params.media_type = MediaType::Video;
+        let mut frame = VideoFrame {
+            pts: self.frame.pts,
+            planes: vec![VideoPlane { stride: row, data }],
+        };
+        if let Some(sig) = self.frame.color_signal() {
+            frame.set_color_signal(sig);
+        }
+        Ok(Image {
+            frame,
+            params: Arc::new(params),
+            ..self.clone_timing()
+        })
     }
 
     /// Position of this picture in the file it came from (0 for stills).
