@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-image/compare/v0.0.5...v0.0.6) - 2026-10-25
+
+### Other
+
+- Label pictures from the watched decoder report (Decoder::output_params), not a per-picture query
+- Multi-frame layer model: page / dispose / blend / tick-rate record on Image, loop counts both ways, and the layers module (coalesce, compare-any/clear/overlay, optimize / optimize-frame / optimize-plus / optimize-transparency, remove-dups / remove-zero, flatten / mosaic / merge / trim-bounds, composite) pinned against magick 7.1.2 as a black box; layered lists are written coalesced
+- edition 2024, MSRV 1.95
+
 - edition 2024, MSRV 1.95
 
 ### Added
