@@ -56,6 +56,8 @@ mod fixture;
 #[cfg(test)]
 mod layer_tests;
 #[cfg(test)]
+mod params_tests;
+#[cfg(test)]
 mod tests;
 
 pub use error::{Error, ImageError, Result};

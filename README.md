@@ -94,14 +94,18 @@ source has none.
   back in packet order; `Image::stream()` says which stream each came
   from (a HEIF with a primary item and a sequence track yields the
   still from stream 0 and the track's frames from stream 1). **The
-  decoder's word on the layout wins:** a picture is labelled with
-  `Decoder::output_pixel_format()` when the decoder reports one (a
-  hardware decoder's negotiated layout, a codec that reads its
-  configuration record), else with the stream's `pixel_format`; the
-  gateway never reports a layout the decoder did not emit, and a
-  stream with no label opens when its decoder knows the layout. The
-  relabelled parameters are shared by the stream's pictures as usual
-  (`Image::params().pixel_format` says what the picture is).
+  decoder's word wins:** frames carry no format fields, so a picture
+  is described by its stream's parameters with the decoder's report
+  (`Decoder::output_params()`: layout, emitted size, colour signal —
+  a hardware decoder's negotiated layout, a codec that reads its
+  configuration record) merged over the container's. The report is
+  read before the first picture and again only when the decoder's
+  `output_params_generation()` moves (an `OutputParamsWatch` per
+  stream), so a mid-stream change relabels the pictures from that one
+  on. The gateway never reports a layout the decoder did not emit, and
+  a stream with no label opens when its decoder knows the layout. The
+  merged parameters are shared by the stream's pictures of one shape
+  (`Image::params()` says what the picture is).
 - **Saving:** the format name or extension resolves to a container with
   a muxer. The payload codec is the container's default: the codec of
   the same name (png, bmp, tiff, heif, …) or the few that differ (`jpeg`

@@ -11,6 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Pictures are labelled from the stream parameters merged with the
+  decoder's full report (oxideav-core 0.1.42 `Decoder::output_params`:
+  layout, emitted width / height, colour signal) through one
+  `OutputParamsWatch` per stream — primed before the first picture,
+  re-read only when `output_params_generation` moves — instead of
+  asking `output_pixel_format()` on every picture; a mid-stream change
+  relabels the pictures from that one on (earlier pictures keep their
+  parameter set). The picture budget counts the decoder-reported size.
+
 - **Layer record on every `Image`** (`Page`, `Dispose`, `Blend`, all
   `#[non_exhaustive]`): `page` / `with_page` / `with_offset` /
   `offset` / `canvas_size` / `is_full_canvas`, `dispose` /

@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use oxideav_core::{
-    BlobKind, CodecParameters, Decoder, ExecutionContext, Frame, MetadataBlob, PixelFormat,
+    BlobKind, CodecParameters, Decoder, ExecutionContext, Frame, MetadataBlob, OutputParamsWatch,
     ReadSeek, RuntimeContext, StreamInfo,
 };
 
@@ -558,10 +558,20 @@ pub fn decode_reader(
     }
 
     // The pictures of a stream share its parameters (one copy of the
-    // stream's blobs, however many pages or frames). A decoder that
-    // reports its own output layout relabels its stream's copy.
+    // stream's blobs, however many pages or frames). What a decoder
+    // reports about its output (`Decoder::output_params`: layout,
+    // emitted size, colour signal) is merged over its stream's copy —
+    // before the first picture, and again whenever the decoder signals
+    // a change; frames carry no format fields of their own.
     let mut shared: Vec<Arc<CodecParameters>> =
         streams.iter().map(|s| Arc::new(s.params.clone())).collect();
+    let mut decoded: Vec<DecodedParams> = streams
+        .iter()
+        .map(|s| DecodedParams {
+            params: s.params.clone(),
+            watch: OutputParamsWatch::new(),
+        })
+        .collect();
     // One decoder per video stream; other streams are skipped.
     let budget = opts.max_pixels.unwrap_or(u64::MAX);
     let execution = opts.execution_context();
@@ -599,6 +609,13 @@ pub fn decode_reader(
         };
         decoders.push(dec);
     }
+    for ((dec, d), sh) in decoders.iter().zip(&mut decoded).zip(&mut shared) {
+        if let Some(dec) = dec
+            && d.watch.prime(&**dec, &mut d.params)
+        {
+            *sh = Arc::new(d.params.clone());
+        }
+    }
     if decoders.iter().all(Option::is_none) {
         return Err(Error::NoImage(format!(
             "container '{container}' has no video stream with a registered decoder"
@@ -626,7 +643,7 @@ pub fn decode_reader(
                     dec.send_packet(&pkt)?;
                     drain(
                         dec.as_mut(),
-                        (&streams[idx], &mut shared[idx]),
+                        (&streams[idx], &mut shared[idx], &mut decoded[idx]),
                         idx,
                         &mut timing[idx],
                         &mut images,
@@ -642,7 +659,7 @@ pub fn decode_reader(
                         let _ = dec.flush();
                         drain(
                             dec.as_mut(),
-                            (&streams[i], &mut shared[i]),
+                            (&streams[i], &mut shared[i], &mut decoded[i]),
                             i,
                             &mut timing[i],
                             &mut images,
@@ -671,11 +688,18 @@ pub fn decode_reader(
     })
 }
 
+/// A stream's parameters with its decoder's report merged in, and the
+/// watch that keeps them current.
+struct DecodedParams {
+    params: CodecParameters,
+    watch: OutputParamsWatch,
+}
+
 /// Pull every ready frame out of a decoder.
 #[allow(clippy::too_many_arguments)]
 fn drain(
     dec: &mut dyn Decoder,
-    (info, shared): (&StreamInfo, &mut Arc<CodecParameters>),
+    (info, shared, decoded): (&StreamInfo, &mut Arc<CodecParameters>, &mut DecodedParams),
     stream_index: usize,
     timing: &mut VecDeque<(Option<i64>, Option<i64>)>,
     images: &mut Vec<Image>,
@@ -690,7 +714,17 @@ fn drain(
         }
         match dec.receive_frame() {
             Ok(Frame::Video(vf)) => {
-                let px = pixels_of(stream);
+                // The parameters describing this picture: the decoder's
+                // report (read on the first picture and whenever its
+                // generation moves — one integer compare otherwise)
+                // over the stream's. The gateway never labels a picture
+                // with a layout the decoder did not emit. Pictures
+                // already built keep the parameters they were built
+                // with (copy on write).
+                if decoded.watch.observe(dec, &mut decoded.params) {
+                    *shared = Arc::new(decoded.params.clone());
+                }
+                let px = pixels_of(shared);
                 if spent.saturating_add(px) > budget {
                     return Err(Error::limit(format!(
                         "picture {} would bring the decoded total to {} pixels, over the \
@@ -711,24 +745,18 @@ fn drain(
                     Some((p, d)) => (p.or(vf.pts), d),
                     None => (vf.pts, None),
                 };
-                // The layout the picture is reported in: the decoder's
-                // own word (`Decoder::output_pixel_format`) when it has
-                // one — the gateway never labels a picture with a layout
-                // the decoder did not emit — else the stream's. Every
-                // image demuxer declares its native layout on the stream
-                // (IMAGE_CRATE_API fleet-sweep ruling), so neither
-                // knowing it is a defect, not something to guess from
-                // the plane count (Rgba vs Bgra vs Yuv444P are
-                // indistinguishable by geometry).
-                let label = dec.output_pixel_format().or(stream.pixel_format);
-                if label.is_none() {
+                // Every image demuxer declares its native layout on the
+                // stream (IMAGE_CRATE_API fleet-sweep ruling), so neither
+                // the stream nor the decoder knowing it is a defect, not
+                // something to guess from the plane count (Rgba vs Bgra
+                // vs Yuv444P are indistinguishable by geometry).
+                if shared.pixel_format.is_none() {
                     return Err(Error::invalid(format!(
                         "stream of codec '{}' declares no pixel format and its decoder \
                          reports none",
                         stream.codec_id
                     )));
                 }
-                relabel(shared, label);
                 let index = images.len();
                 // A decoded picture is the whole canvas as displayed (the
                 // format crates composite their animations): drawn onto a
@@ -755,17 +783,6 @@ fn drain(
             Err(oxideav_core::Error::NeedMore) | Err(oxideav_core::Error::Eof) => return Ok(()),
             Err(e) => return Err(e.into()),
         }
-    }
-}
-
-/// Point a stream's shared parameters at a copy labelled `label` when
-/// they say otherwise (copy on write: the pictures already built keep
-/// the parameters they were built with).
-fn relabel(shared: &mut Arc<CodecParameters>, label: Option<PixelFormat>) {
-    if shared.pixel_format != label {
-        let mut p = (**shared).clone();
-        p.pixel_format = label;
-        *shared = Arc::new(p);
     }
 }
 
