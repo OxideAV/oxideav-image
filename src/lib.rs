@@ -56,6 +56,8 @@ mod fixture;
 #[cfg(test)]
 mod layer_tests;
 #[cfg(test)]
+mod meta_tests;
+#[cfg(test)]
 mod params_tests;
 #[cfg(test)]
 mod tests;
@@ -68,8 +70,9 @@ pub use open::{
     decode_vec_with, open, open_with,
 };
 pub use save::{
-    DEFAULT_DELAY, EncodeTarget, FormatSupport, MetadataSupport, SaveOptions, can_encode, can_open,
-    codec_only_formats, encode, encode_frames, encoder_options, resolve_target, save, support,
+    DEFAULT_DELAY, EncodeTarget, Encoded, FormatSupport, MetadataSupport, SaveOptions, can_encode,
+    can_open, codec_only_formats, encode, encode_detailed, encode_frames, encoder_options,
+    resolve_target, save, save_detailed, support,
 };
 
 /// Re-exported for convenience: the framework's pixel layouts and colour

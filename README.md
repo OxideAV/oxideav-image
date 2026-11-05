@@ -22,7 +22,7 @@ workspace, which is what lets this crate publish on its own.
 ## Usage
 
 ```rust,ignore
-use oxideav_image::{open, save, encode, encode_frames, Image, OpenOptions, SaveOptions};
+use oxideav_image::{open, save, encode, encode_frames, encode_detailed, Image, OpenOptions, SaveOptions};
 
 let mut ctx = oxideav_core::RuntimeContext::new();
 oxideav_meta::register_all(&mut ctx);          // or register the few crates you need
@@ -44,6 +44,8 @@ let apng = encode_frames(&ctx, file.frames(), "png", &SaveOptions::default())?;
 
 if let Some(icc) = img.icc() { /* hand the profile to colour management */ }
 let bare = encode(&ctx, img, "jpg", &SaveOptions::new().without_metadata())?;
+let done = encode_detailed(&ctx, file.frames(), "png", &SaveOptions::default())?;
+println!("kept {:?}, no field for {:?}", done.metadata_written(), done.metadata_dropped());
 let indexed = Image::from_indexed(2, 1, vec![0, 1], &[[255, 0, 0, 255], [0, 0, 0, 0]])?;
 assert_eq!(indexed.to_rgba8()?[7], 0);           // palette alpha reaches the RGBA view
 ```
@@ -55,14 +57,15 @@ assert_eq!(indexed.to_rgba8()?[7], 0);           // palette alpha reaches the RG
 | `open(&ctx, path)` / `open_with(.., &OpenOptions)` | Probe the file (extension as hint), open its demuxer, decode every video stream → `ImageFile`. |
 | `decode_bytes(&ctx, &[u8])` / `decode_vec(&ctx, Vec<u8>)` / `decode_reader(&ctx, Box<dyn ReadSeek>, &OpenOptions)` | Same from memory (`decode_vec` without a copy) or any seekable reader. `*_with` variants take `OpenOptions`. |
 | `ImageFile` | `container()`, `metadata()`, `loop_count()` (plays, `0` = forever; see *Layers*), `primary()`, `frames()`, `frames_mut()`, `iter()`, `into_frames()`, `into_primary()`, `len()`; `IntoIterator` for `ImageFile` and `&ImageFile`. Metadata: `blobs()`, `stream_blobs(i)`, `blob(&kind)`, `icc()`, `exif()`, `xmp()`, `iptc()`, `has_metadata()`, `retain_blobs(f)`, `strip_metadata()` (see *Metadata*). |
-| `Image` | A `VideoFrame` + `CodecParameters`: `width` / `height` / `format` / `color_signal` / `palette`; `palette_alpha`, `palette_rgba(i)`, `palette_entries`, `has_palette_alpha`, `has_alpha` (see *Palette alpha*), `is_opaque` / `has_transparency` (the alpha samples, see *Pixel-format ladder*); `delay`, `timestamp`, `stream`, `index`, `raw_timing`, `time_base`; `to_format(PixelFormat)`, `to_gray8`, `to_rgb8`, `to_rgba8`, `to_gray16`, `to_rgb16`, `to_rgba16`, `to_packed`, `as_packed`, `into_raw`, `crop`, `with_delay`, `with_color_signal`, `with_palette_rgba` / `with_palette` / `with_palette_alpha`, `frame`, `params`, `into_video_frame`. Layer record (see *Layers*): `page` / `set_page` / `with_page` / `with_offset` / `offset` / `canvas_size` / `is_full_canvas`, `dispose` / `with_dispose`, `blend` / `with_blend`, `ticks_per_second` / `delay_ticks` / `with_delay_ticks`. Metadata: `frame_blobs`, `stream_blobs`, `blobs`, `blob(&kind)`, `blobs_of(&kind)`, `icc`, `exif`, `xmp`, `iptc`, `has_metadata`, `with_blob(s)` / `set_blobs` / `push_blob` / `with_stream_blobs` / `take_blobs` / `retain_blobs` / `strip_metadata` / `without_metadata`. |
+| `Image` | A `VideoFrame` + `CodecParameters`: `width` / `height` / `format` / `color_signal` / `palette`; `palette_alpha`, `palette_rgba(i)`, `palette_entries`, `has_palette_alpha`, `has_alpha` (see *Palette alpha*), `is_opaque` / `has_transparency` (the alpha samples, see *Pixel-format ladder*); `delay`, `timestamp`, `stream`, `index`, `raw_timing`, `time_base`; `to_format(PixelFormat)`, `to_gray8`, `to_rgb8`, `to_rgba8`, `to_gray16`, `to_rgb16`, `to_rgba16`, `to_packed`, `as_packed`, `into_raw`, `crop`, `with_delay`, `with_color_signal`, `with_palette_rgba` / `with_palette` / `with_palette_alpha`, `frame`, `params`, `into_video_frame`. Layer record (see *Layers*): `page` / `set_page` / `with_page` / `with_offset` / `offset` / `canvas_size` / `is_full_canvas`, `dispose` / `with_dispose`, `blend` / `with_blend`, `ticks_per_second` / `delay_ticks` / `with_delay_ticks`. Container string metadata (see *Metadata*): `container_metadata` / `container_metadata_value(key)` / `set_container_metadata` / `with_container_metadata`, `loop_count` / `with_loop_count` / `set_loop_count`. Metadata: `frame_blobs`, `stream_blobs`, `blobs`, `blob(&kind)`, `blobs_of(&kind)`, `icc`, `exif`, `xmp`, `iptc`, `has_metadata`, `with_blob(s)` / `set_blobs` / `push_blob` / `with_stream_blobs` / `take_blobs` / `retain_blobs` / `strip_metadata` / `without_metadata`. |
 | `Image::from_rgb8` / `from_rgba8` / `from_indexed` / `from_raw` / `from_planes` / `from_video_frame` | Fallible constructors: geometry, plane count, stride and length are validated; `from_indexed` takes RGBA palette entries. |
 | `encode(&ctx, &Image, "png", &SaveOptions)` / `encode_frames(&ctx, &[Image], ..)` / `save(&ctx, &Image, path, ..)` | Encoder + muxer by container name or extension; see *Format resolution*, *Pixel-format ladder* and *Geometry*. |
+| `encode_detailed(&ctx, &[Image], format, ..)` / `save_detailed(&ctx, &[Image], path, ..)` → `Encoded` | The same encode with its report: `bytes()` / `into_bytes()`, `pixel_format()` (the layout the encoder was handed), `metadata_written()` / `metadata_dropped()` / `metadata_complete()` (the container string-metadata keys the target stored / had no field for; see *Metadata*). |
 | `encoder_options(&ctx, format, &SaveOptions)` | The option schema of the encoder `encode` would use (names for `SaveOptions::with_option`). |
 | `support(&ctx, format)` → `FormatSupport` / `can_open(&ctx, format)` / `codec_only_formats(&ctx, names)` | The registry's answer for a name or extension without touching a file: `container()`, `has_demuxer()` / `has_muxer()` / `has_decoder()` / `has_encoder()`, `can_open()` / `can_save()`, `is_codec_only()` / `is_unknown()`. |
 | `can_encode(&ctx, format)` / `resolve_target(&ctx, format, &SaveOptions)` | "Will this save?" before decoding: `can_encode` is a yes / no; `resolve_target` returns the `EncodeTarget` (`format()`, `container()` / `is_codec_only()`, `codec()`, `accepted_pixel_formats()`, `options()`, `ladder(src, &opts)` / `ladder_for(&image, &opts)`, `metadata_support()`) or the error `encode` would return before looking at a picture. |
-| `OpenOptions` | `execution` (`with_execution_context(ctx)` / `with_threads(n)` / `serial()`, see *Execution budget*), `max_frames`, `ext_hint`, `decoder_options`, `max_pixels`, `allow_containers` / `deny_containers` / `allow_codecs` / `deny_codecs`, `strip_metadata` / `strip_blobs` (`without_metadata()`, `with_stripped_blobs(kinds)`). |
-| `SaveOptions` | `execution` (`with_execution_context(ctx)` / `with_threads(n)` / `serial()`), `loop_count` (`with_loop_count(plays)`, see *Layers*), `quality`, `pixel_format`, `codec`, `options`, `time_base`, `default_delay`, `blobs` (`with_blob(s)`), `strip_metadata` / `strip_blobs` (`without_metadata()`, `with_stripped_blobs(kinds)`). |
+| `OpenOptions` | `execution` (`with_execution_context(ctx)` / `with_threads(n)` / `serial()`, see *Execution budget*), `max_frames`, `ext_hint`, `decoder_options`, `max_pixels`, `allow_containers` / `deny_containers` / `allow_codecs` / `deny_codecs`, `strip_metadata` / `strip_blobs` (`without_metadata()`, `with_stripped_blobs(kinds)`), `pixel_format` (`with_pixel_format(f)`: convert every picture after decoding; default keeps the decoder's layout). |
+| `SaveOptions` | `execution` (`with_execution_context(ctx)` / `with_threads(n)` / `serial()`), `loop_count` (`with_loop_count(plays)`, see *Layers*), `quality`, `pixel_format`, `codec`, `options`, `time_base`, `default_delay`, `blobs` (`with_blob(s)`), `strip_metadata` / `strip_blobs` (`without_metadata()`, `with_stripped_blobs(kinds)`), `container_metadata` (`with_container_metadata(pairs)` / `with_container_metadata_entry(k, v)`), `strip_metadata_keys` (`with_stripped_metadata_keys(keys)`), `strict_metadata` (`with_strict_metadata(true)`). |
 | `Page` / `Dispose` / `Blend` | The per-frame layer record (`#[non_exhaustive]`; `Page::new(w, h).with_offset(x, y)`). |
 | `layers::*` | Format-independent layer operations: `coalesce`, `apply_disposal`, `compare_any` / `deconstruct`, `compare_clear`, `compare_overlay`, `optimize`, `optimize_frame`, `optimize_plus`, `optimize_transparency`, `remove_dups`, `remove_zero`, `flatten`, `mosaic`, `merge`, `trim_bounds`, `composite_layers`; `_with` variants take `LayerOptions` (background); `layers(frames, LayerMethod, &opts)` dispatches. See *Layers*. |
 | `BlobKind` / `MetadataBlob` / `MetadataSupport` | The framework's blob types, re-exported; `MetadataSupport` is what `EncodeTarget::metadata_support()` answers. |
@@ -156,7 +159,13 @@ can reach from it. The order is a rule, not a table:
    after CMYK; grey **last** — only when the source is grey (then it
    comes first, followed by RGB, which is exact for grey, then YCbCr,
    then CMYK) or when nothing colour was accepted;
-2. within a model, the source's bit tier first;
+2. within a model, the source's precision tier first, then the wider
+   tiers closest first (a widening is exact), then the narrower ones
+   closest first — the tiers are the 15-bit words (`Rgb555*` /
+   `Bgr555*`), the 16-bit words (`Rgb565*` / `Bgr565*`), eight bits a
+   sample (the padded `Rgbx` / `Bgrx` / `Xrgb` / `Xbgr` included) and
+   deeper: a 24-bit picture reaches a 48-bit layout before a 16-bit
+   word, a `Rgb565` picture an 8-bit layout before a `Rgb555` one;
 3. **transparency** as the pixels have it: a source with something
    transparent (an alpha sample below full, or a palette entry that is
    not opaque — `Image::has_transparency`) keeps alpha-carrying rungs
@@ -197,6 +206,31 @@ opaque three-channel layout of its model, and CMYK is offered only
 after every additive layout — pinned against a JPEG-like declared set
 (full-range and studio YCbCr, grey 8 / 16, RGB, planar GBR, CMYK) in
 the unit tests.
+
+### Native layouts
+
+The gateway never converts on its own. A picture opens in the layout
+its decoder emitted — YCbCr, CMYK, an indexed palette, or one of the
+packed RGB labels of core 0.1.41 (the 16-bit `Rgb555Le` / `Rgb555Be` /
+`Bgr555Le` / `Bgr555Be` / `Rgb565Le` / `Rgb565Be` / `Bgr565Le` /
+`Bgr565Be` words and the padded 32-bit `Rgbx` / `Bgrx` / `Xrgb` /
+`Xbgr` orders) — and stays in it unless the caller asks:
+`OpenOptions::with_pixel_format(f)` converts every picture once after
+decoding, `to_format` / `to_*8` / `to_*16` convert on demand. Every
+single-plane layout with whole bytes per pixel is a raw layout
+(`from_raw`, `as_packed`, `to_packed`, `crop`); padding is not alpha
+(`has_alpha()` is false, `is_opaque()` true).
+
+Saving: an encoder that declares a picture's layout receives it as is
+(`Encoded::pixel_format()` says which layout went in); one that does
+not gets the ladder's best rung pixfmt reaches. The packed RGB labels
+are newer than some `oxideav-pixfmt` releases: the gateway asks pixfmt
+whether it describes such a layout (a direct step to or from `Rgba`)
+before planning any conversion through it, so with a release that
+predates them a word picture still opens, crops, re-encodes natively
+and is handed out raw, while a conversion is `Unsupported` (an encode
+whose encoder declares no reachable layout says so) instead of a fault
+inside pixfmt.
 
 ### Options
 
@@ -288,6 +322,36 @@ encoder's business: `EncodeTarget::metadata_support()` is
 `MetadataSupport::PassThrough` for every target today — the framework
 has no per-kind encoder declaration (`Declared(kinds)` is reserved for
 one) — and the *Survey* below says what each crate carries.
+
+**Container string metadata** (`title`, `comment`, `copyright`,
+`copyright:<lang>`, a format's own keys — the pairs `Demuxer::metadata`
+reports and `ImageFile::metadata()` returns) is not a blob. Every
+opened picture carries its file's pairs (`Image::container_metadata()`,
+one shared copy), so an encode writes them back without the file being
+threaded through: the first picture's pairs, minus
+`SaveOptions::strip_metadata_keys` (all of them under
+`without_metadata()`), with `SaveOptions::container_metadata` on top —
+a pair there replaces every source pair under its key — go to the
+target's muxer through `Muxer::set_metadata` (core 0.1.41) before its
+header. What the target cannot hold is **reported, never silently
+lost**: `encode_detailed` / `save_detailed` return `Encoded`, whose
+`metadata_written()` lists the keys the muxer stores
+(`Muxer::carries_metadata_key`) and `metadata_dropped()` the keys it
+has no field for — every key for a muxer without text (the default
+`set_metadata` answers `Unsupported`) and for a codec-only format (no
+muxer at all). `SaveOptions::with_strict_metadata(true)` turns a
+dropped key into an `Unsupported` error naming it. A muxer refusing
+the pairs for another reason (a value its field cannot hold) fails the
+encode with its error — no other layout of the ladder is tried for
+that. So open → save → open keeps every key the target carries, and
+the report names the rest.
+
+The `loop_count` pair is not text: it is the animation's play count
+(`ImageFile::loop_count()`, normalised to plays), carried by every
+picture as `Image::loop_count()`. A multi-picture encode with no
+`SaveOptions::loop_count` writes the first picture's count in the
+target's unit (see *Layers*); a single picture is a still and writes
+none.
 
 ### Palette alpha
 

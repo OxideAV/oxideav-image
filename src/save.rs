@@ -45,9 +45,10 @@ pub struct SaveOptions {
     /// and every picture's frame record (set an ICC profile, swap the
     /// XMP packet); other kinds pass through untouched.
     pub blobs: Vec<MetadataBlob>,
-    /// Hand no source blob to the encoder — neither the pictures'
-    /// stream-level ones nor their per-picture ones. `blobs` above are
-    /// still written. Default `false`.
+    /// Hand no source metadata to the target — neither the pictures'
+    /// blobs (stream-level and per-picture) nor their container string
+    /// metadata ([`Image::container_metadata`]). `blobs` and
+    /// `container_metadata` below are still written. Default `false`.
     pub strip_metadata: bool,
     /// Source blob kinds withheld from the encoder when
     /// `strip_metadata` is off.
@@ -71,9 +72,81 @@ pub struct SaveOptions {
     /// Loop Count count the plays. A caller-set `loop_count` option
     /// wins.
     pub loop_count: Option<u32>,
+    /// Container string metadata written on top of the first picture's
+    /// own ([`Image::container_metadata`]): a pair here replaces every
+    /// source pair under its key; other source keys pass through. The
+    /// set reaches the muxer through `Muxer::set_metadata` before its
+    /// header; what it carries and what it has no field for is in the
+    /// [`Encoded`] report ([`encode_detailed`]).
+    pub container_metadata: Vec<(String, String)>,
+    /// Source string-metadata keys withheld from the target when
+    /// `strip_metadata` is off.
+    pub strip_metadata_keys: Vec<String>,
+    /// Fail the encode (`Unsupported`, naming the keys) when the target
+    /// cannot carry a string-metadata key it was handed, instead of
+    /// reporting it in [`Encoded::metadata_dropped`]. Default `false`.
+    pub strict_metadata: bool,
 }
 
 impl SaveOptions {
+    /// Add one container string-metadata pair (see the
+    /// `container_metadata` field).
+    pub fn with_container_metadata_entry(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.container_metadata.push((key.into(), value.into()));
+        self
+    }
+
+    /// Replace the container string-metadata pairs set on the options.
+    pub fn with_container_metadata(mut self, pairs: Vec<(String, String)>) -> Self {
+        self.container_metadata = pairs;
+        self
+    }
+
+    /// Withhold these source string-metadata keys from the target.
+    pub fn with_stripped_metadata_keys<I, K>(mut self, keys: I) -> Self
+    where
+        I: IntoIterator<Item = K>,
+        K: Into<String>,
+    {
+        self.strip_metadata_keys = keys.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Fail instead of reporting when the target drops a string-metadata
+    /// key (see the `strict_metadata` field).
+    pub fn with_strict_metadata(mut self, strict: bool) -> Self {
+        self.strict_metadata = strict;
+        self
+    }
+
+    /// The container string metadata handed to the muxer for an encode
+    /// whose first picture is `first`: its pairs minus the `loop_count`
+    /// pair (that one is the animation's play count, written in the
+    /// target's unit through `loop_count`), minus the strip rules,
+    /// minus every key the options set — then the options' pairs.
+    pub(crate) fn text_metadata(&self, first: &Image) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = if self.strip_metadata {
+            Vec::new()
+        } else {
+            first
+                .container_metadata()
+                .iter()
+                .filter(|(k, _)| {
+                    k != LOOP_COUNT_KEY
+                        && !self.strip_metadata_keys.iter().any(|s| s == k)
+                        && !self.container_metadata.iter().any(|(o, _)| o == k)
+                })
+                .cloned()
+                .collect()
+        };
+        out.extend(self.container_metadata.iter().cloned());
+        out
+    }
+
     /// Defaults everywhere.
     pub fn new() -> Self {
         Self::default()
@@ -176,13 +249,14 @@ impl SaveOptions {
         self
     }
 
-    /// Keep (`true`, the default) or withhold every source blob.
+    /// Keep (`true`, the default) or withhold every source blob and
+    /// source string-metadata pair.
     pub fn with_metadata(mut self, keep: bool) -> Self {
         self.strip_metadata = !keep;
         self
     }
 
-    /// Withhold every source blob from the encoder.
+    /// Withhold every source blob and string-metadata pair.
     pub fn without_metadata(self) -> Self {
         self.with_metadata(false)
     }
@@ -253,6 +327,91 @@ pub enum MetadataSupport {
     /// through but will not be embedded. Reserved for a framework
     /// capability declaration — never produced today.
     Declared(Vec<BlobKind>),
+}
+
+/// The demuxer metadata key holding an animation's loop count.
+const LOOP_COUNT_KEY: &str = "loop_count";
+
+/// What [`encode_detailed`] / [`save_detailed`] wrote: the file and how
+/// the request landed.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct Encoded {
+    bytes: Vec<u8>,
+    pixel_format: PixelFormat,
+    metadata_written: Vec<String>,
+    metadata_dropped: Vec<String>,
+}
+
+impl Encoded {
+    /// The encoded file.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// The encoded file, by value.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    /// The layout the encoder was handed (the rung of the ladder that
+    /// was accepted): the pictures' own layout when the encoder declares
+    /// it, else the conversion target.
+    pub fn pixel_format(&self) -> PixelFormat {
+        self.pixel_format
+    }
+
+    /// Container string-metadata keys the muxer stores
+    /// (`Muxer::carries_metadata_key`), in request order, once each.
+    pub fn metadata_written(&self) -> &[String] {
+        &self.metadata_written
+    }
+
+    /// Container string-metadata keys the target has no field for —
+    /// nothing was stored under them (a codec-only format, a muxer that
+    /// carries no text, a fixed-field header without that key) — in
+    /// request order, once each. Never silent: a caller that must not
+    /// lose a key checks this, or sets
+    /// [`SaveOptions::strict_metadata`].
+    pub fn metadata_dropped(&self) -> &[String] {
+        &self.metadata_dropped
+    }
+
+    /// Every container string-metadata key requested was stored.
+    pub fn metadata_complete(&self) -> bool {
+        self.metadata_dropped.is_empty()
+    }
+}
+
+/// Distinct keys of `pairs`, first-appearance order.
+fn distinct_keys(pairs: &[(String, String)]) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    for (k, _) in pairs {
+        if !keys.contains(k) {
+            keys.push(k.clone());
+        }
+    }
+    keys
+}
+
+/// Hand `pairs` to `muxer` (before its header): the keys it stores and
+/// the keys it has no field for. A muxer answering `Unsupported`
+/// carries no text at all; any other refusal is the encode's error.
+fn route_text_metadata(
+    muxer: &mut dyn oxideav_core::Muxer,
+    pairs: &[(String, String)],
+) -> Result<(Vec<String>, Vec<String>)> {
+    let keys = distinct_keys(pairs);
+    if keys.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    match muxer.set_metadata(pairs) {
+        Ok(()) => Ok(keys
+            .into_iter()
+            .partition(|k| muxer.carries_metadata_key(k))),
+        Err(oxideav_core::Error::Unsupported(_)) => Ok((Vec::new(), keys)),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Default delay for a picture without one in a multi-picture encode.
@@ -628,9 +787,42 @@ pub fn encode_frames(
     format: &str,
     opts: &SaveOptions,
 ) -> Result<Vec<u8>> {
+    encode_detailed(ctx, images, format, opts).map(Encoded::into_bytes)
+}
+
+/// [`encode_frames`] with the report of what was written: the layout
+/// the encoder accepted and the container string-metadata keys the
+/// target stored or had no field for ([`Encoded`]).
+///
+/// String metadata: the first picture's
+/// [`container_metadata`](Image::container_metadata) (an opened file's
+/// pairs) with [`SaveOptions::container_metadata`] on top, handed to the
+/// muxer through `Muxer::set_metadata` before its header. Keys the
+/// muxer does not carry — and every key, for a codec-only format — are
+/// listed in [`Encoded::metadata_dropped`] (or fail the encode under
+/// [`SaveOptions::strict_metadata`]). Blobs (ICC / Exif / XMP / …) keep
+/// their own path (README, *Metadata*). A multi-picture encode with no
+/// [`SaveOptions::loop_count`] writes the first picture's
+/// [`loop_count`](Image::loop_count).
+pub fn encode_detailed(
+    ctx: &RuntimeContext,
+    images: &[Image],
+    format: &str,
+    opts: &SaveOptions,
+) -> Result<Encoded> {
     if images.is_empty() {
         return Err(Error::invalid("encode_frames: no image"));
     }
+    // An animation keeps its source's play count unless the caller
+    // chose one.
+    let inherited;
+    let opts = match (opts.loop_count, images[0].loop_count()) {
+        (None, Some(plays)) if images.len() > 1 => {
+            inherited = opts.clone().with_loop_count(plays);
+            &inherited
+        }
+        _ => opts,
+    };
     // A layered list (sub-rectangle frames, or frames that dispose
     // their rectangle) is written as it is displayed: the framework has
     // no per-frame placement record an encoder or muxer could read, so
@@ -663,10 +855,14 @@ pub fn encode_frames(
     let mut first_err: Option<Error> = None;
     let mut same = true;
     let mut attempts: Vec<String> = Vec::new();
+    let text = opts.text_metadata(&images[0]);
     for dst in candidates {
-        match encode_attempt(ctx, images, &groups, &target, &codec_id, dst, opts) {
-            Ok(bytes) => return Ok(bytes),
-            Err(e) => {
+        match encode_attempt(ctx, images, &groups, &target, &codec_id, dst, &text, opts) {
+            Ok(done) => return Ok(done),
+            // The target refused the metadata itself: no other layout
+            // changes that.
+            Err(Attempt::Fatal(e)) => return Err(e),
+            Err(Attempt::Layout(e)) => {
                 let text = e.to_string();
                 if let Some(f) = &first_err {
                     same &= f.to_string() == text;
@@ -740,6 +936,26 @@ pub fn save(
     let bytes = encode(ctx, image, ext, opts)?;
     std::fs::write(path, bytes)?;
     Ok(())
+}
+
+/// [`save`] for one or more pictures, with the [`encode_detailed`]
+/// report; the extension picks the format.
+pub fn save_detailed(
+    ctx: &RuntimeContext,
+    images: &[Image],
+    path: impl AsRef<Path>,
+    opts: &SaveOptions,
+) -> Result<Encoded> {
+    let path = path.as_ref();
+    let ext = path.extension().and_then(|e| e.to_str()).ok_or_else(|| {
+        Error::UnknownFormat(format!(
+            "'{}' has no extension to derive a format from",
+            path.display()
+        ))
+    })?;
+    let done = encode_detailed(ctx, images, ext, opts)?;
+    std::fs::write(path, done.bytes())?;
+    Ok(done)
 }
 
 /// Where the encoded packets go.
@@ -888,8 +1104,30 @@ fn declared_formats(ctx: &RuntimeContext, codec_id: &CodecId) -> Vec<PixelFormat
         .unwrap_or_default()
 }
 
+/// Why an [`encode_attempt`] failed: something the layout may explain
+/// (the next rung is tried), or a refusal no layout changes (the
+/// container string metadata), returned as is.
+enum Attempt {
+    Layout(Error),
+    Fatal(Error),
+}
+
+impl From<Error> for Attempt {
+    fn from(e: Error) -> Self {
+        Attempt::Layout(e)
+    }
+}
+
+impl From<oxideav_core::Error> for Attempt {
+    fn from(e: oxideav_core::Error) -> Self {
+        Attempt::Layout(e.into())
+    }
+}
+
 /// One attempt in a fixed layout: convert every picture, encode each
-/// geometry group on its own encoder, mux into memory.
+/// geometry group on its own encoder, mux into memory with `text` as
+/// the container string metadata.
+#[allow(clippy::too_many_arguments)]
 fn encode_attempt(
     ctx: &RuntimeContext,
     images: &[Image],
@@ -897,8 +1135,22 @@ fn encode_attempt(
     target: &Target,
     codec_id: &CodecId,
     dst: PixelFormat,
+    text: &[(String, String)],
     opts: &SaveOptions,
-) -> Result<Vec<u8>> {
+) -> std::result::Result<Encoded, Attempt> {
+    let strict = |dropped: &[String], what: &str| -> std::result::Result<(), Attempt> {
+        if opts.strict_metadata && !dropped.is_empty() {
+            return Err(Attempt::Fatal(Error::unsupported(format!(
+                "{what} cannot carry container metadata key(s) {} (strict metadata)",
+                dropped.join(", ")
+            ))));
+        }
+        Ok(())
+    };
+    if matches!(target, Target::CodecOnly(_)) {
+        // No muxer: nothing can hold the text — refuse before encoding.
+        strict(&distinct_keys(text), &target.to_string())?;
+    }
     let time_base = opts.time_base.unwrap_or_else(|| match target {
         // The APNG muxer reads `duration` in its 1/100 s delay unit.
         Target::Container { name, .. } if name == "png" || name == "apng" => TimeBase::new(1, 100),
@@ -952,14 +1204,19 @@ fn encode_attempt(
             // `encode_frames` admits one group here.
             let mut packets = per_group.pop().unwrap_or_default();
             if packets.len() != 1 {
-                return Err(Error::unsupported(format!(
+                return Err(Attempt::Layout(Error::unsupported(format!(
                     "codec-only format '{id}' produced {} packets for {} picture(s); \
                      only a single-packet file can be written without a muxer",
                     packets.len(),
                     images.len()
-                )));
+                ))));
             }
-            return Ok(packets.pop().map(|p| p.data).unwrap_or_default());
+            return Ok(Encoded {
+                bytes: packets.pop().map(|p| p.data).unwrap_or_default(),
+                pixel_format: dst,
+                metadata_written: Vec::new(),
+                metadata_dropped: distinct_keys(text),
+            });
         }
     };
 
@@ -999,6 +1256,9 @@ fn encode_attempt(
         .containers
         .open_muxer(container, Box::new(sink.clone()), &streams)
         .map_err(multi)?;
+    let (metadata_written, metadata_dropped) =
+        route_text_metadata(muxer.as_mut(), text).map_err(Attempt::Fatal)?;
+    strict(&metadata_dropped, &format!("container '{container}'"))?;
     muxer.write_header().map_err(multi)?;
     for pkt in &packets {
         muxer.write_packet(pkt).map_err(multi)?;
@@ -1007,11 +1267,16 @@ fn encode_attempt(
     drop(muxer);
     let bytes = sink.into_bytes();
     if bytes.is_empty() {
-        return Err(Error::unsupported(format!(
+        return Err(Attempt::Layout(Error::unsupported(format!(
             "muxer '{container}' wrote no bytes"
-        )));
+        ))));
     }
-    Ok(bytes)
+    Ok(Encoded {
+        bytes,
+        pixel_format: dst,
+        metadata_written,
+        metadata_dropped,
+    })
 }
 
 /// Encoder parameters for one geometry group in layout `dst`

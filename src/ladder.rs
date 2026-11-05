@@ -15,7 +15,45 @@
 //! below, ordered the same way.
 
 use oxideav_core::PixelFormat;
-use oxideav_pixfmt::supports;
+use oxideav_pixfmt::{supports, supports_direct};
+
+/// The packed RGB labels core 0.1.41 added (16-bit words, padded 32-bit
+/// orders). A pixfmt release older than those labels has no descriptor
+/// for them and must not be asked to plan a route through one (its
+/// planner describes both ends first); [`pixfmt_describes`] probes it
+/// through the one query that does not.
+const LATE_LABELS: &[PixelFormat] = &[
+    PixelFormat::Rgb555Le,
+    PixelFormat::Rgb555Be,
+    PixelFormat::Bgr555Le,
+    PixelFormat::Bgr555Be,
+    PixelFormat::Rgb565Le,
+    PixelFormat::Rgb565Be,
+    PixelFormat::Bgr565Le,
+    PixelFormat::Bgr565Be,
+    PixelFormat::Rgbx,
+    PixelFormat::Bgrx,
+    PixelFormat::Xrgb,
+    PixelFormat::Xbgr,
+];
+
+/// True when the linked `oxideav-pixfmt` converts `f` at all. Every
+/// layout pixfmt has carried since before core 0.1.41 qualifies; one of
+/// the later packed RGB labels qualifies when pixfmt has a direct step
+/// between it and `Rgba` (its packed-RGB hub) — a table lookup that
+/// never describes an unknown layout. The gateway asks this before any
+/// other pixfmt query involving `f`, so an older pixfmt answers "not
+/// reachable" instead of tripping over a layout it predates.
+pub(crate) fn pixfmt_describes(f: PixelFormat) -> bool {
+    !LATE_LABELS.contains(&f)
+        || supports_direct(f, PixelFormat::Rgba)
+        || supports_direct(PixelFormat::Rgba, f)
+}
+
+/// `oxideav_pixfmt::supports` behind the [`pixfmt_describes`] guard.
+pub(crate) fn reachable(src: PixelFormat, dst: PixelFormat) -> bool {
+    src == dst || (pixfmt_describes(src) && pixfmt_describes(dst) && supports(src, dst))
+}
 
 /// Colour model of a layout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,6 +110,28 @@ pub(crate) fn is_deep(f: PixelFormat) -> bool {
         .any(|t| name.ends_with(t))
 }
 
+/// Sample precision tier: `0` for the 15-bit RGB words (`Rgb555*` /
+/// `Bgr555*`, five bits a channel), `1` for the 16-bit ones (`Rgb565*` /
+/// `Bgr565*`, six bits of green), `2` for eight bits per sample, `3`
+/// for deeper integer and float layouts. Within a colour model the
+/// source's tier comes first, then the wider tiers closest first (a
+/// widening is exact), then the narrower ones closest first — a 24-bit
+/// picture is never offered a 16-bit word ahead of a 48-bit layout, a
+/// `Rgb565` picture reaches an 8-bit layout before a `Rgb555` one.
+fn precision(f: PixelFormat) -> u8 {
+    if is_deep(f) {
+        return 3;
+    }
+    let name = format!("{f:?}");
+    if name.contains("555") {
+        0
+    } else if name.contains("565") {
+        1
+    } else {
+        2
+    }
+}
+
 /// Chroma fidelity of a YUV layout: 4:4:4 = 3, 4:2:2 / 4:4:0 = 2,
 /// 4:2:0 = 1, 4:1:1 = 0. Non-YUV layouts rank as full colour (3).
 fn fidelity(f: PixelFormat) -> u8 {
@@ -120,8 +180,10 @@ fn rank(
     } else {
         2 * model_distance(family(src), family(f))
     };
-    // Tier: the source's own bit tier first.
-    let tier = u8::from(is_deep(f) != is_deep(src));
+    // Tier: the source's own bit tier first, then wider tiers (a
+    // lossless widening, closest first), then narrower ones.
+    let (st, ct) = (precision(src), precision(f));
+    let tier = if ct >= st { ct - st } else { 2 + (st - ct) };
     // Fidelity: at or below the source by decreasing fidelity, then
     // above it, closest first.
     let (s, c) = (fidelity(src), fidelity(f));
@@ -175,6 +237,18 @@ pub(crate) fn ladder_with_alpha(
     transparent: bool,
     declared: &[PixelFormat],
 ) -> Vec<PixelFormat> {
+    let mut out = Vec::new();
+    for f in ranked(src, transparent, declared) {
+        if !out.contains(&f) && reachable(src, f) {
+            out.push(f);
+        }
+    }
+    out
+}
+
+/// Every candidate of [`ladder_with_alpha`] in rank order, before the
+/// pixfmt reachability filter.
+fn ranked(src: PixelFormat, transparent: bool, declared: &[PixelFormat]) -> Vec<PixelFormat> {
     let mut rungs: Vec<PixelFormat> = if declared.is_empty() {
         RUNGS.to_vec()
     } else {
@@ -185,13 +259,7 @@ pub(crate) fn ladder_with_alpha(
     }
     rungs.sort_by_cached_key(|f| rank(src, transparent, *f));
     rungs.dedup();
-    let mut out = Vec::with_capacity(rungs.len());
-    for f in rungs {
-        if !out.contains(&f) && (f == src || supports(src, f)) {
-            out.push(f);
-        }
-    }
-    out
+    rungs
 }
 
 #[cfg(test)]
@@ -455,6 +523,91 @@ mod tests {
             &[P::Rgb24, P::Rgba]
         );
         assert_eq!(ladder(P::Yuv444P, WEBP_LIKE)[0], P::Yuv420P);
+    }
+
+    /// The twelve packed RGB labels of core 0.1.41.
+    const WORDS: &[P] = &[
+        P::Rgb555Le,
+        P::Rgb555Be,
+        P::Bgr555Le,
+        P::Bgr555Be,
+        P::Rgb565Le,
+        P::Rgb565Be,
+        P::Bgr565Le,
+        P::Bgr565Be,
+        P::Rgbx,
+        P::Bgrx,
+        P::Xrgb,
+        P::Xbgr,
+    ];
+
+    #[test]
+    fn packed_words_and_padded_orders_rank_by_precision() {
+        // Every label is RGB, eight bits or less, no alpha.
+        for &f in WORDS {
+            assert_eq!(family(f), Family::Rgb, "{f:?}");
+            assert!(!is_deep(f), "{f:?}");
+            assert!(!f.has_alpha(), "{f:?}");
+        }
+        assert_eq!(precision(P::Bgr555Be), 0);
+        assert_eq!(precision(P::Rgb565Le), 1);
+        assert_eq!(precision(P::Xbgr), 2);
+        assert_eq!(precision(P::Rgb24), 2);
+        assert_eq!(precision(P::Rgb48Le), 3);
+        // A declared native layout leads (no conversion).
+        for &f in WORDS {
+            let r = ranked(f, false, &[P::Rgb24, P::Rgba, f, P::Yuv420P]);
+            assert_eq!(r[0], f, "{f:?}: {r:?}");
+        }
+        // A 24-bit source: its own tier (tight or padded), then the
+        // deeper one, then the 16-bit word, then the 15-bit one.
+        assert_eq!(
+            ranked(
+                P::Rgb24,
+                false,
+                &[P::Rgb555Le, P::Rgb565Le, P::Rgb48Le, P::Xrgb]
+            ),
+            vec![P::Xrgb, P::Rgb48Le, P::Rgb565Le, P::Rgb555Le]
+        );
+        // A 16-bit word: its tier (byte order or channel order is free),
+        // then widening closest first, then the narrower 15-bit word.
+        assert_eq!(
+            ranked(
+                P::Rgb565Le,
+                false,
+                &[P::Rgb555Le, P::Rgb48Le, P::Rgb24, P::Bgr565Be]
+            ),
+            vec![P::Bgr565Be, P::Rgb24, P::Rgb48Le, P::Rgb555Le]
+        );
+        // A 15-bit word widens to the 16-bit word first.
+        assert_eq!(
+            ranked(P::Bgr555Le, false, &[P::Rgb24, P::Rgb565Le])[0],
+            P::Rgb565Le
+        );
+        // Padding is not alpha: an opaque padded source keeps opaque
+        // rungs ahead; a transparent Rgba source is never handed a
+        // padded order ahead of an alpha one.
+        assert_eq!(
+            ranked(P::Bgrx, false, &[P::Rgba, P::Bgra, P::Rgb24])[0],
+            P::Rgb24
+        );
+        assert_eq!(ranked(P::Rgba, true, &[P::Rgbx, P::Bgra])[0], P::Bgra);
+        // Opaque Rgba: the padded order of the same tier is an opaque
+        // layout like Rgb24, ahead of the source itself.
+        let r = ranked(P::Rgba, false, &[P::Rgba, P::Rgbx]);
+        assert_eq!(r, vec![P::Rgbx, P::Rgba]);
+    }
+
+    #[test]
+    fn ladder_filters_by_pixfmt_reachability() {
+        // Whatever the pixfmt release converts, the ladder holds the
+        // source itself and only rungs pixfmt reaches from it.
+        for &f in WORDS {
+            let l = ladder(f, &[P::Rgb24, f]);
+            assert_eq!(l[0], f);
+            assert_eq!(l.contains(&P::Rgb24), reachable(f, P::Rgb24), "{f:?}");
+            assert_eq!(pixfmt_describes(f), reachable(f, P::Rgba), "{f:?}");
+        }
     }
 
     #[test]

@@ -57,6 +57,13 @@ pub struct Image {
     /// Page geometry, disposal, blending, delay ticks (see
     /// [`crate::layers`]).
     layer: Layer,
+    /// The container's string metadata (`Demuxer::metadata`), shared by
+    /// every picture of the file; written back through
+    /// `Muxer::set_metadata` by an encode.
+    text: Arc<Vec<(String, String)>>,
+    /// Plays of the animation this picture belongs to (`0` = forever),
+    /// normalised from the container's `loop_count` pair.
+    loop_count: Option<u32>,
 }
 
 impl Image {
@@ -109,6 +116,8 @@ impl Image {
             time_base: TimeBase::MILLIS,
             start: 0,
             layer: Layer::default(),
+            text: Arc::default(),
+            loop_count: None,
         })
     }
 
@@ -155,6 +164,8 @@ impl Image {
             time_base: TimeBase::MILLIS,
             start: 0,
             layer: Layer::default(),
+            text: Arc::default(),
+            loop_count: None,
         })
     }
 
@@ -581,6 +592,71 @@ impl Image {
         self
     }
 
+    // ---- container string metadata ---------------------------------------
+
+    /// The container's string metadata as the demuxer reported it
+    /// (`(key, value)` pairs in the framework vocabulary: `title`,
+    /// `comment`, `copyright`, a format's own keys), shared by every
+    /// picture of the file — the same pairs as
+    /// [`ImageFile::metadata`](crate::ImageFile::metadata). An encode
+    /// hands them to the target's muxer through `Muxer::set_metadata`
+    /// (README, *Metadata*): open → save → open keeps every key the
+    /// target carries and reports the rest. The `loop_count` pair is
+    /// not text: it travels as [`loop_count`](Self::loop_count).
+    /// Empty for a caller-built picture.
+    pub fn container_metadata(&self) -> &[(String, String)] {
+        &self.text
+    }
+
+    /// The value of the first pair under `key` in
+    /// [`container_metadata`](Self::container_metadata).
+    pub fn container_metadata_value(&self, key: &str) -> Option<&str> {
+        self.text
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// Replace the container string metadata an encode writes for this
+    /// picture (the first picture's set is the file's).
+    pub fn set_container_metadata(&mut self, pairs: Vec<(String, String)>) {
+        self.text = Arc::new(pairs);
+    }
+
+    /// Builder form of [`set_container_metadata`](Self::set_container_metadata).
+    pub fn with_container_metadata(mut self, pairs: Vec<(String, String)>) -> Self {
+        self.set_container_metadata(pairs);
+        self
+    }
+
+    /// Shared form for `ImageFile`: one allocation for every picture.
+    pub(crate) fn set_container_metadata_shared(&mut self, pairs: Arc<Vec<(String, String)>>) {
+        self.text = pairs;
+    }
+
+    /// Plays of the animation this picture came from, `0` = forever —
+    /// [`ImageFile::loop_count`](crate::ImageFile::loop_count), carried
+    /// by each picture so an encode of the pictures keeps it (when
+    /// [`SaveOptions::loop_count`](crate::SaveOptions::loop_count) is
+    /// unset, the first picture's count is written, in the target
+    /// format's unit). `None` when the file stated none, and for a
+    /// caller-built picture.
+    pub fn loop_count(&self) -> Option<u32> {
+        self.loop_count
+    }
+
+    /// Set (or clear) the plays an encode of this picture writes when
+    /// the options set none (see [`loop_count`](Self::loop_count)).
+    pub fn with_loop_count(mut self, plays: Option<u32>) -> Self {
+        self.set_loop_count(plays);
+        self
+    }
+
+    /// In-place form of [`with_loop_count`](Self::with_loop_count).
+    pub fn set_loop_count(&mut self, plays: Option<u32>) {
+        self.loop_count = plays;
+    }
+
     /// Display delay for this picture inside a sequence or animation.
     ///
     /// The rule, applied by [`crate::open`] and friends from the
@@ -655,6 +731,8 @@ impl Image {
             time_base: self.time_base,
             start: self.start,
             layer: self.layer,
+            text: self.text.clone(),
+            loop_count: self.loop_count,
         }
     }
 
@@ -876,6 +954,11 @@ impl Image {
         let src = self.format();
         if src == dst {
             return Ok(self.clone());
+        }
+        if !crate::ladder::pixfmt_describes(src) || !crate::ladder::pixfmt_describes(dst) {
+            return Err(Error::unsupported(format!(
+                "no {src:?} -> {dst:?} conversion in the linked oxideav-pixfmt"
+            )));
         }
         let mut cx = ConvertContext::new();
         if self.frame.color_signal().is_none()
@@ -1257,26 +1340,33 @@ pub(crate) fn duration_to_ticks(d: Duration, tb: TimeBase) -> i64 {
 /// Bytes per row of a packed (single-plane) layout, or `None` for
 /// planar / bit-packed layouts the gateway does not hand out as raw
 /// bytes.
+///
+/// Every single-plane layout with whole bytes per pixel qualifies — the
+/// 8 / 16-bit grey and grey-alpha words, the 24 / 32-bit RGB orders
+/// (`Rgb24` … `Abgr`), the padded 32-bit `Rgbx` / `Bgrx` / `Xrgb` /
+/// `Xbgr`, the 16-bit `Rgb555*` / `Bgr555*` / `Rgb565*` / `Bgr565*`
+/// words, the 48 / 64-bit and float RGB(A), CMYK — so a picture a
+/// decoder emits in any of them is handed out as it is. Bit-packed mono
+/// and the 4:2:2 macropixel layouts are not (a pixel is not a whole
+/// number of bytes), nor is anything with more than one plane.
 pub(crate) fn packed_row_bytes(format: PixelFormat, width: u32) -> Option<usize> {
-    let bpp: usize = match format {
-        PixelFormat::Gray8 | PixelFormat::Pal8 => 1,
-        PixelFormat::Gray16Le | PixelFormat::Ya8 => 2,
-        PixelFormat::Rgb24 | PixelFormat::Bgr24 => 3,
-        PixelFormat::Rgba
-        | PixelFormat::Bgra
-        | PixelFormat::Argb
-        | PixelFormat::Abgr
-        | PixelFormat::Ya16Le
-        | PixelFormat::Cmyk
-        | PixelFormat::CmykInverted
-        | PixelFormat::GrayF32Le => 4,
-        PixelFormat::Rgb48Le => 6,
-        PixelFormat::Rgba64Le => 8,
-        PixelFormat::RgbF32Le => 12,
-        PixelFormat::RgbaF32Le => 16,
-        _ => return None,
-    };
-    (width as usize).checked_mul(bpp)
+    if format.plane_count() != 1
+        || matches!(
+            format,
+            PixelFormat::MonoBlack
+                | PixelFormat::MonoWhite
+                | PixelFormat::Yuyv422
+                | PixelFormat::Uyvy422
+        )
+        || format.chroma_subsampling().is_some()
+    {
+        return None;
+    }
+    let bits = format.bits_per_pixel_approx();
+    if bits == 0 || !bits.is_multiple_of(8) {
+        return None;
+    }
+    format.plane_row_bytes(0, width)
 }
 
 /// Copy `height` rows of `row` bytes out of a plane, dropping any stride

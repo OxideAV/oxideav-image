@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use oxideav_core::{
     BlobKind, CodecParameters, Decoder, ExecutionContext, Frame, MetadataBlob, OutputParamsWatch,
-    ReadSeek, RuntimeContext, StreamInfo,
+    PixelFormat, ReadSeek, RuntimeContext, StreamInfo,
 };
 
 use crate::image::ticks_to_duration;
@@ -279,9 +279,22 @@ pub struct OpenOptions {
     /// the decoder's declared option schema has a `threads` option the
     /// caller did not set, the budget is forwarded through it as well.
     pub execution: Option<ExecutionContext>,
+    /// Layout every picture is converted to after decoding (through
+    /// `oxideav-pixfmt`). `None` — the default — keeps the layout each
+    /// decoder emitted, whatever it is (YCbCr, a packed 16-bit RGB
+    /// word, a padded 32-bit order, CMYK, …): the gateway never
+    /// converts on its own. A layout pixfmt cannot reach from a
+    /// picture's fails the open.
+    pub pixel_format: Option<PixelFormat>,
 }
 
 impl OpenOptions {
+    /// Convert every picture to `f` after decoding (see the field).
+    pub fn with_pixel_format(mut self, f: PixelFormat) -> Self {
+        self.pixel_format = Some(f);
+        self
+    }
+
     /// Defaults: every frame, no extension hint.
     pub fn new() -> Self {
         Self::default()
@@ -680,12 +693,32 @@ pub fn decode_reader(
         )));
     }
     resolve_delays(&mut images, streams.len());
-    Ok(ImageFile {
+    let mut file = ImageFile {
         container,
         metadata,
         streams: shared,
         images,
-    })
+    };
+    // Every picture carries the file's string metadata (one shared
+    // copy) and its loop count, so an encode of the pictures writes
+    // them back without the caller threading the file through.
+    let text = Arc::new(file.metadata.clone());
+    let plays = file.loop_count();
+    for img in &mut file.images {
+        img.set_container_metadata_shared(text.clone());
+        img.set_loop_count(plays);
+    }
+    // A layout asked for by the caller: every picture converted once,
+    // after decoding. Without one the pictures keep the layout their
+    // decoder emitted.
+    if let Some(dst) = opts.pixel_format {
+        for img in &mut file.images {
+            if img.format() != dst {
+                *img = img.to_format(dst)?;
+            }
+        }
+    }
+    Ok(file)
 }
 
 /// A stream's parameters with its decoder's report merged in, and the

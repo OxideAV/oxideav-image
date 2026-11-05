@@ -11,6 +11,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Container string metadata on save.** Every opened picture carries
+  its file's `Demuxer::metadata` pairs (`Image::container_metadata`,
+  `container_metadata_value`, `set_container_metadata` /
+  `with_container_metadata`; one shared copy per file) and an encode
+  hands the first picture's pairs to the target's muxer through
+  core 0.1.41 `Muxer::set_metadata` before its header, so open → save →
+  open keeps every key the target carries. `SaveOptions::container_metadata`
+  (`with_container_metadata`, `with_container_metadata_entry`) replaces
+  source pairs by key and adds new ones; `strip_metadata_keys`
+  (`with_stripped_metadata_keys`) withholds source keys;
+  `without_metadata()` now withholds the source pairs as well as the
+  source blobs. Blobs keep their own path.
+- `encode_detailed` / `save_detailed` → `Encoded` (`bytes`,
+  `into_bytes`, `pixel_format`, `metadata_written`, `metadata_dropped`,
+  `metadata_complete`): the keys the muxer stores
+  (`Muxer::carries_metadata_key`) and the keys it has no field for —
+  every key for a muxer without text and for a codec-only format —
+  are reported, never dropped silently; `SaveOptions::strict_metadata`
+  (`with_strict_metadata`) makes a dropped key an `Unsupported` error.
+  A muxer refusing the pairs otherwise fails the encode with its own
+  error, without walking the rest of the layout ladder.
+- `Image::loop_count` / `with_loop_count` / `set_loop_count`: the
+  file's play count on every picture; a multi-picture encode without
+  `SaveOptions::loop_count` writes it in the target's unit, so an
+  animation keeps its looping through open → save. The `loop_count`
+  pair is not forwarded as text.
+- **Native packed layouts.** `OpenOptions::pixel_format`
+  (`with_pixel_format`) converts every picture after decoding; without
+  it the decoder's layout is kept, core 0.1.41's 16-bit RGB words
+  (`Rgb555*` / `Bgr555*` / `Rgb565*` / `Bgr565*`) and padded orders
+  (`Rgbx` / `Bgrx` / `Xrgb` / `Xbgr`) included. Every single-plane
+  layout with whole bytes per pixel is a raw layout for `from_raw` /
+  `as_packed` / `to_packed` / `crop` (the twelve labels, `Gray10Le` /
+  `Gray12Le`, … were refused). An encoder that declares such a layout
+  receives the picture as is (`Encoded::pixel_format`).
+- Ladder: a precision tier inside each colour model — 15-bit words,
+  16-bit words, eight bits, deeper; the source's tier first, wider
+  tiers closest first, narrower ones last — so a 24-bit picture is
+  never offered a 16-bit word ahead of a 48-bit layout, nor a `Rgb565`
+  picture a `Rgb555` word ahead of `Rgb24`.
 - Pictures are labelled from the stream parameters merged with the
   decoder's full report (oxideav-core 0.1.42 `Decoder::output_params`:
   layout, emitted width / height, colour signal) through one
@@ -43,6 +83,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A packed RGB label of core 0.1.41 no longer reaches an
+  `oxideav-pixfmt` release that predates it: the gateway probes
+  whether pixfmt describes the layout (a direct step to or from
+  `Rgba`) before any route query or conversion, so with pixfmt 0.1.11
+  the ladder skips those rungs and `to_format` answers `Unsupported`
+  where pixfmt's own route planner faulted on the undescribed layout
+  (a debug-build assertion).
 - A multi-picture encode picks its layout from every picture's
   transparency, not the first one's: an animation whose first frame is
   opaque no longer loses the alpha of later frames to an `Rgb24` rung.

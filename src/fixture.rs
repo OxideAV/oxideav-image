@@ -110,12 +110,44 @@ pub(crate) const FORMATS: &[PixelFormat] = &[
     PixelFormat::YuvJ420P,
 ];
 
+/// The twelve packed RGB labels of core 0.1.41 (16-bit words and padded
+/// 32-bit orders), tagged after [`FORMATS`]. Only codec `oxim_packed`
+/// declares them, so the `oxim` codec's declared set — and every test
+/// iterating [`FORMATS`] — stays on layouts every pixfmt release
+/// converts.
+pub(crate) const PACKED_WORDS: &[PixelFormat] = &[
+    PixelFormat::Rgb555Le,
+    PixelFormat::Rgb555Be,
+    PixelFormat::Bgr555Le,
+    PixelFormat::Bgr555Be,
+    PixelFormat::Rgb565Le,
+    PixelFormat::Rgb565Be,
+    PixelFormat::Bgr565Le,
+    PixelFormat::Bgr565Be,
+    PixelFormat::Rgbx,
+    PixelFormat::Bgrx,
+    PixelFormat::Xrgb,
+    PixelFormat::Xbgr,
+];
+
+/// Declares [`PACKED_WORDS`] only — an encoder whose native input is a
+/// packed word layout.
+pub(crate) const CODEC_PACKED: &str = "oxim_packed";
+
 fn tag_of(f: PixelFormat) -> Option<u8> {
-    FORMATS.iter().position(|x| *x == f).map(|i| i as u8)
+    FORMATS
+        .iter()
+        .chain(PACKED_WORDS)
+        .position(|x| *x == f)
+        .map(|i| i as u8)
 }
 
 fn format_of(tag: u8) -> Option<PixelFormat> {
-    FORMATS.get(tag as usize).copied()
+    FORMATS
+        .iter()
+        .chain(PACKED_WORDS)
+        .nth(tag as usize)
+        .copied()
 }
 
 /// One picture of a fixture file.
@@ -559,6 +591,10 @@ fn make_encoder_jpeg_like(params: &CodecParameters) -> Result<Box<dyn Encoder>> 
     make_encoder_for(CODEC_JPEG_LIKE, JPEG_LIKE_FORMATS, params)
 }
 
+fn make_encoder_packed(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+    make_encoder_for(CODEC_PACKED, PACKED_WORDS, params)
+}
+
 fn make_encoder_undeclared(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     make_encoder_for(
         CODEC_UNDECLARED,
@@ -917,11 +953,46 @@ impl Demuxer for OximDemuxer {
     }
 }
 
+/// Which container string metadata a fixture muxer stores — the three
+/// shapes `Muxer::set_metadata` documents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Text {
+    /// A free-form tag block: every key (`oxim`).
+    FreeForm,
+    /// A fixed header with `title` and `comment` fields only (`oximrgb`).
+    Fixed,
+    /// `copyright` and `copyright:<lang>` only, the way a box-structured
+    /// still format stores one notice per language (`oximmulti`).
+    Copyright,
+    /// No text at all: the default `set_metadata` (`oximmux`).
+    None,
+}
+
+impl Text {
+    fn carries(self, key: &str) -> bool {
+        match self {
+            Text::FreeForm => true,
+            Text::Fixed => matches!(key, "title" | "comment"),
+            Text::Copyright => {
+                key == "copyright"
+                    || key.strip_prefix("copyright:").is_some_and(|l| {
+                        !l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                    })
+            }
+            Text::None => false,
+        }
+    }
+}
+
 struct OximMuxer {
     name: &'static str,
     output: Box<dyn WriteSeek>,
     streams: Vec<StreamInfo>,
     packets: Vec<Packet>,
+    text: Text,
+    /// What `set_metadata` stored (the pairs `text` carries).
+    pairs: Vec<(String, String)>,
+    header_written: bool,
 }
 
 fn open_muxer_named(
@@ -954,11 +1025,20 @@ fn open_muxer_named(
             return Err(Error::unsupported(format!("oxim muxer: no tag for {f:?}")));
         }
     }
+    let text = match name {
+        CONTAINER => Text::FreeForm,
+        CONTAINER_RGB_ONLY => Text::Fixed,
+        CONTAINER_MULTI => Text::Copyright,
+        _ => Text::None,
+    };
     Ok(Box::new(OximMuxer {
         name,
         output,
         streams: streams.to_vec(),
         packets: Vec::new(),
+        text,
+        pairs: Vec::new(),
+        header_written: false,
     }))
 }
 
@@ -984,12 +1064,41 @@ impl Muxer for OximMuxer {
     }
 
     fn write_header(&mut self) -> Result<()> {
+        self.header_written = true;
         Ok(())
     }
 
     fn write_packet(&mut self, packet: &Packet) -> Result<()> {
         self.packets.push(packet.clone());
         Ok(())
+    }
+
+    fn set_metadata(&mut self, metadata: &[(String, String)]) -> Result<()> {
+        if self.text == Text::None {
+            return Err(Error::unsupported("oximmux carries no container metadata"));
+        }
+        if self.header_written {
+            return Err(Error::invalid("oxim muxer: metadata after the header"));
+        }
+        // The muxer's own lines (muxer, codec, options) are written
+        // first; a pair can neither break the line format nor shadow
+        // them.
+        if let Some((k, _)) = metadata
+            .iter()
+            .find(|(k, v)| k.is_empty() || k.contains(['=', '\n']) || v.contains('\n'))
+        {
+            return Err(Error::invalid(format!("oxim muxer: unwritable pair '{k}'")));
+        }
+        self.pairs = metadata
+            .iter()
+            .filter(|(k, _)| self.text.carries(k))
+            .cloned()
+            .collect();
+        Ok(())
+    }
+
+    fn carries_metadata_key(&self, key: &str) -> bool {
+        self.text.carries(key)
     }
 
     fn write_trailer(&mut self) -> Result<()> {
@@ -1008,8 +1117,17 @@ impl Muxer for OximMuxer {
                 .collect();
             out.extend_from_slice(&(packets.len() as u32).to_le_bytes());
             let mut meta = format!("muxer={}\ncodec={}\n", self.name, p.codec_id).into_bytes();
+            let mut own = vec!["muxer".to_string(), "codec".to_string()];
             for (k, v) in p.options.iter() {
                 meta.extend_from_slice(format!("{k}={v}\n").as_bytes());
+                own.push(k.to_string());
+            }
+            // The stored text, in the first block (the demuxer reports
+            // the first block's lines); the muxer's own lines win.
+            if si == 0 {
+                for (k, v) in self.pairs.iter().filter(|(k, _)| !own.contains(k)) {
+                    meta.extend_from_slice(format!("{k}={v}\n").as_bytes());
+                }
             }
             out.extend_from_slice(&(meta.len() as u16).to_le_bytes());
             out.extend_from_slice(&meta);
@@ -1125,6 +1243,17 @@ pub(crate) fn register(ctx: &mut RuntimeContext) {
             )
             .decoder(make_decoder)
             .encoder(make_encoder_jpeg_like),
+    );
+    ctx.codecs.register(
+        CodecInfo::new(CodecId::new(CODEC_PACKED))
+            .capabilities(
+                CodecCapabilities::video("oxim_packed_sw")
+                    .with_intra_only(true)
+                    .with_lossless(true)
+                    .with_pixel_formats(PACKED_WORDS.to_vec()),
+            )
+            .decoder(make_decoder)
+            .encoder(make_encoder_packed),
     );
     ctx.codecs.register(
         CodecInfo::new(CodecId::new(CODEC_UNDECLARED))
