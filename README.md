@@ -63,7 +63,7 @@ assert_eq!(indexed.to_rgba8()?[7], 0);           // palette alpha reaches the RG
 | `encode_detailed(&ctx, &[Image], format, ..)` / `save_detailed(&ctx, &[Image], path, ..)` → `Encoded` | The same encode with its report: `bytes()` / `into_bytes()`, `pixel_format()` (the layout the encoder was handed), `metadata_written()` / `metadata_dropped()` / `metadata_complete()` (the container string-metadata keys the target stored / had no field for; see *Metadata*). |
 | `encoder_options(&ctx, format, &SaveOptions)` | The option schema of the encoder `encode` would use (names for `SaveOptions::with_option`). |
 | `support(&ctx, format)` → `FormatSupport` / `can_open(&ctx, format)` / `codec_only_formats(&ctx, names)` | The registry's answer for a name or extension without touching a file: `container()`, `has_demuxer()` / `has_muxer()` / `has_decoder()` / `has_encoder()`, `can_open()` / `can_save()`, `is_codec_only()` / `is_unknown()`. |
-| `can_encode(&ctx, format)` / `resolve_target(&ctx, format, &SaveOptions)` | "Will this save?" before decoding: `can_encode` is a yes / no; `resolve_target` returns the `EncodeTarget` (`format()`, `container()` / `is_codec_only()`, `codec()`, `accepted_pixel_formats()`, `options()`, `ladder(src, &opts)` / `ladder_for(&image, &opts)`, `metadata_support()`) or the error `encode` would return before looking at a picture. |
+| `can_encode(&ctx, format)` / `resolve_target(&ctx, format, &SaveOptions)` | "Will this save?" before decoding: `can_encode` is a yes / no; `resolve_target` returns the `EncodeTarget` (`format()`, `container()` / `is_codec_only()`, `codec()`, `accepted_pixel_formats()`, `options()`, `ladder(src, &opts)` / `ladder_for(&image, &opts)`, `metadata_support()`, `metadata_keys_dropped(&ctx, keys)`) or the error `encode` would return before looking at a picture. |
 | `OpenOptions` | `execution` (`with_execution_context(ctx)` / `with_threads(n)` / `serial()`, see *Execution budget*), `max_frames`, `ext_hint`, `decoder_options`, `max_pixels`, `allow_containers` / `deny_containers` / `allow_codecs` / `deny_codecs`, `strip_metadata` / `strip_blobs` (`without_metadata()`, `with_stripped_blobs(kinds)`), `pixel_format` (`with_pixel_format(f)`: convert every picture after decoding; default keeps the decoder's layout). |
 | `SaveOptions` | `execution` (`with_execution_context(ctx)` / `with_threads(n)` / `serial()`), `loop_count` (`with_loop_count(plays)`, see *Layers*), `quality`, `pixel_format`, `codec`, `options`, `time_base`, `default_delay`, `blobs` (`with_blob(s)`), `strip_metadata` / `strip_blobs` (`without_metadata()`, `with_stripped_blobs(kinds)`), `container_metadata` (`with_container_metadata(pairs)` / `with_container_metadata_entry(k, v)`), `strip_metadata_keys` (`with_stripped_metadata_keys(keys)`), `strict_metadata` (`with_strict_metadata(true)`). |
 | `Page` / `Dispose` / `Blend` | The per-frame layer record (`#[non_exhaustive]`; `Page::new(w, h).with_offset(x, y)`). |
@@ -344,7 +344,10 @@ dropped key into an `Unsupported` error naming it. A muxer refusing
 the pairs for another reason (a value its field cannot hold) fails the
 encode with its error — no other layout of the ladder is tried for
 that. So open → save → open keeps every key the target carries, and
-the report names the rest.
+the report names the rest. Before decoding anything,
+`resolve_target(..)?.metadata_keys_dropped(&ctx, &keys)` gives the same
+answer (the muxer opened on a scratch sink with a probe stream and
+asked; `None` when no probe stream opens it).
 
 The `loop_count` pair is not text: it is the animation's play count
 (`ImageFile::loop_count()`, normalised to plays), carried by every

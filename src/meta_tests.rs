@@ -13,7 +13,7 @@ use crate::fixture::{self, Fixture, PACKED_WORDS};
 use crate::ladder::reachable as supports;
 use crate::{
     Image, ImageError, OpenOptions, SaveOptions, decode_bytes, decode_bytes_with, encode,
-    encode_detailed, encode_frames,
+    encode_detailed, encode_frames, resolve_target,
 };
 
 fn pairs(list: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -577,4 +577,48 @@ fn open_keeps_the_decoders_layout_unless_asked() {
         same.primary().as_packed(),
         Some(packed_bytes(PixelFormat::Rgb565Le, 4, 2).as_slice())
     );
+}
+
+#[test]
+fn the_target_answers_before_anything_is_decoded() {
+    let ctx = fixture::ctx();
+    let asked = ["title", "comment", "author", "copyright:fr", "title"];
+    let dropped = |format: &str| {
+        resolve_target(&ctx, format, &on(format, SaveOptions::default()))
+            .unwrap()
+            .metadata_keys_dropped(&ctx, &asked)
+    };
+    assert_eq!(dropped("oxim"), Some(vec![]));
+    // `oximrgb` takes Rgb24 streams only: the probe walks the declared
+    // layouts until its muxer opens.
+    assert_eq!(dropped("oximrgb"), Some(keys(&["author", "copyright:fr"])));
+    assert_eq!(
+        dropped("oximmulti"),
+        Some(keys(&["title", "comment", "author"]))
+    );
+    assert_eq!(
+        dropped("oximmux"),
+        Some(keys(&["title", "comment", "author", "copyright:fr"]))
+    );
+    assert_eq!(
+        dropped(fixture::CODEC_YUV_ONLY).map(|d| d.len()),
+        Some(asked.len())
+    );
+    // The answer matches what an encode then reports.
+    let file = decode_bytes(&ctx, &tagged(PixelFormat::Rgb24, SOURCE)).unwrap();
+    for target in ["oxim", "oximrgb", "oximmulti", "oximmux"] {
+        let done = encode_detailed(
+            &ctx,
+            file.frames(),
+            target,
+            &on(target, SaveOptions::default()),
+        )
+        .unwrap();
+        let keys: Vec<&str> = SOURCE.iter().map(|(k, _)| *k).collect();
+        let pre = resolve_target(&ctx, target, &on(target, SaveOptions::default()))
+            .unwrap()
+            .metadata_keys_dropped(&ctx, &keys)
+            .unwrap();
+        assert_eq!(pre.as_slice(), done.metadata_dropped(), "{target}");
+    }
 }

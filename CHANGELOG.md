@@ -32,6 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`with_strict_metadata`) makes a dropped key an `Unsupported` error.
   A muxer refusing the pairs otherwise fails the encode with its own
   error, without walking the rest of the layout ladder.
+- `EncodeTarget::metadata_keys_dropped(&ctx, keys)`: the keys a target
+  has no field for, asked before decoding (codec-only: all; a container:
+  its muxer opened on a scratch sink with a probe stream in each
+  declared layout until one is accepted; `None` when none is) — the
+  same answer `Encoded::metadata_dropped` gives after the encode.
 - `Image::loop_count` / `with_loop_count` / `set_loop_count`: the
   file's play count on every picture; a multi-picture encode without
   `SaveOptions::loop_count` writes it in the target's unit, so an

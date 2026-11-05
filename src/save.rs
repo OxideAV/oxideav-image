@@ -507,6 +507,57 @@ impl EncodeTarget {
         }
     }
 
+    /// Of `keys` (container string-metadata keys), the ones the target
+    /// has no field for — asked before any picture is decoded or
+    /// encoded. A codec-only format drops every key. For a container the
+    /// muxer is opened on a scratch sink with a 16×16 stream in each
+    /// layout the encoder declares (or the ladder's fixed rungs) until
+    /// one is accepted, and asked `Muxer::carries_metadata_key`; nothing
+    /// is written. `None` when no such stream opens it (a muxer that
+    /// needs the encoder's configuration record, say) — the
+    /// [`Encoded`] report of [`encode_detailed`] is the answer then.
+    pub fn metadata_keys_dropped(
+        &self,
+        ctx: &RuntimeContext,
+        keys: &[&str],
+    ) -> Option<Vec<String>> {
+        let Some(container) = self.container.as_deref() else {
+            return Some(keys.iter().map(|k| k.to_string()).collect());
+        };
+        let layouts: Vec<PixelFormat> = if self.accepted.is_empty() {
+            ladder::ladder(PixelFormat::Rgb24, &[])
+        } else {
+            self.accepted.clone()
+        };
+        for f in layouts {
+            let mut params = CodecParameters::video(self.codec.clone());
+            params.width = Some(16);
+            params.height = Some(16);
+            params.pixel_format = Some(f);
+            let stream = StreamInfo {
+                index: 0,
+                time_base: TimeBase::MILLIS,
+                duration: None,
+                start_time: Some(0),
+                params,
+            };
+            if let Ok(muxer) = ctx.containers.open_muxer(
+                container,
+                Box::new(SharedCursor::default()),
+                std::slice::from_ref(&stream),
+            ) {
+                let mut dropped: Vec<String> = Vec::new();
+                for k in keys {
+                    if !muxer.carries_metadata_key(k) && !dropped.iter().any(|d| d == k) {
+                        dropped.push(k.to_string());
+                    }
+                }
+                return Some(dropped);
+            }
+        }
+        None
+    }
+
     /// How the target carries metadata blobs. Always
     /// [`MetadataSupport::PassThrough`] today: every blob the pictures
     /// or [`SaveOptions::blobs`] carry reaches the encoder; the
