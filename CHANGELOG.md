@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-image/compare/v0.0.5...v0.0.6) - 2026-11-06
+
+### Other
+
+- :from_video_frame docs: the parameters are this frame's shape (after a mid-stream change, the event's), planes checked against it
+- :StreamParams on every decode path: pictures keep their own shape across a mid-stream change, layer ops re-plan at a change of canvas, encoders never see a shape change
+- :metadata_keys_dropped: which string-metadata keys a target has no field for, asked before decoding
+- Container string metadata through Muxer::set_metadata with a written / dropped report, and native packed layouts kept end to end
+- Label pictures from the watched decoder report (Decoder::output_params), not a per-picture query
+- Multi-frame layer model: page / dispose / blend / tick-rate record on Image, loop counts both ways, and the layers module (coalesce, compare-any/clear/overlay, optimize / optimize-frame / optimize-plus / optimize-transparency, remove-dups / remove-zero, flatten / mosaic / merge / trim-bounds, composite) pinned against magick 7.1.2 as a black box; layered lists are written coalesced
+- edition 2024, MSRV 1.95
+
 - edition 2024, MSRV 1.95
 
 ### Added
