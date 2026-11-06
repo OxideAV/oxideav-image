@@ -823,6 +823,14 @@ pub fn encode(
 /// `Unsupported` naming the geometries, never a resize. A codec-only
 /// format (one packet, no muxer) refuses mixed geometries the same way.
 ///
+/// Mid-stream shape changes (a sequence whose size or layout changes,
+/// as an opened file whose decoder announced a `Frame::StreamParams`
+/// event hands out): no encoder ever sees its input shape change. The
+/// layout is one per encode — the first picture's ladder rung (any
+/// picture's transparency counted), every picture converted to it —
+/// and a change of size is a further stream as above. The gateway
+/// never sends `Frame::StreamParams` to an encoder.
+///
 /// Timing: every picture's [`Image::delay`] (or
 /// [`SaveOptions::default_delay`]) is rescaled to the stream time base
 /// ([`SaveOptions::time_base`], default milliseconds; 1/100 s for
@@ -1405,6 +1413,7 @@ fn encode_group(
     for &i in &group.members {
         let img = &images[i];
         let converted = img.to_format(dst)?;
+        same_shape(&converted, group, dst, i)?;
         let (mut frame, _) = converted.into_video_frame();
         frame.set_blobs(opts.frame_blobs(img));
         frame.pts = Some(pts);
@@ -1465,6 +1474,24 @@ fn encode_group(
     let mut out_params = encoder.output_params().clone();
     out_params.media_type = MediaType::Video;
     Ok((packets, out_params, pts))
+}
+
+/// The shape-change policy's guard: every frame an encoder receives has
+/// the shape its stream was opened with (the gateway never sends
+/// `Frame::StreamParams` to an encoder — a picture of another layout
+/// is converted to the stream's, one of another size goes to a stream
+/// of its own). A picture that still differs is refused by type rather
+/// than handed to the encoder under the wrong description.
+fn same_shape(img: &Image, group: &Group, dst: PixelFormat, index: usize) -> Result<()> {
+    let got = (img.width(), img.height(), img.format());
+    if got != (group.width, group.height, dst) {
+        return Err(Error::unsupported(format!(
+            "picture {index} is {}x{} {:?} after conversion; its output stream was opened \
+             for {}x{} {dst:?} and an encoder stream does not change shape mid-stream",
+            got.0, got.1, got.2, group.width, group.height
+        )));
+    }
+    Ok(())
 }
 
 /// An in-memory sink the muxer can own while we keep a handle to read

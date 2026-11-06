@@ -31,6 +31,19 @@
 //! for GIF-style 0 / 255 alpha. *Cleared* pixels are visible in the
 //! earlier picture and transparent in the later one; *overlaid* pixels
 //! changed and are visible in the later one.
+//!
+//! **A change of canvas** — a frame whose canvas (its [`Page`] size, or
+//! its own size when it declares none) differs from the frame before
+//! it, as in a picture sequence whose size changed mid-stream — starts
+//! a new canvas: the frames before it and after it are never composited
+//! or compared across the change. [`coalesce`], [`apply_disposal`] and
+//! [`optimize_transparency`] restart from the background on the new
+//! canvas; [`compare_any`] / [`compare_clear`] / [`compare_overlay`]
+//! keep the first frame of the new canvas whole, as they keep frame 0;
+//! [`optimize_frame`] / [`optimize_plus`] optimise each run of one
+//! canvas on its own. [`flatten`], [`mosaic`], [`merge`] and
+//! [`composite_layers`] produce one canvas by definition and clip as
+//! documented on each.
 
 use std::time::Duration;
 
@@ -475,18 +488,31 @@ fn add_delay(a: Option<Duration>, b: Option<Duration>) -> Option<Duration> {
 
 // ---- playback ---------------------------------------------------------------
 
+/// `true` when frame `i` starts a new canvas: its canvas size is not
+/// the one of the frame before it (module docs, *a change of canvas*).
+fn new_canvas(frames: &[Image], i: usize) -> bool {
+    i > 0 && frames[i].canvas_size() != frames[i - 1].canvas_size()
+}
+
 /// Play `frames` on a canvas the size of the first frame's canvas,
-/// starting from the background: for each frame, `visit(index, canvas
-/// as displayed, canvas after the frame's disposal)`.
+/// starting from the background — and on a fresh background canvas at
+/// every change of canvas: for each frame, `visit(index, canvas as
+/// displayed, canvas after the frame's disposal, whether the frame
+/// started a new canvas)`.
 fn play(
     frames: &[Image],
     opts: &LayerOptions,
-    mut visit: impl FnMut(usize, &Raster, &Raster) -> Result<()>,
-) -> Result<(u32, u32)> {
+    mut visit: impl FnMut(usize, &Raster, &Raster, bool) -> Result<()>,
+) -> Result<()> {
     let (cw, ch) = frames[0].canvas_size();
     let bg = opts.background;
     let mut canvas = Raster::filled(cw, ch, bg)?;
     for (i, f) in frames.iter().enumerate() {
+        let fresh = new_canvas(frames, i);
+        if fresh {
+            let (cw, ch) = f.canvas_size();
+            canvas = Raster::filled(cw, ch, bg)?;
+        }
         let saved = (f.dispose() == Dispose::Previous).then(|| canvas.clone());
         let src = Raster::of(f)?;
         let r = frame_rect(f);
@@ -499,9 +525,9 @@ fn play(
             Dispose::Previous => canvas = saved.unwrap_or_else(|| canvas.clone()),
             _ => {}
         }
-        visit(i, &shown, &canvas)?;
+        visit(i, &shown, &canvas, fresh)?;
     }
-    Ok((cw, ch))
+    Ok(())
 }
 
 /// Full-canvas `pixels` built on `template`'s attributes.
@@ -533,8 +559,10 @@ pub fn coalesce_with(frames: &[Image], opts: &LayerOptions) -> Result<Vec<Image>
     let deep = is_deep(frames);
     let mut out: Vec<Image> = Vec::with_capacity(frames.len());
     let mut last: Option<Raster> = None;
-    play(frames, opts, |i, shown, _| {
-        if let Some(prev) = &last {
+    play(frames, opts, |i, shown, _, fresh| {
+        // Across a change of canvas nothing carries over: the last
+        // frame of the old canvas keeps `None`.
+        if let Some(prev) = last.as_ref().filter(|_| !fresh) {
             let clears = prev.diff(shown, cleared).is_some();
             if let Some(p) = out.last_mut() {
                 p.set_dispose(if clears {
@@ -572,7 +600,7 @@ pub fn apply_disposal_with(frames: &[Image], opts: &LayerOptions) -> Result<Vec<
     need_frames(frames, "dispose")?;
     let deep = is_deep(frames);
     let mut out = Vec::with_capacity(frames.len());
-    play(frames, opts, |i, _, disposed| {
+    play(frames, opts, |i, _, disposed, _| {
         out.push(canvas_frame(&frames[i], disposed, deep)?.with_dispose(Dispose::None));
         Ok(())
     })?;
@@ -622,6 +650,11 @@ fn compare(frames: &[Image], how: Compare) -> Result<Vec<Image>> {
     for pair in frames.windows(2) {
         let (prev, cur) = (&pair[0], &pair[1]);
         let (cw, ch) = cur.canvas_size();
+        if prev.canvas_size() != (cw, ch) {
+            // A new canvas: nothing to compare against, kept whole.
+            out.push(cur.clone());
+            continue;
+        }
         let mut before = Raster::filled(cw, ch, CLEAR)?;
         let pr = frame_rect(prev);
         before.draw(&Raster::of(prev)?, pr.x, pr.y, Blend::Source);
@@ -751,15 +784,7 @@ fn choose(
 
 fn check_coalesced(frames: &[Image], what: &str) -> Result<()> {
     need_frames(frames, what)?;
-    let (w, h) = (frames[0].width(), frames[0].height());
     for (i, f) in frames.iter().enumerate() {
-        if (f.width(), f.height()) != (w, h) {
-            return Err(Error::invalid(format!(
-                "{what}: frame {i} is {}x{}, frame 0 is {w}x{h} (coalesce first)",
-                f.width(),
-                f.height()
-            )));
-        }
         if !f.is_full_canvas() {
             return Err(Error::invalid(format!(
                 "{what}: frame {i} has page {}, not a coalesced full-canvas frame (coalesce first)",
@@ -770,8 +795,8 @@ fn check_coalesced(frames: &[Image], what: &str) -> Result<()> {
     Ok(())
 }
 
-/// Turn a coalesced animation (every frame full canvas, same size —
-/// [`coalesce`] output) into the smallest frames it can, choosing each
+/// Turn a coalesced animation (every frame full canvas — [`coalesce`]
+/// output; a change of size starts a run optimised on its own) into the smallest frames it can, choosing each
 /// frame's disposal: for every transition the candidates are
 /// [`Dispose::None`] (when nothing visible has to be erased),
 /// [`Dispose::Previous`] and [`Dispose::Background`] (the previous
@@ -797,7 +822,22 @@ pub fn optimize_plus(frames: &[Image]) -> Result<Vec<Image>> {
 
 fn optimize_frames(frames: &[Image], plus: bool, what: &str) -> Result<Vec<Image>> {
     check_coalesced(frames, what)?;
+    // Each run of one canvas on its own (module docs, *a change of
+    // canvas*); the layout choice is the whole list's.
     let deep = is_deep(frames);
+    let mut out = Vec::with_capacity(frames.len());
+    let mut start = 0;
+    for i in 1..=frames.len() {
+        if i == frames.len() || new_canvas(frames, i) {
+            out.extend(optimize_run(&frames[start..i], plus, deep)?);
+            start = i;
+        }
+    }
+    Ok(out)
+}
+
+/// [`optimize_frames`] on frames of one canvas.
+fn optimize_run(frames: &[Image], plus: bool, deep: bool) -> Result<Vec<Image>> {
     let (w, h) = (frames[0].width(), frames[0].height());
     let mut prev = Raster::of(&frames[0])?;
     let mut before_last = Raster::filled(w, h, CLEAR)?;
@@ -889,7 +929,11 @@ pub fn optimize_transparency_with(frames: &[Image], opts: &LayerOptions) -> Resu
     let bg = opts.background;
     let mut canvas = Raster::filled(cw, ch, bg)?;
     let mut out = Vec::with_capacity(frames.len());
-    for f in frames {
+    for (i, f) in frames.iter().enumerate() {
+        if new_canvas(frames, i) {
+            let (cw, ch) = f.canvas_size();
+            canvas = Raster::filled(cw, ch, bg)?;
+        }
         let saved = (f.dispose() == Dispose::Previous).then(|| canvas.clone());
         let src = Raster::of(f)?;
         let r = frame_rect(f);

@@ -746,10 +746,22 @@ fn drain(
             return Ok(());
         }
         match dec.receive_frame() {
+            // A mid-stream shape change announced in band, just before
+            // the first picture of the new shape: fold it into the
+            // stream's parameters so the pictures after it are labelled
+            // with their own shape. It is not a picture — it takes no
+            // index, no packet timing and no pixel budget.
+            Ok(event @ Frame::StreamParams(_)) => {
+                if decoded.watch.observe_frame(&event, &mut decoded.params) {
+                    *shared = Arc::new(decoded.params.clone());
+                }
+            }
             Ok(Frame::Video(vf)) => {
                 // The parameters describing this picture: the decoder's
                 // report (read on the first picture and whenever its
-                // generation moves — one integer compare otherwise)
+                // generation moves — one integer compare otherwise; an
+                // in-band event above has already been merged, and the
+                // generation that moved with it merges to no change)
                 // over the stream's. The gateway never labels a picture
                 // with a layout the decoder did not emit. Pictures
                 // already built keep the parameters they were built
@@ -794,7 +806,19 @@ fn drain(
                 // A decoded picture is the whole canvas as displayed (the
                 // format crates composite their animations): drawn onto a
                 // canvas it replaces what was there.
-                let mut img = Image::from_video_frame_shared(vf, shared.clone())?
+                // The planes must hold the shape the stream parameters
+                // state: a decoder that changed shape without saying so
+                // (no event, no generation bump) is reported here rather
+                // than handed out under the old label.
+                let mut img = Image::from_video_frame_shared(vf, shared.clone())
+                    .map_err(|e| match e {
+                        Error::InvalidData(msg) => Error::invalid(format!(
+                            "picture {index} of stream {stream_index} (codec '{}') does not \
+                             match the shape its decoder reports: {msg}",
+                            stream.codec_id
+                        )),
+                        other => other,
+                    })?
                     .with_index(index)
                     .with_blend(crate::layer::Blend::Source);
                 crate::adapt::adapt(&mut img, stream);
@@ -812,6 +836,7 @@ fn drain(
                 );
                 images.push(img);
             }
+            // Audio / subtitle / vector frames have no place in an image.
             Ok(_) => {}
             Err(oxideav_core::Error::NeedMore) | Err(oxideav_core::Error::Eof) => return Ok(()),
             Err(e) => return Err(e.into()),

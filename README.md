@@ -109,6 +109,19 @@ source has none.
   a stream with no label opens when its decoder knows the layout. The
   merged parameters are shared by the stream's pictures of one shape
   (`Image::params()` says what the picture is).
+- **Mid-stream shape changes** (core 0.1.43 `Frame::StreamParams`): a
+  decoder whose size or layout changes returns the event just before
+  the first picture of the new shape; the gateway folds it into the
+  stream's parameters (`OutputParamsWatch::observe_frame`), so every
+  picture after it carries its own shape. A decoder that only bumps
+  its generation is followed the same way; the two agree, so each
+  change is merged once. The event is never a picture: it takes no
+  index, no packet timing, no `max_frames` slot and no pixel budget
+  (each picture is charged its own size), on every decode path —
+  pictures as they come, and those drained after `flush`. A decoder
+  that changes shape without either signal is caught when a picture's
+  planes are too small for the shape it would be labelled with
+  (`InvalidData` naming the picture) — never handed out mislabelled.
 - **Saving:** the format name or extension resolves to a container with
   a muxer. The payload codec is the container's default: the codec of
   the same name (png, bmp, tiff, heif, …) or the few that differ (`jpeg`
@@ -397,6 +410,18 @@ geometries (`"container 'png' refused 2 picture geometries (16x16,
 geometries before anything is encoded. `Image::stream()` on the decoded
 side tells which stream each picture came from.
 
+**Shape changes on the encode side.** No encoder ever sees its input
+shape change mid-stream, and the gateway never sends a
+`Frame::StreamParams` event to one: the layout is one per encode (the
+ladder rung for the first picture's layout, any picture's transparency
+counted) and every picture is converted to it; a change of size is a
+further stream as above, or the typed refusal. A picture whose
+converted shape still differs from its stream's is refused as
+`Unsupported` before it reaches the encoder. A sequence opened from a
+decoder that changed shape mid-stream therefore saves to a
+multi-geometry container one stream per size, and is refused by a
+one-geometry one.
+
 A *layered* list — more than one picture, some of them sub-rectangles of
 their canvas (a page offset or a canvas larger than the picture) or
 disposing their rectangle (`Dispose::Background` / `Previous`) — is
@@ -467,10 +492,10 @@ disposal and pixels of each frame compared on 519 generated animations
 
 | Operation | What it does |
 |---|---|
-| `coalesce` | Plays the list on a canvas the size of the first frame's (background: `LayerOptions::background`, transparent black by default) and returns every displayed canvas, `WxH+0+0`. Output disposal: `Background` where the next frame clears a visible pixel, else `None`; the last repeats the previous. |
+| `coalesce` | Plays the list on a canvas the size of the first frame's — a new one at every change of canvas (below) — (background: `LayerOptions::background`, transparent black by default) and returns every displayed canvas, `WxH+0+0`. Output disposal: `Background` where the next frame clears a visible pixel, else `None`; the last repeats the previous. |
 | `apply_disposal` | The canvas each frame leaves for the next (after its disposal). |
 | `compare_any` (`deconstruct`), `compare_clear`, `compare_overlay` | Frame 0 as is; each later frame cropped to the pixels that differ from the frame before it (both placed on the canvas, no disposal applied) — all of them / the ones turning transparent / the changed ones that are visible afterwards. A frame with nothing to keep is dropped. |
-| `optimize_frame` | For a coalesced list (same size, full canvas; else `InvalidData` "coalesce first"): the smallest frames, choosing each disposal. Per transition the candidates are `None` (only when nothing visible must be erased), `Previous`, and `Background` with the previous window grown over the pixels to erase; cost = next window's area (+ the growth); ties go None → Previous → Background. An unchanged frame is a 1×1 transparent pixel at `-1-1`. |
+| `optimize_frame` | For a coalesced list (full canvas; else `InvalidData` "coalesce first"; each run of one size on its own): the smallest frames, choosing each disposal. Per transition the candidates are `None` (only when nothing visible must be erased), `Previous`, and `Background` with the previous window grown over the pixels to erase; cost = next window's area (+ the growth); ties go None → Previous → Background. An unchanged frame is a 1×1 transparent pixel at `-1-1`. |
 | `optimize_plus` | `optimize_frame` plus a fourth candidate, ranked before `Background`: keep the frame (`None`, zero delay) and add a clearing frame over just the pixels to erase (`Background`, the delay), costed as both windows; frames identical to their predecessor (from the third on) fold into it. |
 | `optimize_transparency` | Every pixel of an `Over` frame that leaves the canvas pixel under it unchanged becomes transparent. |
 | `optimize` | `coalesce` → `optimize_frame` → `optimize_transparency` (`-layers optimize`). |
@@ -478,6 +503,19 @@ disposal and pixels of each frame compared on 519 generated animations
 | `flatten` / `mosaic` / `merge` | One picture: every frame composited at its offset onto the first frame's canvas / that canvas grown right and down to fit every frame / a canvas just covering every frame (the page keeps the first canvas size and records the possibly negative corner). |
 | `trim_bounds` | Offsets shifted so the frames' bounding box starts at `+0+0`; the canvas becomes that box. |
 | `composite_layers(dst, src, dx, dy)` | Pair-wise composition of two lists (a one-frame list pairs with every frame of the other), the source placed relative to the destination frame's offset. |
+
+**A change of canvas** — a frame whose canvas (its page size, or its
+own size when it declares none) differs from the previous frame's, as
+in an opened sequence whose size changed mid-stream — starts a new
+canvas: nothing is composited or compared across it. `coalesce`,
+`apply_disposal` and `optimize_transparency` restart from the
+background on the new canvas; the `compare_*` operations keep the
+first frame of the new canvas whole, as they keep frame 0;
+`optimize_frame` / `optimize_plus` optimise each run of one canvas on
+its own (so `optimize` of such a sequence replays to the same
+pictures). `flatten`, `mosaic`, `merge` and `composite_layers` make one
+canvas by definition and clip as described. The pinned `magick` lists
+all keep one canvas, so the rule changes none of them.
 
 A pixel counts as *transparent* below half alpha (`< 128` at 8 bits),
 as `magick` does; two pixels are equal when identical or both fully
@@ -567,8 +605,8 @@ of parsing the header itself.
 | `Io` | File or stream I/O failed. |
 | `UnknownFormat` | No container probed the input, the name / extension matches nothing with a muxer, or the extension belongs to a codec-only crate with no demuxer. |
 | `NoImage` | A container matched but holds no video stream with a registered decoder, or decoded no picture. |
-| `Unsupported` | No encoder for the codec, no layout of the ladder accepted, mixed geometries into a one-geometry container or a codec-only format, a planar layout asked for as packed bytes, a `crop` origin off the chroma grid or on a bit-packed layout. |
-| `InvalidData` | Caller data inconsistent with its geometry (buffer length, plane count, stride), a crop window outside the picture, a stream without a pixel format whose decoder reports none. |
+| `Unsupported` | No encoder for the codec, no layout of the ladder accepted, mixed geometries into a one-geometry container or a codec-only format, a picture whose converted shape differs from its output stream's, a planar layout asked for as packed bytes, a `crop` origin off the chroma grid or on a bit-packed layout. |
+| `InvalidData` | Caller data inconsistent with its geometry (buffer length, plane count, stride, a plane too small for the stated size), a crop window outside the picture, a stream without a pixel format whose decoder reports none, a decoded picture that does not match the shape its decoder reports (a shape change with neither event nor generation bump). |
 | `LimitExceeded` | `max_pixels` would be exceeded. |
 | `Restricted` | The probed container or a video stream's codec is refused by the allow / deny lists; nothing was decoded. |
 | `Core` | A registry, demuxer, decoder, muxer or encoder error, unchanged. |
@@ -585,8 +623,10 @@ of parsing the header itself.
   consumer's). `ImageFile::metadata()` is the container's string pairs
   as the demuxer reports them.
 - **Guessing.** A stream without a declared pixel format whose decoder
-  reports none either, a frame whose plane count disagrees with the
-  label, or a probe miss is an error, not an inference.
+  reports none either, a frame whose plane count or plane sizes
+  disagree with the label, or a probe miss is an error, not an
+  inference. A picture's shape comes from the stream parameters the
+  decoder's event or generation keeps current, never from its planes.
 
 ## Testing
 
@@ -606,7 +646,13 @@ a multi-stream container and into a one-geometry one, the layer model
 and every `layers` operation against geometry, disposal and pixels
 recorded from `magick` (plus replay invariants: an optimised list
 coalesces back to the original animation), loop counts, layered lists
-written as displayed, zero delays, `support` /
+written as displayed, zero delays, mid-stream shape changes (stub
+decoders that emit `Frame::StreamParams` with and without a generation
+bump, while decoding and while draining after `flush`, that only bump
+the generation, and that change silently: true shapes, `max_frames`
+and the pixel budget counting pictures only, the layer operations
+re-planning at the change, a multi-geometry save round trip, a strict
+encoder that refuses the event never receiving it), `support` /
 `can_open` / `codec_only_formats`, options, limits, every error
 variant). The umbrella's `crates/oxideav-tests/tests/image_gateway*.rs`
 run the gateway over the real format crates through

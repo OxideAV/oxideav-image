@@ -11,6 +11,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`Frame::StreamParams` on every decode path** (core 0.1.43; the
+  `oxideav-core` floor moves to `0.1.43`). A decoder's in-band event
+  announcing a mid-stream size / layout change is folded into the
+  stream's parameters (`OutputParamsWatch::observe_frame`), so each
+  picture after it is labelled with its own shape; decoders that only
+  bump `output_params_generation` are followed the same way, and the
+  two together merge each change once. The event is never a picture:
+  no index, no packet timing, no `max_frames` slot, no pixel budget —
+  each picture is charged its own size — while decoding and while
+  draining after `flush`.
+- Layer operations re-plan at a change of canvas (a frame whose canvas
+  differs from the previous frame's): `coalesce`, `apply_disposal`,
+  `optimize_transparency` restart from the background on the new
+  canvas, the `compare_*` operations keep its first frame whole,
+  `optimize_frame` / `optimize_plus` optimise each run of one canvas
+  on its own (`optimize` of a shape-changing sequence replays to the
+  same pictures). Lists of one canvas — every `magick`-pinned case —
+  are unchanged.
+- Encode-side policy, documented and guarded: no encoder sees its
+  input shape change and none is sent `Frame::StreamParams` — one
+  layout per encode, every picture converted to it, each size its own
+  stream (or the typed `Unsupported` refusal); a picture whose
+  converted shape differs from its stream's is refused as
+  `Unsupported` before reaching the encoder.
 - **Container string metadata on save.** Every opened picture carries
   its file's `Demuxer::metadata` pairs (`Image::container_metadata`,
   `container_metadata_value`, `set_container_metadata` /
@@ -85,6 +109,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `encode_frames` writes a layered list (sub-rectangle frames or
   frames disposing their rectangle) coalesced, as one animation at the
   canvas size, instead of one stream per frame geometry.
+
+### Changed
+
+- `Image::from_video_frame` (and every opened picture) checks that each
+  plane holds the rows its layout and the stated size imply (stride
+  padding allowed): a too-small plane is `InvalidData`. On open the
+  error names the picture and says it does not match the shape its
+  decoder reports — a decoder that changed shape without the event or
+  a generation bump is reported, not mislabelled.
+- `optimize_frame` / `optimize_plus` accept full-canvas lists whose
+  size changes (one run per size) instead of refusing them as
+  "coalesce first"; a frame that is not full canvas still is.
 
 ### Fixed
 

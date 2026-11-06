@@ -515,8 +515,16 @@ fn optimize_frame_grows_a_background_window_over_what_must_clear() {
 fn optimize_frame_wants_a_coalesced_list() {
     let err = layers::optimize_frame(&c1()).unwrap_err();
     assert!(err.to_string().contains("coalesce first"), "{err}");
-    let mixed = [paint(4, 4, R, &[]), paint(5, 4, R, &[])];
-    assert!(layers::optimize_frame(&mixed).is_err());
+    // Full-canvas frames whose size changes are a coalesced list of two
+    // canvases: each run is optimised on its own, the first frame of
+    // each kept whole.
+    let mixed = [
+        paint(4, 4, R, &[]),
+        paint(4, 4, R, &[]),
+        paint(5, 4, R, &[]),
+    ];
+    let out = layers::optimize_frame(&mixed).unwrap();
+    expect(&out, "4x4+0+0 4 4 None; 4x4-1-1 1 1 None; 5x4+0+0 5 4 None");
     assert!(layers::optimize_frame(&[]).is_err());
 }
 

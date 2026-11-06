@@ -103,6 +103,30 @@ impl Image {
                 "frame carries {planes} image plane(s) but {format:?} has {expected}"
             )));
         }
+        // Each plane must hold the rows its layout and the stated size
+        // imply (stride padding allowed). A plane too small for them is
+        // a picture labelled with a shape it does not have.
+        for (p, plane) in frame.image_planes().iter().enumerate() {
+            let (Some(row), Some((_, rows))) = (
+                format.plane_row_bytes(p, width),
+                format.plane_dimensions(p, width, height),
+            ) else {
+                continue;
+            };
+            let rows = rows as usize;
+            let needed = plane
+                .stride
+                .checked_mul(rows.saturating_sub(1))
+                .and_then(|n| n.checked_add(row));
+            if plane.stride < row || needed.is_none_or(|n| plane.data.len() < n) {
+                return Err(Error::invalid(format!(
+                    "plane {p} of a {width}x{height} {format:?} picture needs {rows} row(s) of \
+                     {row} bytes; the frame has stride {} and {} bytes",
+                    plane.stride,
+                    plane.data.len()
+                )));
+            }
+        }
         let blobs = frame.take_blobs();
         Ok(Self {
             frame,
