@@ -68,8 +68,12 @@ pub struct Image {
 
 impl Image {
     /// Wrap a decoded frame. `params` must carry `width`, `height` and
-    /// `pixel_format`; the frame must have the plane count the format
-    /// implies (side-channel records excluded). A metadata-blobs record
+    /// `pixel_format` — the shape of *this* frame (after a mid-stream
+    /// change, the parameters a `Frame::StreamParams` event or the
+    /// decoder's report describe, not the stream's opening shape); the
+    /// frame must have the plane count the format implies (side-channel
+    /// records excluded), each plane holding the rows of its size
+    /// (stride padding allowed), else `InvalidData`. A metadata-blobs record
     /// on the frame is lifted into [`frame_blobs`](Self::frame_blobs);
     /// `params.blobs` become the [`stream_blobs`](Self::stream_blobs).
     pub fn from_video_frame(frame: VideoFrame, params: &CodecParameters) -> Result<Self> {
