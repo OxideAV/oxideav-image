@@ -439,6 +439,36 @@ fn compare_methods_match_magick() {
 }
 
 #[test]
+fn compare_against_every_earlier_frame_replacing_its_rectangle() {
+    // magick -layers compareany / compareclear / compareoverlay: a
+    // frame is compared with the canvas all earlier frames leave, each
+    // drawn over what it covers (not with the one frame before it).
+    let a = [
+        layer(2, 2, R, 0, 0, 6, 2, Dispose::Unspecified),
+        layer(2, 2, B, 4, 0, 6, 2, Dispose::Unspecified),
+        layer(4, 2, R, 0, 0, 6, 2, Dispose::Unspecified),
+    ];
+    let any = "6x2+0+0 2 2 Undefined; 6x2+4+0 2 2 Undefined; 6x2+2+0 2 2 Undefined";
+    expect(&layers::compare_any(&a).unwrap(), any);
+    expect(&layers::compare_overlay(&a).unwrap(), any);
+    expect(&layers::compare_clear(&a).unwrap(), "6x2+0+0 2 2 Undefined");
+    // Each earlier frame replaces its rectangle, transparency included:
+    // a transparent frame over red leaves those pixels transparent.
+    let b = [
+        layer(4, 2, R, 0, 0, 4, 2, Dispose::Unspecified),
+        layer(2, 2, T, 0, 0, 4, 2, Dispose::Unspecified),
+        paint(4, 2, T, &[(2, 0, 2, 2, R)]).with_page(Page::new(4, 2)),
+    ];
+    let first_two = "4x2+0+0 4 2 Undefined; 4x2+0+0 2 2 Undefined";
+    expect(&layers::compare_any(&b).unwrap(), first_two);
+    expect(&layers::compare_clear(&b).unwrap(), first_two);
+    expect(
+        &layers::compare_overlay(&b).unwrap(),
+        "4x2+0+0 4 2 Undefined",
+    );
+}
+
+#[test]
 fn compare_works_on_layers_and_drops_unchanged_frames() {
     // Layered input: each layer against the one before it on the canvas.
     expect(

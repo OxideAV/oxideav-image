@@ -494,7 +494,7 @@ disposal and pixels of each frame compared on 519 generated animations
 |---|---|
 | `coalesce` | Plays the list on a canvas the size of the first frame's — a new one at every change of canvas (below) — (background: `LayerOptions::background`, transparent black by default) and returns every displayed canvas, `WxH+0+0`. Output disposal: `Background` where the next frame clears a visible pixel, else `None`; the last repeats the previous. |
 | `apply_disposal` | The canvas each frame leaves for the next (after its disposal). |
-| `compare_any` (`deconstruct`), `compare_clear`, `compare_overlay` | Frame 0 as is; each later frame cropped to the pixels that differ from the frame before it (both placed on the canvas, no disposal applied) — all of them / the ones turning transparent / the changed ones that are visible afterwards. A frame with nothing to keep is dropped. |
+| `compare_any` (`deconstruct`), `compare_clear`, `compare_overlay` | Frame 0 as is; each later frame cropped to the pixels of its rectangle that differ from the canvas the frames before it leave (each drawn at its offset replacing what it covers, on a transparent canvas, no disposal applied) — all of them / the ones turning transparent / the changed ones that are visible afterwards. A frame with nothing to keep is dropped. |
 | `optimize_frame` | For a coalesced list (full canvas; else `InvalidData` "coalesce first"; each run of one size on its own): the smallest frames, choosing each disposal. Per transition the candidates are `None` (only when nothing visible must be erased), `Previous`, and `Background` with the previous window grown over the pixels to erase; cost = next window's area (+ the growth); ties go None → Previous → Background. An unchanged frame is a 1×1 transparent pixel at `-1-1`. |
 | `optimize_plus` | `optimize_frame` plus a fourth candidate, ranked before `Background`: keep the frame (`None`, zero delay) and add a clearing frame over just the pixels to erase (`Background`, the delay), costed as both windows; frames identical to their predecessor (from the third on) fold into it. |
 | `optimize_transparency` | Every pixel of an `Over` frame that leaves the canvas pixel under it unchanged becomes transparent. |
@@ -546,21 +546,23 @@ Deliberate departures from `magick` 7.1.2:
   applies that rule (below).
 
 **`BackgroundRule::FirstFrameAlpha`**, for callers that must reproduce
-`Imagick` results. Pinned on 563 random layered lists (two seeds; 6–14
+`Imagick` results. Pinned on 600 random layered lists (two seeds; 6–14
 pixel canvases, 2–5 frames with random offsets — negative and running
 off the canvas — and disposals, half of them with an alpha-less first
-frame, 0 / 255 alpha, an opaque `-background`): `coalesce` matches
-`magick -coalesce` in geometry, disposal and every pixel on 563 / 563
-(the default rule: 122), `optimize_transparency` matches
-`-layers optimizetransparency` on 589 / 589 (the default rule: 67;
-`magick` refuses the other lists), and `optimize` matches
-`-layers optimize` in geometry and disposal on 563 / 563 and in pixels
-on 347; on the rest every differing pixel is one the gateway leaves
-fully transparent where `magick` writes black at a partial alpha
-(on one list, two pixels the gateway keeps opaque black over the same
-black) — on 196 of those 216 lists `magick`'s own output does not
-coalesce back to its `-coalesce`. The gateway's optimised lists
-coalesce back to the original animation on all 563, under either rule.
+frame, 0 / 255 alpha, an opaque `-background`), each operation against
+its `magick` counterpart in geometry, disposal and every pixel:
+`coalesce` 571 / 571 (`magick` refuses the other lists; the default
+rule: 113), `optimize_transparency` 594 / 594 (the default rule: 87),
+`optimize_frame` and `optimize_plus` of the coalesced list 571 / 571,
+`compare_any` / `compare_clear` / `compare_overlay`, `flatten`,
+`mosaic`, `merge`, `trim_bounds` 600 / 600 each. `optimize` matches
+`-layers optimize` in geometry and disposal on 571 / 571 and in pixels
+on 388; on the rest every differing pixel is one the gateway leaves
+fully transparent (or, on 2 lists, opaque black over the same black)
+where `magick` writes black at a partial alpha — on 165 of those 183
+lists `magick`'s own output does not coalesce back to its `-coalesce`.
+The gateway's optimised lists coalesce back to the original animation
+on all 571, under either rule.
 
 For semi-transparent content (`0 < alpha < 255`) the optimisers inherit
 `magick`'s 1-bit view: an overlay window is composited again over the

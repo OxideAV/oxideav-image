@@ -20,6 +20,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `optimize` matches `-layers optimize` in geometry and disposal on all
   563. `Fill` (the default) keeps the specifications' model.
 
+### Fixed
+
+- `compare_any` / `deconstruct` / `compare_clear` / `compare_overlay`
+  compare each frame with the canvas every earlier frame leaves (each
+  replacing its rectangle, no disposal), not with the one frame before
+  it (#5): layered lists whose frames do not cover each other now match
+  `magick -layers compare*` on 600 / 600 random lists (288 / 252 / 292
+  before).
+
 ## [0.0.6](https://github.com/OxideAV/oxideav-image/compare/v0.0.5...v0.0.6) - 2026-11-06
 
 ### Other

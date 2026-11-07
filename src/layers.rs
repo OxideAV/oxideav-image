@@ -687,9 +687,11 @@ enum Compare {
     Overlay,
 }
 
-/// Each frame after the first cropped to the pixels that differ from
-/// the frame before it, both placed on the canvas at their offsets (no
-/// disposal applied): ImageMagick's `CompareAny`, `deconstructImages`.
+/// Each frame after the first cropped to the pixels of its rectangle
+/// that differ from the canvas the frames before it leave — every
+/// earlier frame drawn at its offset replacing what it covers, on a
+/// transparent canvas, no disposal applied: ImageMagick's
+/// `CompareAny`, `deconstructImages`.
 /// The first frame is kept as is; a frame identical to its predecessor
 /// has nothing to keep and is dropped, as ImageMagick drops it.
 pub fn compare_any(frames: &[Image]) -> Result<Vec<Image>> {
@@ -718,15 +720,20 @@ fn compare(frames: &[Image], how: Compare) -> Result<Vec<Image>> {
     need_frames(frames, "compare")?;
     let deep = is_deep(frames);
     let mut out = vec![frames[0].clone()];
+    // Every earlier frame of the canvas, each replacing its rectangle
+    // (no disposal, no blending): what the current frame is compared
+    // against.
+    let (cw, ch) = frames[0].canvas_size();
+    let mut before = Raster::filled(cw, ch, CLEAR)?;
     for pair in frames.windows(2) {
         let (prev, cur) = (&pair[0], &pair[1]);
         let (cw, ch) = cur.canvas_size();
         if prev.canvas_size() != (cw, ch) {
             // A new canvas: nothing to compare against, kept whole.
+            before = Raster::filled(cw, ch, CLEAR)?;
             out.push(cur.clone());
             continue;
         }
-        let mut before = Raster::filled(cw, ch, CLEAR)?;
         let pr = frame_rect(prev);
         before.draw(&Raster::of(prev)?, pr.x, pr.y, Blend::Source);
         let src = Raster::of(cur)?;
