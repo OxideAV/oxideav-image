@@ -24,6 +24,8 @@
 //! application-defined color"), a picture is drawn with its [`Blend`]
 //! (the non-premultiplied OVER of RFC 9649 §2.7.1.1), then disposed
 //! (GIF89a §23.c.iv / fcTL `dispose_op` / ANMF D bit).
+//! [`BackgroundRule::FirstFrameAlpha`] swaps the background part for
+//! the rule the `magick` binary applies.
 //!
 //! Two of the comparisons use a *visibility threshold*: a pixel counts
 //! as transparent when its alpha is below one half (`< 32768` at
@@ -64,6 +66,34 @@ pub struct LayerOptions {
     /// [`flatten`] / [`mosaic`] / [`merge`] and what
     /// [`Dispose::Background`] restores. Default transparent black.
     pub background: [u16; 4],
+    /// How [`background`](Self::background) seeds a played canvas and
+    /// what [`Dispose::Background`] restores; see [`BackgroundRule`].
+    pub background_rule: BackgroundRule,
+}
+
+/// How the layer operations that play a list ([`coalesce`],
+/// [`apply_disposal`], [`optimize_transparency`], [`optimize`]) use
+/// [`LayerOptions::background`]. [`flatten`], [`mosaic`], [`merge`]
+/// fill their canvas with the background as given under every rule.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum BackgroundRule {
+    /// The canvas starts as the background colour exactly as given, and
+    /// [`Dispose::Background`] restores it (the animation
+    /// specifications' model: PNG 3rd edition §11.3.6.2, RFC 9649
+    /// §2.7.2). The default.
+    #[default]
+    Fill,
+    /// The rule the `magick` binary (7.1.2) applies, for callers that
+    /// must reproduce `Imagick` results: [`coalesce`] /
+    /// [`apply_disposal`] start each canvas as the background colour,
+    /// *opaque* when the first frame of the canvas has no alpha
+    /// ([`Image::has_alpha`] false) and *fully transparent* (alpha `0`,
+    /// colour kept) when it has; [`optimize_transparency`] starts from
+    /// fully transparent whatever the background; and
+    /// [`Dispose::Background`] clears the rectangle to fully
+    /// transparent (each pixel's colour kept, alpha `0`).
+    FirstFrameAlpha,
 }
 
 impl LayerOptions {
@@ -83,6 +113,34 @@ impl LayerOptions {
     pub fn with_background_rgba16(mut self, rgba: [u16; 4]) -> Self {
         self.background = rgba;
         self
+    }
+
+    /// The [`BackgroundRule`] of the played canvases.
+    pub fn with_background_rule(mut self, rule: BackgroundRule) -> Self {
+        self.background_rule = rule;
+        self
+    }
+
+    /// The colour a played canvas whose first frame is `first` starts
+    /// as. `transparent_start` = the operation starts from fully
+    /// transparent under [`BackgroundRule::FirstFrameAlpha`].
+    fn canvas_start(&self, first: &Image, transparent_start: bool) -> Px {
+        let bg = self.background;
+        match self.background_rule {
+            BackgroundRule::FirstFrameAlpha if transparent_start || first.has_alpha() => {
+                [bg[0], bg[1], bg[2], 0]
+            }
+            BackgroundRule::FirstFrameAlpha => [bg[0], bg[1], bg[2], u16::MAX],
+            _ => bg,
+        }
+    }
+
+    /// [`Dispose::Background`] of rectangle `r` on `canvas`.
+    fn dispose_background(&self, canvas: &mut Raster, r: Rect) {
+        match self.background_rule {
+            BackgroundRule::FirstFrameAlpha => canvas.clear_alpha(r),
+            _ => canvas.fill(Some(r), self.background),
+        }
     }
 }
 
@@ -355,6 +413,20 @@ impl Raster {
         }
     }
 
+    /// Alpha `0` over `r` (clipped), colours kept.
+    fn clear_alpha(&mut self, r: Rect) {
+        let Some(r) = r.intersect(self.w, self.h) else {
+            return;
+        };
+        for cy in r.y..r.y + r.h {
+            for cx in r.x..r.x + r.w {
+                let mut p = self.at(cx, cy);
+                p[3] = 0;
+                self.put(cx, cy, p);
+            }
+        }
+    }
+
     fn crop(&self, r: Rect) -> Raster {
         let mut px = Vec::with_capacity((r.w * r.h) as usize);
         for y in r.y..r.y + r.h {
@@ -505,13 +577,12 @@ fn play(
     mut visit: impl FnMut(usize, &Raster, &Raster, bool) -> Result<()>,
 ) -> Result<()> {
     let (cw, ch) = frames[0].canvas_size();
-    let bg = opts.background;
-    let mut canvas = Raster::filled(cw, ch, bg)?;
+    let mut canvas = Raster::filled(cw, ch, opts.canvas_start(&frames[0], false))?;
     for (i, f) in frames.iter().enumerate() {
         let fresh = new_canvas(frames, i);
         if fresh {
             let (cw, ch) = f.canvas_size();
-            canvas = Raster::filled(cw, ch, bg)?;
+            canvas = Raster::filled(cw, ch, opts.canvas_start(f, false))?;
         }
         let saved = (f.dispose() == Dispose::Previous).then(|| canvas.clone());
         let src = Raster::of(f)?;
@@ -519,7 +590,7 @@ fn play(
         canvas.draw(&src, r.x, r.y, f.blend());
         let shown = canvas.clone();
         match f.dispose() {
-            Dispose::Background => canvas.fill(Some(r), bg),
+            Dispose::Background => opts.dispose_background(&mut canvas, r),
             // On the first frame the state before it is the initial
             // background (APNG: "treated as APNG_DISPOSE_OP_BACKGROUND").
             Dispose::Previous => canvas = saved.unwrap_or_else(|| canvas.clone()),
@@ -926,13 +997,12 @@ pub fn optimize_transparency_with(frames: &[Image], opts: &LayerOptions) -> Resu
     need_frames(frames, "optimize-transparency")?;
     let deep = is_deep(frames);
     let (cw, ch) = frames[0].canvas_size();
-    let bg = opts.background;
-    let mut canvas = Raster::filled(cw, ch, bg)?;
+    let mut canvas = Raster::filled(cw, ch, opts.canvas_start(&frames[0], true))?;
     let mut out = Vec::with_capacity(frames.len());
     for (i, f) in frames.iter().enumerate() {
         if new_canvas(frames, i) {
             let (cw, ch) = f.canvas_size();
-            canvas = Raster::filled(cw, ch, bg)?;
+            canvas = Raster::filled(cw, ch, opts.canvas_start(f, true))?;
         }
         let saved = (f.dispose() == Dispose::Previous).then(|| canvas.clone());
         let src = Raster::of(f)?;
@@ -954,7 +1024,7 @@ pub fn optimize_transparency_with(frames: &[Image], opts: &LayerOptions) -> Resu
         }
         canvas.draw(&src, r.x, r.y, f.blend());
         match f.dispose() {
-            Dispose::Background => canvas.fill(Some(r), bg),
+            Dispose::Background => opts.dispose_background(&mut canvas, r),
             Dispose::Previous => canvas = saved.unwrap_or_else(|| canvas.clone()),
             _ => {}
         }

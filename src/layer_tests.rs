@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use crate::layers::{self, LayerMethod, LayerOptions};
+use crate::layers::{self, BackgroundRule, LayerMethod, LayerOptions};
 use crate::{Blend, Dispose, Image, Page};
 
 type C = [u8; 4];
@@ -765,6 +765,136 @@ fn layer_methods_dispatch() {
             "{m:?}"
         );
     }
+}
+
+// ---- the first-frame-alpha background rule ---------------------------
+
+/// `w × h` of `c` without an alpha channel (`Rgb24`).
+fn opaque(w: u32, h: u32, c: C) -> Image {
+    Image::from_rgb8(w, h, [c[0], c[1], c[2]].repeat((w * h) as usize)).unwrap()
+}
+
+/// On a 12×10 canvas: an opaque (no alpha channel) red 6×4 at +1+1, a
+/// lime 3×3 with a transparent centre at +4+3 disposed to background, a
+/// yellow 2×2 at +0+0 restored to previous, a red 2×2 at +9+7.
+fn c10() -> Vec<Image> {
+    let mut lime = paint(3, 3, G, &[(1, 1, 1, 1, T)]);
+    lime = lime.with_page(Page::new(12, 10).with_offset(4, 3));
+    vec![
+        opaque(6, 4, R)
+            .with_page(Page::new(12, 10).with_offset(1, 1))
+            .with_dispose(Dispose::None),
+        lime.with_dispose(Dispose::Background),
+        opaque(2, 2, Y)
+            .with_page(Page::new(12, 10))
+            .with_dispose(Dispose::Previous),
+        opaque(2, 2, R)
+            .with_page(Page::new(12, 10).with_offset(9, 7))
+            .with_dispose(Dispose::None),
+    ]
+}
+
+fn magick_rule(bg: C) -> LayerOptions {
+    LayerOptions::new()
+        .with_background_rgba8(bg)
+        .with_background_rule(BackgroundRule::FirstFrameAlpha)
+}
+
+#[test]
+fn first_frame_alpha_rule_coalesces_like_magick() {
+    // magick c10 -background blue -coalesce: the canvas starts opaque
+    // blue (frame 0 has no alpha channel), the background disposal
+    // clears to transparent with the colour kept.
+    let out = layers::coalesce_with(&c10(), &magick_rule(B)).unwrap();
+    expect(
+        &out,
+        "12x10+0+0 12 10 None; 12x10+0+0 12 10 Background; \
+         12x10+0+0 12 10 None; 12x10+0+0 12 10 None",
+    );
+    let at = |k: usize| [(0, 0), (1, 1), (4, 3), (5, 4), (11, 9)].map(|(x, y)| px(&out[k], x, y));
+    assert_eq!(at(0), [B, R, R, R, B]);
+    assert_eq!(at(1), [B, R, G, R, B]);
+    assert_eq!(at(2), [Y, Y, [0, 255, 0, 0], [255, 0, 0, 0], B]);
+    assert_eq!(at(3), [B, R, [0, 255, 0, 0], [255, 0, 0, 0], B]);
+    // The default rule fills with the background as given.
+    let out = layers::coalesce_with(&c10(), &LayerOptions::new().with_background_rgba8(B)).unwrap();
+    assert_eq!(px(&out[2], 4, 3), B);
+}
+
+#[test]
+fn first_frame_alpha_rule_starts_transparent_after_an_alpha_frame() {
+    // magick: red 10×10 (alpha on / off) at +0+0 on 20×20, opaque lime
+    // 5×5 at +10+10, -background blue -coalesce, pixel 19,0.
+    for (alpha, want) in [(true, [0, 0, 255, 0]), (false, B)] {
+        let first = if alpha {
+            paint(10, 10, R, &[])
+        } else {
+            opaque(10, 10, R)
+        };
+        let frames = [
+            first.with_page(Page::new(20, 20)),
+            opaque(5, 5, G).with_page(Page::new(20, 20).with_offset(10, 10)),
+        ];
+        let out = layers::coalesce_with(&frames, &magick_rule(B)).unwrap();
+        assert_eq!(px(&out[0], 19, 0), want, "alpha {alpha}");
+        assert_eq!(px(&out[1], 19, 19), want, "alpha {alpha}");
+        assert_eq!(px(&out[1], 12, 12), G);
+        // Previous on the first frame restores that initial canvas.
+        let mut prev = frames.clone();
+        prev[0].set_dispose(Dispose::Previous);
+        let out = layers::coalesce_with(&prev, &magick_rule(B)).unwrap();
+        assert_eq!(px(&out[1], 0, 0), want, "alpha {alpha}");
+    }
+}
+
+#[test]
+fn first_frame_alpha_rule_optimizes_like_magick() {
+    let out = layers::optimize_with(&c10(), &magick_rule(B)).unwrap();
+    expect(
+        &out,
+        "12x10+0+0 12 10 None; 12x10+4+3 3 3 Background; \
+         12x10+0+0 2 2 Previous; 12x10+9+7 2 2 Previous",
+    );
+    assert_eq!([px(&out[0], 0, 0), px(&out[0], 1, 1)], [B, R]);
+    assert_eq!((px(&out[1], 0, 0), px(&out[1], 1, 1)[3]), (G, 0));
+    assert_eq!(px(&out[2], 1, 1), Y);
+    assert_eq!(px(&out[3], 0, 0), R);
+    // The list replays to the coalesced animation under the same rule.
+    let replay = |frames: &[Image]| -> Vec<Vec<u8>> {
+        layers::coalesce_with(frames, &magick_rule(B))
+            .unwrap()
+            .iter()
+            .map(|f| {
+                let mut b = f.to_rgba8().unwrap();
+                b.chunks_mut(4)
+                    .filter(|p| p[3] == 0)
+                    .for_each(|p| p.fill(0));
+                b
+            })
+            .collect()
+    };
+    assert_eq!(replay(&out), replay(&c10()));
+}
+
+#[test]
+fn first_frame_alpha_rule_optimizes_transparency_from_transparent() {
+    // magick: red 20×20 (alpha off) disposed to background, opaque blue
+    // 5×5 at +10+10, -background blue -layers optimizetransparency:
+    // the blue frame is kept (its canvas is transparent), whatever the
+    // background.
+    let frames = [
+        opaque(20, 20, R)
+            .with_page(Page::new(20, 20))
+            .with_dispose(Dispose::Background),
+        opaque(5, 5, B).with_page(Page::new(20, 20).with_offset(10, 10)),
+    ];
+    let out = layers::optimize_transparency_with(&frames, &magick_rule(B)).unwrap();
+    assert_eq!(px(&out[1], 0, 0), B);
+    // The default rule restores the opaque blue background, so the
+    // frame leaves it unchanged and goes.
+    let fill = LayerOptions::new().with_background_rgba8(B);
+    let out = layers::optimize_transparency_with(&frames, &fill).unwrap();
+    assert_eq!(px(&out[1], 0, 0)[3], 0);
 }
 
 #[test]

@@ -67,7 +67,7 @@ assert_eq!(indexed.to_rgba8()?[7], 0);           // palette alpha reaches the RG
 | `OpenOptions` | `execution` (`with_execution_context(ctx)` / `with_threads(n)` / `serial()`, see *Execution budget*), `max_frames`, `ext_hint`, `decoder_options`, `max_pixels`, `allow_containers` / `deny_containers` / `allow_codecs` / `deny_codecs`, `strip_metadata` / `strip_blobs` (`without_metadata()`, `with_stripped_blobs(kinds)`), `pixel_format` (`with_pixel_format(f)`: convert every picture after decoding; default keeps the decoder's layout). |
 | `SaveOptions` | `execution` (`with_execution_context(ctx)` / `with_threads(n)` / `serial()`), `loop_count` (`with_loop_count(plays)`, see *Layers*), `quality`, `pixel_format`, `codec`, `options`, `time_base`, `default_delay`, `blobs` (`with_blob(s)`), `strip_metadata` / `strip_blobs` (`without_metadata()`, `with_stripped_blobs(kinds)`), `container_metadata` (`with_container_metadata(pairs)` / `with_container_metadata_entry(k, v)`), `strip_metadata_keys` (`with_stripped_metadata_keys(keys)`), `strict_metadata` (`with_strict_metadata(true)`). |
 | `Page` / `Dispose` / `Blend` | The per-frame layer record (`#[non_exhaustive]`; `Page::new(w, h).with_offset(x, y)`). |
-| `layers::*` | Format-independent layer operations: `coalesce`, `apply_disposal`, `compare_any` / `deconstruct`, `compare_clear`, `compare_overlay`, `optimize`, `optimize_frame`, `optimize_plus`, `optimize_transparency`, `remove_dups`, `remove_zero`, `flatten`, `mosaic`, `merge`, `trim_bounds`, `composite_layers`; `_with` variants take `LayerOptions` (background); `layers(frames, LayerMethod, &opts)` dispatches. See *Layers*. |
+| `layers::*` | Format-independent layer operations: `coalesce`, `apply_disposal`, `compare_any` / `deconstruct`, `compare_clear`, `compare_overlay`, `optimize`, `optimize_frame`, `optimize_plus`, `optimize_transparency`, `remove_dups`, `remove_zero`, `flatten`, `mosaic`, `merge`, `trim_bounds`, `composite_layers`; `_with` variants take `LayerOptions` (background, `BackgroundRule`); `layers(frames, LayerMethod, &opts)` dispatches. See *Layers*. |
 | `BlobKind` / `MetadataBlob` / `MetadataSupport` | The framework's blob types, re-exported; `MetadataSupport` is what `EncodeTarget::metadata_support()` answers. |
 | `ImageError` (`Error`) | `#[non_exhaustive]`: see *Errors*. |
 
@@ -535,9 +535,32 @@ Deliberate departures from `magick` 7.1.2:
 - `apply_disposal`: `magick -layers dispose` returns the first frame's
   canvas for every frame; the gateway returns what the disposal model
   defines.
-- `magick` starts the canvas of a list whose first frame has no alpha
-  channel opaque (its background colour); the gateway always starts
-  from `LayerOptions::background`.
+- Background (default `BackgroundRule::Fill`): the canvas starts as
+  `LayerOptions::background` exactly as given and `Dispose::Background`
+  restores it, the specifications' model. `magick` starts the canvas
+  as its background colour made opaque when the first frame has no
+  alpha channel and made fully transparent when it has one, clears a
+  `Background` disposal to transparent, and starts
+  `-layers optimizetransparency` from transparent whatever the
+  background: `LayerOptions::with_background_rule(BackgroundRule::FirstFrameAlpha)`
+  applies that rule (below).
+
+**`BackgroundRule::FirstFrameAlpha`**, for callers that must reproduce
+`Imagick` results. Pinned on 563 random layered lists (two seeds; 6–14
+pixel canvases, 2–5 frames with random offsets — negative and running
+off the canvas — and disposals, half of them with an alpha-less first
+frame, 0 / 255 alpha, an opaque `-background`): `coalesce` matches
+`magick -coalesce` in geometry, disposal and every pixel on 563 / 563
+(the default rule: 122), `optimize_transparency` matches
+`-layers optimizetransparency` on 589 / 589 (the default rule: 67;
+`magick` refuses the other lists), and `optimize` matches
+`-layers optimize` in geometry and disposal on 563 / 563 and in pixels
+on 347; on the rest every differing pixel is one the gateway leaves
+fully transparent where `magick` writes black at a partial alpha
+(on one list, two pixels the gateway keeps opaque black over the same
+black) — on 196 of those 216 lists `magick`'s own output does not
+coalesce back to its `-coalesce`. The gateway's optimised lists
+coalesce back to the original animation on all 563, under either rule.
 
 For semi-transparent content (`0 < alpha < 255`) the optimisers inherit
 `magick`'s 1-bit view: an overlay window is composited again over the

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `layers::BackgroundRule` and `LayerOptions::with_background_rule` (#5):
+  `FirstFrameAlpha` plays a list the way the `magick` binary does — the
+  canvas starts as the background colour, opaque when the first frame
+  has no alpha channel and fully transparent when it has one;
+  `Dispose::Background` clears to transparent; `optimize_transparency`
+  starts from transparent. On 563 random layered lists `coalesce`
+  matches `magick -coalesce` pixel for pixel on all 563 (122 under the
+  default rule), `optimize_transparency` matches on 589 / 589, and
+  `optimize` matches `-layers optimize` in geometry and disposal on all
+  563. `Fill` (the default) keeps the specifications' model.
+
 ## [0.0.6](https://github.com/OxideAV/oxideav-image/compare/v0.0.5...v0.0.6) - 2026-11-06
 
 ### Other
