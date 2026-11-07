@@ -562,7 +562,11 @@ fully transparent (or, on 2 lists, opaque black over the same black)
 where `magick` writes black at a partial alpha — on 165 of those 183
 lists `magick`'s own output does not coalesce back to its `-coalesce`.
 The gateway's optimised lists coalesce back to the original animation
-on all 571, under either rule.
+on all 571, under either rule. A third seed (250 lists) adds random
+delays (0 / 5 / 10 cs) and repeated frames and compares the delays as
+well: `remove_dups` and `remove_zero` 250 / 250, every other operation
+as above, `optimize_plus` 236 / 237 (the other is the delay departure
+above).
 
 For semi-transparent content (`0 < alpha < 255`) the optimisers inherit
 `magick`'s 1-bit view: an overlay window is composited again over the
