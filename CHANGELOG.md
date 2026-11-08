@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/OxideAV/oxideav-image/compare/v0.0.6...v0.0.7) - 2026-11-07
+
+### Other
+
+- layer sweep with random delays and repeated frames ([#5](https://github.com/OxideAV/oxideav-image/pull/5))
+- :compare_*: compare each frame with the canvas the earlier frames leave ([#5](https://github.com/OxideAV/oxideav-image/pull/5))
+- :BackgroundRule::FirstFrameAlpha: play a layer list the way magick does ([#5](https://github.com/OxideAV/oxideav-image/pull/5))
+
 ### Added
 
 - `layers::BackgroundRule` and `LayerOptions::with_background_rule` (#5):
