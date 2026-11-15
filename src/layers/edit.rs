@@ -134,6 +134,35 @@ pub fn translate(frames: &[Image], dx: i32, dy: i32) -> Result<Vec<Image>> {
         .collect()
 }
 
+/// Keep of every frame the part inside its canvas: a frame that runs
+/// off the canvas is cut to the rectangle the two share (in its own
+/// layout where [`Image::crop`] can), and a frame wholly outside
+/// becomes one fully transparent overlay pixel at `+0+0` that is not
+/// disposed. The list plays exactly as before — what lies off the
+/// canvas is never shown, and disposing it changes nothing — and every
+/// frame now fits the canvas, as formats that store layers require.
+pub fn clip_to_canvas(frames: &[Image]) -> Result<Vec<Image>> {
+    let depth = Depth::of(frames);
+    frames
+        .iter()
+        .map(|f| {
+            let (cw, ch) = f.canvas_size();
+            let r = frame_rect(f);
+            match r.clip(cw as usize, ch as usize) {
+                Some(inside) if inside == r => Ok(f.clone()),
+                Some(inside) => cut(f, inside, depth),
+                None => {
+                    let pixel = Raster::filled(1, 1, depth, Px::clear(depth))?;
+                    Ok(raster_image(f, pixel)?
+                        .with_page(Page::new(cw, ch))
+                        .with_blend(Blend::Over)
+                        .with_dispose(Dispose::None))
+                }
+            }
+        })
+        .collect()
+}
+
 /// Cut `r` (canvas coordinates, inside the picture) out of `img`,
 /// leaving it where it was on its canvas.
 fn cut(img: &Image, r: Rect, depth: Depth) -> Result<Image> {

@@ -16,6 +16,7 @@ use crate::image::ticks_to_duration;
 
 use crate::error::{Error, Result};
 use crate::image::Image;
+use crate::layer::{LayerRecord, Page};
 
 /// What a file decoded to: the container that matched, its metadata and
 /// every picture (one for a still; the frames of an animation, burst,
@@ -583,6 +584,7 @@ pub fn decode_reader(
         .map(|s| DecodedParams {
             params: s.params.clone(),
             watch: OutputParamsWatch::new(),
+            layer: None,
         })
         .collect();
     // One decoder per video stream; other streams are skipped.
@@ -726,6 +728,33 @@ pub fn decode_reader(
 struct DecodedParams {
     params: CodecParameters,
     watch: OutputParamsWatch,
+    /// The stream's parameters at a layer's own size, for the stream
+    /// parameters they were made from: consecutive layers of one size
+    /// share them.
+    layer: Option<(Arc<CodecParameters>, Arc<CodecParameters>)>,
+}
+
+impl DecodedParams {
+    /// `shared` with the size `width × height`.
+    fn layer_params(
+        &mut self,
+        shared: &Arc<CodecParameters>,
+        width: u32,
+        height: u32,
+    ) -> Arc<CodecParameters> {
+        if let Some((from, sized)) = &self.layer
+            && Arc::ptr_eq(from, shared)
+            && (sized.width, sized.height) == (Some(width), Some(height))
+        {
+            return sized.clone();
+        }
+        let mut params = (**shared).clone();
+        params.width = Some(width);
+        params.height = Some(height);
+        let sized = Arc::new(params);
+        self.layer = Some((shared.clone(), sized.clone()));
+        sized
+    }
 }
 
 /// Pull every ready frame out of a decoder.
@@ -769,7 +798,29 @@ fn drain(
                 if decoded.watch.observe(dec, &mut decoded.params) {
                     *shared = Arc::new(decoded.params.clone());
                 }
-                let px = pixels_of(shared);
+                // A frame that is a layer of its stream's canvas says
+                // so in a record: its planes hold the record's size,
+                // the stream's size being the canvas.
+                let record = match vf.blob(&LayerRecord::kind()) {
+                    Some(blob) => Some(LayerRecord::from_bytes(&blob.data).ok_or_else(|| {
+                        Error::invalid(format!(
+                            "picture {} of stream {stream_index} (codec '{}') carries a \
+                             malformed '{}' record",
+                            images.len(),
+                            stream.codec_id,
+                            LayerRecord::KIND
+                        ))
+                    })?),
+                    None => None,
+                };
+                let canvas = (shared.width, shared.height);
+                let own = match record {
+                    Some(r) if (Some(r.width), Some(r.height)) != canvas => {
+                        decoded.layer_params(shared, r.width, r.height)
+                    }
+                    _ => shared.clone(),
+                };
+                let px = pixels_of(&own);
                 if spent.saturating_add(px) > budget {
                     return Err(Error::limit(format!(
                         "picture {} would bring the decoded total to {} pixels, over the \
@@ -810,7 +861,7 @@ fn drain(
                 // state: a decoder that changed shape without saying so
                 // (no event, no generation bump) is reported here rather
                 // than handed out under the old label.
-                let mut img = Image::from_video_frame_shared(vf, shared.clone())
+                let mut img = Image::from_video_frame_shared(vf, own)
                     .map_err(|e| match e {
                         Error::InvalidData(msg) => Error::invalid(format!(
                             "picture {index} of stream {stream_index} (codec '{}') does not \
@@ -821,6 +872,21 @@ fn drain(
                     })?
                     .with_index(index)
                     .with_blend(crate::layer::Blend::Source);
+                if let Some(r) = record {
+                    // The record is the picture's layer fields; it is
+                    // written again from them, not carried as a blob.
+                    img.retain_frame_blobs(|b| !b.is(&LayerRecord::kind()));
+                    let side = |stated: u32, stream: Option<u32>| match stated {
+                        0 => stream.unwrap_or(0),
+                        n => n,
+                    };
+                    img.set_page(
+                        Page::new(side(r.page.width, canvas.0), side(r.page.height, canvas.1))
+                            .with_offset(r.page.x, r.page.y),
+                    );
+                    img.set_dispose(r.dispose);
+                    img.set_blend(r.blend);
+                }
                 crate::adapt::adapt(&mut img, stream);
                 // The stream level was filtered before decoding; only
                 // the frame's own blobs are left to check.

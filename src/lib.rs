@@ -56,6 +56,8 @@ mod fixture;
 #[cfg(test)]
 mod layer_exact_tests;
 #[cfg(test)]
+mod layer_registry_tests;
+#[cfg(test)]
 mod layer_tests;
 #[cfg(test)]
 mod meta_tests;
@@ -68,7 +70,9 @@ mod tests;
 
 pub use error::{Error, ImageError, Result};
 pub use image::Image;
-pub use layer::{BACKGROUND_COLOR_KEY, Blend, Dispose, Page, format_background, parse_background};
+pub use layer::{
+    BACKGROUND_COLOR_KEY, Blend, Dispose, LayerRecord, Page, format_background, parse_background,
+};
 pub use layers::{LayerSequence, OptimizeOptions};
 pub use open::{
     ImageFile, OpenOptions, decode_bytes, decode_bytes_with, decode_reader, decode_vec,
@@ -77,7 +81,7 @@ pub use open::{
 pub use save::{
     DEFAULT_DELAY, EncodeTarget, Encoded, FormatSupport, MetadataSupport, SaveOptions, can_encode,
     can_open, codec_only_formats, encode, encode_detailed, encode_frames, encoder_options,
-    resolve_target, save, save_detailed, support,
+    encodes_layers, resolve_target, save, save_detailed, support,
 };
 
 /// Re-exported for convenience: the framework's pixel layouts and colour

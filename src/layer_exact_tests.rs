@@ -205,6 +205,14 @@ fn option_grid() -> Vec<OptimizeOptions> {
 
 fn check_identity(frames: &[Image], depth: Depth, layer: LayerOptions, seed: u64) {
     let want = layers::coalesce_with(frames, &layer).unwrap();
+    // A coalesced list plays back to itself.
+    let replay = layers::coalesce_with(&want, &layer).unwrap();
+    assert_same_pictures(
+        &replay,
+        &want,
+        depth,
+        &format!("seed {seed} {depth:?} coalesce twice"),
+    );
     for opts in option_grid() {
         let opts = opts.with_layer_options(layer);
         let small = layers::optimize_layers_with(frames, &opts).unwrap();

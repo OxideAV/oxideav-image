@@ -222,3 +222,155 @@ pub fn format_background(rgba: [u16; 4]) -> String {
         format!("#{r:04x}{g:04x}{b:04x}{a:04x}")
     }
 }
+
+/// A frame's layer fields as they travel through the registry: a
+/// per-frame metadata blob of kind [`LayerRecord::KIND`] on the
+/// `VideoFrame` a decoder hands out (a frame that is a layer of its
+/// stream's canvas rather than the whole canvas) and on the frame an
+/// encoder is handed (when it declares the kind among its
+/// `CodecCapabilities::embedded_blob_kinds`).
+///
+/// The stream's `width × height` is the canvas; the record states the
+/// picture's own size — a frame's planes hold `width × height` of the
+/// record, not of the stream — its offset on the canvas, its disposal
+/// and its blending. The delay is the packet's duration, as for any
+/// frame.
+///
+/// Wire form ([`to_bytes`](Self::to_bytes), 28 bytes, little-endian):
+///
+/// | bytes | field |
+/// |---|---|
+/// | 0 | version, `1` |
+/// | 1 | disposal: `0` unspecified, `1` none, `2` background, `3` previous |
+/// | 2 | blending: `0` over, `1` source |
+/// | 3 | reserved, `0` |
+/// | 4..8, 8..12 | canvas width, height (`u32`; `0` = the stream's) |
+/// | 12..16, 16..20 | offset x, y (`i32`) |
+/// | 20..24, 24..28 | picture width, height (`u32`) |
+///
+/// `#[non_exhaustive]`: build it with [`new`](Self::new) /
+/// [`of`](Self::of) and the `with_*` builders.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct LayerRecord {
+    /// The canvas and the picture's offset on it.
+    pub page: Page,
+    /// The picture's own width in pixels.
+    pub width: u32,
+    /// The picture's own height in pixels.
+    pub height: u32,
+    /// What happens to the rectangle after the delay.
+    pub dispose: Dispose,
+    /// How the picture is combined with the canvas.
+    pub blend: Blend,
+}
+
+impl LayerRecord {
+    /// The metadata-blob kind of the record.
+    pub const KIND: &'static str = "image-layer";
+    /// Length of the wire form.
+    pub const WIRE_LEN: usize = 28;
+
+    /// A `width × height` picture on `page`, [`Dispose::Unspecified`],
+    /// [`Blend::Over`].
+    pub fn new(page: Page, width: u32, height: u32) -> Self {
+        Self {
+            page,
+            width,
+            height,
+            dispose: Dispose::Unspecified,
+            blend: Blend::Over,
+        }
+    }
+
+    /// The record of `image`: its size, its page with the canvas made
+    /// explicit, its disposal and blending.
+    pub fn of(image: &crate::Image) -> Self {
+        let (cw, ch) = image.canvas_size();
+        let (x, y) = image.offset();
+        Self {
+            page: Page::new(cw, ch).with_offset(x, y),
+            width: image.width(),
+            height: image.height(),
+            dispose: image.dispose(),
+            blend: image.blend(),
+        }
+    }
+
+    /// The same record with another disposal.
+    pub fn with_dispose(mut self, dispose: Dispose) -> Self {
+        self.dispose = dispose;
+        self
+    }
+
+    /// The same record with another blending.
+    pub fn with_blend(mut self, blend: Blend) -> Self {
+        self.blend = blend;
+        self
+    }
+
+    /// The blob kind, as a `BlobKind`.
+    pub fn kind() -> oxideav_core::BlobKind {
+        oxideav_core::BlobKind::from_static(Self::KIND)
+    }
+
+    /// The wire form.
+    pub fn to_bytes(&self) -> [u8; Self::WIRE_LEN] {
+        let mut out = [0u8; Self::WIRE_LEN];
+        out[0] = 1;
+        out[1] = self.dispose.gif_code();
+        out[2] = u8::from(self.blend == Blend::Source);
+        let words = [
+            self.page.width.to_le_bytes(),
+            self.page.height.to_le_bytes(),
+            self.page.x.to_le_bytes(),
+            self.page.y.to_le_bytes(),
+            self.width.to_le_bytes(),
+            self.height.to_le_bytes(),
+        ];
+        for (o, w) in out[4..].as_chunks_mut::<4>().0.iter_mut().zip(words) {
+            *o = w;
+        }
+        out
+    }
+
+    /// Read the wire form. `None` for another length or version, an
+    /// unknown disposal or blending code, a non-zero reserved byte or a
+    /// picture with a zero side.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let bytes: &[u8; Self::WIRE_LEN] = bytes.try_into().ok()?;
+        if bytes[0] != 1 || bytes[1] > 3 || bytes[2] > 1 || bytes[3] != 0 {
+            return None;
+        }
+        let words = bytes[4..].as_chunks::<4>().0;
+        let unsigned = |i: usize| u32::from_le_bytes(words[i]);
+        let signed = |i: usize| i32::from_le_bytes(words[i]);
+        let (width, height) = (unsigned(4), unsigned(5));
+        if width == 0 || height == 0 {
+            return None;
+        }
+        Some(Self {
+            page: Page::new(unsigned(0), unsigned(1)).with_offset(signed(2), signed(3)),
+            width,
+            height,
+            dispose: Dispose::from_gif_code(bytes[1]),
+            blend: if bytes[2] == 1 {
+                Blend::Source
+            } else {
+                Blend::Over
+            },
+        })
+    }
+
+    /// The record as a metadata blob of kind [`KIND`](Self::KIND).
+    pub fn to_blob(&self) -> oxideav_core::MetadataBlob {
+        oxideav_core::MetadataBlob::new(Self::kind(), self.to_bytes().to_vec())
+    }
+}
+
+/// `true` when every frame is on one canvas.
+pub(crate) fn one_canvas(frames: &[crate::Image]) -> bool {
+    frames
+        .windows(2)
+        .all(|w| w[0].canvas_size() == w[1].canvas_size())
+}

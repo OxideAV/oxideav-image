@@ -9,6 +9,7 @@ use std::time::Duration;
 use crate::error::{Error, Result};
 use crate::image::{Image, duration_to_ticks};
 use crate::ladder;
+use crate::layer::LayerRecord;
 use oxideav_core::{
     BlobKind, CodecId, CodecParameters, ExecutionContext, Frame, MediaType, MetadataBlob,
     OptionField, Packet, PixelFormat, RuntimeContext, StreamInfo, TimeBase,
@@ -341,9 +342,19 @@ pub struct Encoded {
     pixel_format: PixelFormat,
     metadata_written: Vec<String>,
     metadata_dropped: Vec<String>,
+    layered: bool,
 }
 
 impl Encoded {
+    /// `true` when the pictures were written as layers — each frame
+    /// its own rectangle with its offset, disposal and blending
+    /// ([`crate::LayerRecord`]) — rather than as full canvases: the
+    /// list was layered and the encoder declared that it writes the
+    /// record ([`encodes_layers`]).
+    pub fn layered(&self) -> bool {
+        self.layered
+    }
+
     /// The encoded file.
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
@@ -882,17 +893,6 @@ pub fn encode_detailed(
         }
         _ => opts,
     };
-    // A layered list (sub-rectangle frames, or frames that dispose
-    // their rectangle) is written as it is displayed: the framework has
-    // no per-frame placement record an encoder or muxer could read, so
-    // every frame goes out as its full canvas.
-    let coalesced;
-    let images = if crate::layer::is_layered(images) {
-        coalesced = crate::layers::coalesce(images)?;
-        coalesced.as_slice()
-    } else {
-        images
-    };
     let target = resolve_format(ctx, format)?;
     let codec_id = codec_for(ctx, &target, opts);
     if !ctx.codecs.has_encoder(&codec_id) {
@@ -900,8 +900,35 @@ pub fn encode_detailed(
             "no registered encoder for codec '{codec_id}' ({target})"
         )));
     }
+    // A layered list (sub-rectangle frames, or frames that dispose
+    // their rectangle) goes out as layers — each frame with its
+    // `LayerRecord` — when the encoder declares that it writes the
+    // record and the list keeps one canvas; else as it is displayed,
+    // every frame its full canvas.
+    let prepared;
+    let (images, layered) = if crate::layer::is_layered(images) {
+        if encoder_takes_layers(ctx, &codec_id) && crate::layer::one_canvas(images) {
+            prepared = crate::layers::clip_to_canvas(images)?;
+            (prepared.as_slice(), true)
+        } else {
+            prepared = crate::layers::coalesce(images)?;
+            (prepared.as_slice(), false)
+        }
+    } else {
+        (images, false)
+    };
 
-    let groups = group_by_geometry(images);
+    let groups = if layered {
+        let (width, height) = images[0].canvas_size();
+        vec![Group {
+            width,
+            height,
+            members: (0..images.len()).collect(),
+            layered: true,
+        }]
+    } else {
+        group_by_geometry(images)
+    };
     if groups.len() > 1 && matches!(target, Target::CodecOnly(_)) {
         return Err(Error::unsupported(format!(
             "{target} writes one picture geometry per file; {} were given ({})",
@@ -917,7 +944,10 @@ pub fn encode_detailed(
     let text = opts.text_metadata(&images[0]);
     for dst in candidates {
         match encode_attempt(ctx, images, &groups, &target, &codec_id, dst, &text, opts) {
-            Ok(done) => return Ok(done),
+            Ok(mut done) => {
+                done.layered = layered;
+                return Ok(done);
+            }
             // The target refused the metadata itself: no other layout
             // changes that.
             Err(Attempt::Fatal(e)) => return Err(e),
@@ -950,6 +980,9 @@ struct Group {
     height: u32,
     /// Indices into the picture slice, in order.
     members: Vec<usize>,
+    /// The pictures are layers of a `width × height` canvas, each sent
+    /// with its [`LayerRecord`], rather than pictures of that size.
+    layered: bool,
 }
 
 /// One group per distinct `(width, height)`, in first-appearance order.
@@ -963,6 +996,7 @@ fn group_by_geometry(images: &[Image]) -> Vec<Group> {
                 width: w,
                 height: h,
                 members: vec![i],
+                layered: false,
             }),
         }
     }
@@ -1275,6 +1309,7 @@ fn encode_attempt(
                 pixel_format: dst,
                 metadata_written: Vec::new(),
                 metadata_dropped: distinct_keys(text),
+                layered: false,
             });
         }
     };
@@ -1335,6 +1370,7 @@ fn encode_attempt(
         pixel_format: dst,
         metadata_written,
         metadata_dropped,
+        layered: false,
     })
 }
 
@@ -1415,7 +1451,7 @@ fn encode_group(
         let converted = img.to_format(dst)?;
         same_shape(&converted, group, dst, i)?;
         let (mut frame, _) = converted.into_video_frame();
-        frame.set_blobs(opts.frame_blobs(img));
+        frame.set_blobs(frame_blobs(img, group, opts));
         frame.pts = Some(pts);
         let delay = if images.len() == 1 {
             img.delay().unwrap_or(Duration::ZERO)
@@ -1446,7 +1482,7 @@ fn encode_group(
             let mut enc = ctx.codecs.first_encoder(params)?;
             enc.set_execution_context(&execution);
             let (mut frame, _) = images[i].to_format(dst)?.into_video_frame();
-            frame.set_blobs(opts.frame_blobs(&images[i]));
+            frame.set_blobs(frame_blobs(&images[i], group, opts));
             frame.pts = Some(0);
             enc.send_frame(&Frame::Video(frame))?;
             enc.flush()?;
@@ -1476,6 +1512,40 @@ fn encode_group(
     Ok((packets, out_params, pts))
 }
 
+/// The blobs sent with a picture's frame: its own (after the strip
+/// rules), and for a layer its [`LayerRecord`] — the picture's size,
+/// offset, disposal and blending, which the strip rules never remove.
+fn frame_blobs(img: &Image, group: &Group, opts: &SaveOptions) -> Vec<MetadataBlob> {
+    let mut blobs = opts.frame_blobs(img);
+    if group.layered {
+        blobs.retain(|b| !b.is(&LayerRecord::kind()));
+        blobs.push(LayerRecord::of(img).to_blob());
+    }
+    blobs
+}
+
+/// Whether the encoder `first_encoder` picks for `codec_id` declares
+/// that it writes the [`LayerRecord`] of its frames.
+fn encoder_takes_layers(ctx: &RuntimeContext, codec_id: &CodecId) -> bool {
+    ctx.codecs
+        .implementations(codec_id)
+        .iter()
+        .find(|i| i.make_encoder.is_some())
+        .is_some_and(|i| i.caps.embeds_blob(&LayerRecord::kind()))
+}
+
+/// Whether a layered list saved as `format` (a container name, file
+/// extension or codec-only format, resolved as [`encode`] resolves it)
+/// goes out as layers — each frame its own rectangle with its
+/// [`LayerRecord`] — rather than coalesced to full canvases: the
+/// target's encoder lists [`LayerRecord::KIND`] among its
+/// `CodecCapabilities::embedded_blob_kinds`. `false` when the format
+/// does not resolve.
+pub fn encodes_layers(ctx: &RuntimeContext, format: &str, opts: &SaveOptions) -> bool {
+    resolve_format(ctx, format)
+        .is_ok_and(|target| encoder_takes_layers(ctx, &codec_for(ctx, &target, opts)))
+}
+
 /// The shape-change policy's guard: every frame an encoder receives has
 /// the shape its stream was opened with (the gateway never sends
 /// `Frame::StreamParams` to an encoder — a picture of another layout
@@ -1483,6 +1553,18 @@ fn encode_group(
 /// of its own). A picture that still differs is refused by type rather
 /// than handed to the encoder under the wrong description.
 fn same_shape(img: &Image, group: &Group, dst: PixelFormat, index: usize) -> Result<()> {
+    if group.layered {
+        // A layer has its own size, stated in its record; the layout
+        // is still the stream's.
+        if img.format() != dst {
+            return Err(Error::unsupported(format!(
+                "layer {index} is {:?} after conversion; its output stream was opened for \
+                 {dst:?}",
+                img.format()
+            )));
+        }
+        return Ok(());
+    }
     let got = (img.width(), img.height(), img.format());
     if got != (group.width, group.height, dst) {
         return Err(Error::unsupported(format!(

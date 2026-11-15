@@ -76,8 +76,9 @@ mod raster;
 mod sequence;
 
 pub use edit::{
-    Direction, append, append_with, repage, reset_page, reverse, scale_delays, select, set_canvas,
-    set_delay, set_delay_ticks, set_loop_count, total_delay, translate, trim, trim_to,
+    Direction, append, append_with, clip_to_canvas, repage, reset_page, reverse, scale_delays,
+    select, set_canvas, set_delay, set_delay_ticks, set_loop_count, total_delay, translate, trim,
+    trim_to,
 };
 pub use exact::{OptimizeOptions, optimize_layers, optimize_layers_with};
 pub use sequence::LayerSequence;
@@ -417,11 +418,12 @@ fn disposed_rect(f: &Image) -> Option<Rect> {
     matches!(f.dispose(), Dispose::Background | Dispose::Previous).then(|| frame_rect(f))
 }
 
-/// Full-canvas `pixels` built on `template`'s attributes.
+/// Full-canvas `pixels` built on `template`'s attributes: a frame that
+/// replaces the canvas ([`Blend::Source`]), as a decoded frame does.
 fn canvas_frame(template: &Image, pixels: &Raster) -> Result<Image> {
     Ok(raster_image(template, pixels.clone())?
         .with_page(Page::new(pixels.w as u32, pixels.h as u32))
-        .with_blend(Blend::Over))
+        .with_blend(Blend::Source))
 }
 
 // ---- coalesce / dispose -----------------------------------------------------
@@ -431,10 +433,13 @@ fn canvas_frame(template: &Image, pixels: &Raster) -> Result<Image> {
 /// one full-canvas picture per frame (page `WxH+0+0`). Transparent-black
 /// background; [`coalesce_with`] sets another.
 ///
-/// The output frames are disposed so that drawing them in order with
-/// [`Blend::Over`] shows the same animation: [`Dispose::Background`]
-/// where the next frame clears a visible pixel, else [`Dispose::None`]
-/// (the last frame repeats the previous frame's choice).
+/// Every output frame replaces the canvas ([`Blend::Source`]), so a
+/// coalesced list plays back to itself at every alpha value. The
+/// frames are also labelled with the disposal under which drawing them
+/// as overlays would show the same animation when alpha is all or
+/// nothing: [`Dispose::Background`] where the next frame clears a
+/// visible pixel, else [`Dispose::None`] (the last frame repeats the
+/// previous frame's choice).
 pub fn coalesce(frames: &[Image]) -> Result<Vec<Image>> {
     coalesce_with(frames, &LayerOptions::default())
 }

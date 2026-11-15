@@ -27,6 +27,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   comparisons run in row bands under a caller-granted budget (serial by
   default, same output at every budget), and
   `with_background_rgba_f32` for float canvases.
+- Layers through the registry (#5): `LayerRecord`, a 28-byte per-frame
+  metadata blob of kind `image-layer` (canvas, offset, the picture's
+  own size, disposal, blending). A decoder that hands out a frame with
+  the record is handing out a layer of its stream's canvas: `open`
+  reads the picture at the record's size and sets its page, disposal
+  and blending (budgeted at its own size; a malformed record is
+  `InvalidData`). An encoder that lists the kind in its
+  `embedded_blob_kinds` is handed a layered list as layers — every
+  frame cut to the canvas (`layers::clip_to_canvas`) with its record —
+  instead of coalesced canvases; `Encoded::layered` and
+  `encodes_layers` report it. A coalesce → optimise → write round trip
+  keeps the optimiser's rectangles in the file.
 - `layers::LayerSequence` (#5): an animation as one value — frames
   plus the canvas size, background colour and loop count they share —
   built from a frame list or an opened file, with the layer operations
@@ -48,6 +60,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that depth (it was always 16-bit, narrowed on output; float lists
   came out 16-bit). A list played frame by frame and the same list
   played from its coalesced frames now show the same pixels.
+- `coalesce` / `apply_disposal` frames replace the canvas
+  (`Blend::Source`, as decoded frames do) instead of overlaying it, so
+  a coalesced list coalesces to itself at every alpha value; their
+  disposal labels are unchanged.
 - OVER is defined in exact integer arithmetic rounded to nearest (an
   8-bit sample `v` stands for `257·v`; float in `f64`); see the
   `layers` module docs.
