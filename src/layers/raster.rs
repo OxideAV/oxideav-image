@@ -316,6 +316,23 @@ pub(crate) fn drop_unchanged(depth: Depth, line: &mut [u8], under: &[u8]) {
     by_depth!(depth, drop_unchanged_row(line, under));
 }
 
+fn overlay_safe_row<P: Samples<N>, const N: usize>(line: &[u8], under: &[u8]) -> bool {
+    line == under
+        || line
+            .as_chunks::<N>()
+            .0
+            .iter()
+            .zip(under.as_chunks::<N>().0)
+            .all(|(t, b)| t == b || !hit::<P, N>(Pred::OverFails, b, t))
+}
+
+/// `true` when every pixel of `line` equals the pixel of `under` at
+/// its place or shows itself when drawn over it: the row can be drawn
+/// as an overlay.
+pub(crate) fn overlay_safe(depth: Depth, line: &[u8], under: &[u8]) -> bool {
+    by_depth!(depth, overlay_safe_row(line, under))
+}
+
 fn settle_row<P: Samples<N>, const N: usize>(line: &mut [u8], under: Option<&[u8]>, all: bool) {
     // A pixel drawn over itself stays itself: opaque, or transparent.
     let stays = |t: &[u8; N]| {

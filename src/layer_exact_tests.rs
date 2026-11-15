@@ -371,6 +371,67 @@ fn legacy_optimisers_replay_exactly_on_one_bit_alpha() {
 }
 
 #[test]
+fn transparency_optimisation_plays_the_same_at_every_alpha() {
+    // Under the default rule the transparency optimisation is exact
+    // too, replacements included: converted to overlays where that
+    // plays the same, left alone where it does not.
+    let mut converted = 0;
+    for depth in [Depth::U8, Depth::U16, Depth::F32] {
+        for seed in 1..=cases(120) as u64 {
+            let mut rng = Rng(seed.wrapping_mul(0xE703_7ED1_A0B4_28DB) + depth.bpp() as u64);
+            let mut frames = random_animation(&mut rng, depth);
+            if seed % 2 == 0 {
+                // Authored overlays of semi-transparent pixels are the
+                // documented exception; replacements have none.
+                for f in &mut frames {
+                    f.set_blend(Blend::Source);
+                }
+            }
+            let small = layers::optimize_transparency(&frames).unwrap();
+            converted += frames
+                .iter()
+                .zip(&small)
+                .filter(|(f, s)| f.blend() != s.blend())
+                .count();
+            if seed % 2 == 0 {
+                let what = format!("seed {seed} {depth:?} transparency");
+                let (got, want) = (
+                    layers::coalesce(&small).unwrap(),
+                    layers::coalesce(&frames).unwrap(),
+                );
+                assert_same_pictures(&got, &want, depth, &what);
+            }
+        }
+    }
+    if !cfg!(miri) {
+        assert!(converted > 0);
+    }
+    // A coalesced list — replacements — is optimised as its overlays
+    // would be.
+    let frames: Vec<Image> = (0..3u8)
+        .map(|k| {
+            let mut px = [[7u8, 7, 7, 255]; 6];
+            px[usize::from(k)] = [200, 0, 0, 255];
+            Image::from_rgba8(3, 2, px.concat()).unwrap()
+        })
+        .collect();
+    let shown = layers::coalesce(&frames).unwrap();
+    let small = layers::optimize_transparency(&shown).unwrap();
+    assert!(small.iter().all(|f| f.blend() == Blend::Over));
+    let holes = |f: &Image| {
+        let px = f.to_rgba8().unwrap();
+        px.as_chunks::<4>().0.iter().filter(|p| p[3] == 0).count()
+    };
+    assert_eq!(small.iter().map(holes).collect::<Vec<_>>(), [0, 4, 4]);
+    assert_same_pictures(
+        &layers::coalesce(&small).unwrap(),
+        &shown,
+        Depth::U8,
+        "coalesced",
+    );
+}
+
+#[test]
 fn a_moving_sprite_costs_its_two_positions() {
     // Opaque 40×30 background, an opaque 4×4 sprite moving 5 pixels a
     // frame: each later frame is the box around both positions.

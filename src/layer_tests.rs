@@ -678,13 +678,30 @@ fn optimize_transparency_skips_semi_transparent_matches_and_source_frames() {
     let frames = [paint(2, 1, R, &[]), paint(2, 1, R, &[(0, 0, 1, 1, B)])];
     let out = layers::optimize_transparency(&frames).unwrap();
     assert_eq!((px(&out[1], 0, 0), px(&out[1], 1, 0)[3]), (B, 0));
-    // A frame that replaces its rectangle cannot leave holes.
+    // A frame that replaces its rectangle becomes the overlay that
+    // plays the same, when there is one: opaque pixels show themselves.
     let frames: Vec<Image> = frames
         .into_iter()
         .map(|f| f.with_blend(Blend::Source))
         .collect();
     let out = layers::optimize_transparency(&frames).unwrap();
-    assert_eq!(px(&out[1], 1, 0), R);
+    assert_eq!(out[1].blend(), Blend::Over);
+    assert_eq!((px(&out[1], 0, 0), px(&out[1], 1, 0)[3]), (B, 0));
+    // One that erases cannot leave holes: it stays a replacement, whole.
+    let frames = [
+        paint(2, 1, R, &[]).with_blend(Blend::Source),
+        paint(2, 1, R, &[(0, 0, 1, 1, T)]).with_blend(Blend::Source),
+    ];
+    let out = layers::optimize_transparency(&frames).unwrap();
+    assert_eq!(out[1].blend(), Blend::Source);
+    assert_eq!((px(&out[1], 0, 0), px(&out[1], 1, 0)), (T, R));
+    // So does every replacement under the first-frame-alpha rule.
+    let frames = [
+        paint(2, 1, R, &[]).with_blend(Blend::Source),
+        paint(2, 1, R, &[(0, 0, 1, 1, B)]).with_blend(Blend::Source),
+    ];
+    let out = layers::optimize_transparency_with(&frames, &magick_rule(W)).unwrap();
+    assert_eq!((out[1].blend(), px(&out[1], 1, 0)), (Blend::Source, R));
 }
 
 // ---- clean-up and flattening -------------------------------------------

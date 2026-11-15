@@ -876,6 +876,15 @@ fn optimize_run(frames: &[Image], plus: bool, depth: Depth, threads: usize) -> R
 /// equal to the canvas pixel, which changes the picture, and the
 /// gateway does not (README, *Layer operations*). Frames come out
 /// in the RGBA layout of the list's depth.
+///
+/// A frame that replaces its rectangle ([`Blend::Source`] — what
+/// [`coalesce`] and the decoders hand out) is turned into an overlay
+/// with its unchanged pixels transparent when that plays the same:
+/// every pixel of it either equals the canvas pixel under it or shows
+/// itself when drawn over it. Otherwise it is left as it is (its
+/// transparent pixels erase the canvas, which an overlay cannot do).
+/// Under [`BackgroundRule::FirstFrameAlpha`] replacements are always
+/// left as they are.
 pub fn optimize_transparency(frames: &[Image]) -> Result<Vec<Image>> {
     optimize_transparency_with(frames, &LayerOptions::default())
 }
@@ -901,17 +910,33 @@ pub fn optimize_transparency_with(frames: &[Image], opts: &LayerOptions) -> Resu
             _ => None,
         };
         let mut kept = src.bytes().to_vec();
-        // Only an overlay can leave a pixel alone: a `Source` frame's
-        // transparent pixel would erase the canvas.
-        if f.blend() == Blend::Over
-            && let Some(win) = inside
-        {
+        let mut blend = f.blend();
+        if let Some(win) = inside {
             let (x0, y0) = ((win.x - r.x) as usize, (win.y - r.y) as usize);
             let (ww, wh) = (win.w as usize, win.h as usize);
-            for row in 0..wh {
-                let under = canvas.span(win.y as usize + row, win.x as usize..win.x as usize + ww);
+            // The frame's pixels on the canvas and the canvas under
+            // them, row by row.
+            let under =
+                |row: usize| canvas.span(win.y as usize + row, win.x as usize..win.x as usize + ww);
+            let line = |row: usize| {
                 let at = ((y0 + row) * src.w + x0) * bpp;
-                raster::drop_unchanged(depth, &mut kept[at..at + ww * bpp], under);
+                at..at + ww * bpp
+            };
+            if blend == Blend::Over {
+                for row in 0..wh {
+                    raster::drop_unchanged(depth, &mut kept[line(row)], under(row));
+                }
+            } else if opts.background_rule == BackgroundRule::Fill
+                && (0..wh).all(|row| raster::overlay_safe(depth, &kept[line(row)], under(row)))
+            {
+                // Only an overlay can leave a pixel alone — a
+                // replacement's transparent pixel erases the canvas —
+                // but a replacement whose every pixel is unchanged or
+                // shows itself drawn over the canvas is that overlay.
+                for row in 0..wh {
+                    raster::settle_overlay(depth, &mut kept[line(row)], Some(under(row)), true);
+                }
+                blend = Blend::Over;
             }
         }
         canvas.draw(&src, r.x, r.y, f.blend());
@@ -924,10 +949,7 @@ pub fn optimize_transparency_with(frames: &[Image], opts: &LayerOptions) -> Resu
             }
             _ => {}
         }
-        out.push(raster_image(
-            f,
-            Raster::from_bytes(src.w, src.h, depth, kept),
-        )?);
+        out.push(raster_image(f, Raster::from_bytes(src.w, src.h, depth, kept))?.with_blend(blend));
     }
     Ok(out)
 }

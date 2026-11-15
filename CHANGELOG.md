@@ -64,6 +64,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`Blend::Source`, as decoded frames do) instead of overlaying it, so
   a coalesced list coalesces to itself at every alpha value; their
   disposal labels are unchanged.
+- `optimize_transparency` turns a `Blend::Source` frame into the
+  overlay that plays the same (unchanged pixels transparent) when there
+  is one, so it works on coalesced lists and on opened files, whose
+  frames replace the canvas; a frame that erases stays a whole
+  replacement, as before.
 - OVER is defined in exact integer arithmetic rounded to nearest (an
   8-bit sample `v` stands for `257·v`; float in `f64`); see the
   `layers` module docs.
