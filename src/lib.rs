@@ -62,7 +62,8 @@ mod save;
 
 #[cfg(test)]
 mod fixture;
-#[cfg(test)]
+// Spawns a process: not under Miri.
+#[cfg(all(test, not(miri)))]
 mod layer_blackbox_tests;
 #[cfg(test)]
 mod layer_exact_tests;

@@ -157,7 +157,6 @@ fn validate(dir: &Path, frames: &[Image], operations: &[&str]) -> Option<Vec<See
 }
 
 #[test]
-#[cfg(not(miri))]
 fn coalesce_and_optimize_frame_match_the_black_box_reader() {
     if !validator() {
         return;
