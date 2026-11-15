@@ -63,6 +63,8 @@ mod save;
 #[cfg(test)]
 mod fixture;
 #[cfg(test)]
+mod layer_blackbox_tests;
+#[cfg(test)]
 mod layer_exact_tests;
 #[cfg(test)]
 mod layer_registry_tests;

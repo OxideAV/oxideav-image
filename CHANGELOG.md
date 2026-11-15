@@ -50,6 +50,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   / `trim_to` (a layer cut to its content, left in place on its
   canvas), `set_delay`, `set_delay_ticks`, `scale_delays`,
   `total_delay`, `set_loop_count`, `select`, `reverse`.
+- A black-box sweep in the test suite, run when the `magick`
+  executable of the pinned version is installed (skipped otherwise):
+  60 random layered lists, `coalesce` / `optimize_frame` /
+  `compare_any` compared in geometry, disposal and pixels, `optimize`
+  in geometry and disposal.
 - `benches/layers.rs`: frames per second of the layer operations on a
   100-frame 1920×1080 animation.
 

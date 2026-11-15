@@ -821,7 +821,12 @@ record and one that does not) for the registry round trips — layers
 written and read back byte for byte, coalesce → optimise → write
 keeping the rectangles, canvas / loop count / background carried, a
 malformed record refused, the pixel budget counting layers at their
-own size — the list edits, loop counts, layered lists
+own size — the list edits, a sweep that runs when the `magick` executable
+of the pinned version is on the path (60 random 1-bit-alpha layered
+lists: `coalesce` and `optimize_frame` 58 / 58 in geometry, disposal
+and pixels — the reader refuses two lists — `compare_any` 60 / 60,
+`optimize` in geometry and disposal on every list it accepts), loop
+counts, layered lists
 written as displayed, zero delays, mid-stream shape changes (stub
 decoders that emit `Frame::StreamParams` with and without a generation
 bump, while decoding and while draining after `flush`, that only bump
