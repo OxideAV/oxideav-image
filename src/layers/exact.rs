@@ -171,12 +171,20 @@ pub fn optimize_layers_with(frames: &[Image], opts: &OptimizeOptions) -> Result<
                 )?);
             }
             let before = shown.as_mut().expect("set on the first frame");
-            // Where the picture can differ from the one before it.
+            // Where the picture differs from the one before it: inside
+            // what the frame before disposed and this one drew — a
+            // rectangle the pixels then narrow, so that a full-canvas
+            // frame costs one comparison of the canvas and every
+            // candidate below a comparison of the changed box.
             let dirty = if first {
                 Some(whole)
             } else {
-                Rect::union(disposed_rect(&frames[i - 1]), Some(frame_rect(&frames[i])))
-                    .and_then(|r| r.clip(canvas.w, canvas.h))
+                Rect::union(disposed_rect(&frames[i - 1]), Some(frame_rect(&frames[i]))).and_then(
+                    |r| {
+                        let threads = opts.layer.threads();
+                        scan(&Base::of(before), canvas, Some(r), Pred::Changed, threads)
+                    },
+                )
             };
             let plan = plan(before, canvas, pending.as_ref(), dirty, background, opts)
                 .map_err(|e| Error::unsupported(format!("optimize-layers: frame {i} {e}")))?;

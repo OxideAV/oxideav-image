@@ -158,6 +158,8 @@ pub(crate) trait Samples<const N: usize> {
     fn transparent(p: &[u8; N]) -> bool;
     /// Alpha is at least one half.
     fn visible(p: &[u8; N]) -> bool;
+    /// Alpha is full (float: at least one).
+    fn opaque(p: &[u8; N]) -> bool;
     /// `d ← s OVER d`.
     fn over(s: &[u8; N], d: &mut [u8; N]);
 }
@@ -173,6 +175,10 @@ impl Samples<4> for P8 {
 
     fn visible(p: &[u8; 4]) -> bool {
         p[3] >= 128
+    }
+
+    fn opaque(p: &[u8; 4]) -> bool {
+        p[3] == 255
     }
 
     /// An 8-bit sample `v` stands for the 16-bit value `257·v`; the
@@ -203,6 +209,10 @@ impl Samples<8> for P16 {
 
     fn visible(p: &[u8; 8]) -> bool {
         p[7] >= 0x80
+    }
+
+    fn opaque(p: &[u8; 8]) -> bool {
+        p[6] == 0xff && p[7] == 0xff
     }
 
     fn over(s: &[u8; 8], d: &mut [u8; 8]) {
@@ -236,6 +246,10 @@ impl Samples<16> for PF {
 
     fn visible(p: &[u8; 16]) -> bool {
         pxf(p)[3] >= 0.5
+    }
+
+    fn opaque(p: &[u8; 16]) -> bool {
+        pxf(p)[3] >= 1.0
     }
 
     /// Alpha is clamped to `[0, 1]` (NaN = 0); with `a = s.a + d.a·(1 −
@@ -359,7 +373,9 @@ fn hit<P: Samples<N>, const N: usize>(pred: Pred, a: &[u8; N], b: &[u8; N]) -> b
         Pred::Cleared => P::visible(a) && !P::visible(b),
         Pred::Overlaid => changed && P::visible(b),
         Pred::OverFails => {
-            changed && {
+            // An opaque pixel, or any pixel on a transparent one, shows
+            // itself.
+            changed && !P::opaque(b) && !P::transparent(a) && {
                 let mut out = *a;
                 P::over(b, &mut out);
                 !same_arr::<P, N>(&out, b)
@@ -496,6 +512,23 @@ impl<'a> Raster<'a> {
         self.data.into_owned()
     }
 
+    /// A copy of the bytes, made in row bands on up to `threads`
+    /// threads.
+    pub(crate) fn copy_bytes(&self, threads: usize) -> Vec<u8> {
+        let bands = threads.min(self.w * self.h / MIN_BAND_PIXELS).max(1);
+        if bands == 1 {
+            return self.data.to_vec();
+        }
+        let mut out = vec![0u8; self.data.len()];
+        let per = self.h.div_ceil(bands) * self.row_bytes();
+        std::thread::scope(|scope| {
+            for (dst, src) in out.chunks_mut(per).zip(self.data.chunks(per)) {
+                scope.spawn(move || dst.copy_from_slice(src));
+            }
+        });
+        out
+    }
+
     fn row_bytes(&self) -> usize {
         self.w * self.depth.bpp()
     }
@@ -537,8 +570,14 @@ impl<'a> Raster<'a> {
             return;
         };
         let p = p.as_slice();
+        let zero = p.iter().all(|&b| b == 0);
         for cy in r.rows() {
-            for d in self.span_mut(cy, r.cols()).chunks_exact_mut(p.len()) {
+            let span = self.span_mut(cy, r.cols());
+            if zero {
+                span.fill(0);
+                continue;
+            }
+            for d in span.chunks_exact_mut(p.len()) {
                 d.copy_from_slice(p);
             }
         }
@@ -697,17 +736,41 @@ fn merge(a: Bounds, b: Bounds) -> Bounds {
     }
 }
 
+/// Pixels compared at once before any is looked at: a run of equal
+/// pixels is skipped a block at a time.
+const BLOCK: usize = 32;
+
 /// First and last pixel of `b` that `pred` selects against the pixels
 /// of `a`.
 fn extent<P: Samples<N>, const N: usize>(pred: Pred, a: &[u8], b: &[u8]) -> Option<(usize, usize)> {
     if a == b {
         return None;
     }
-    let pairs = || a.as_chunks::<N>().0.iter().zip(b.as_chunks::<N>().0);
+    let (a, b) = (a.as_chunks::<N>().0, b.as_chunks::<N>().0);
     let test = |(a, b): (&[u8; N], &[u8; N])| a != b && hit::<P, N>(pred, a, b);
-    let first = pairs().position(test)?;
-    let last = pairs().rposition(test).unwrap_or(first);
-    Some((first, last))
+    let mut first = None;
+    for (k, (ba, bb)) in a.chunks(BLOCK).zip(b.chunks(BLOCK)).enumerate() {
+        if ba != bb
+            && let Some(i) = ba.iter().zip(bb).position(test)
+        {
+            first = Some(k * BLOCK + i);
+            break;
+        }
+    }
+    let first = first?;
+    // From the end, in blocks aligned to it; the first hit bounds the
+    // search.
+    let (ta, tb) = (&a[first..], &b[first..]);
+    let mut end = ta.len();
+    for (ba, bb) in ta.rchunks(BLOCK).zip(tb.rchunks(BLOCK)) {
+        end -= ba.len();
+        if ba != bb
+            && let Some(i) = ba.iter().zip(bb).rposition(test)
+        {
+            return Some((first, first + end + i));
+        }
+    }
+    Some((first, first))
 }
 
 /// [`extent`] against one colour.

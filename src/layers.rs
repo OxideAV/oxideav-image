@@ -420,8 +420,9 @@ fn disposed_rect(f: &Image) -> Option<Rect> {
 
 /// Full-canvas `pixels` built on `template`'s attributes: a frame that
 /// replaces the canvas ([`Blend::Source`]), as a decoded frame does.
-fn canvas_frame(template: &Image, pixels: &Raster) -> Result<Image> {
-    Ok(raster_image(template, pixels.clone())?
+fn canvas_frame(template: &Image, pixels: &Raster, threads: usize) -> Result<Image> {
+    let copy = Raster::from_bytes(pixels.w, pixels.h, pixels.depth, pixels.copy_bytes(threads));
+    Ok(raster_image(template, copy)?
         .with_page(Page::new(pixels.w as u32, pixels.h as u32))
         .with_blend(Blend::Source))
 }
@@ -472,7 +473,7 @@ pub fn coalesce_with(frames: &[Image], opts: &LayerOptions) -> Result<Vec<Image>
                 Dispose::None
             });
         }
-        out.push(canvas_frame(&frames[i], canvas)?.with_dispose(Dispose::None));
+        out.push(canvas_frame(&frames[i], canvas, opts.threads())?.with_dispose(Dispose::None));
         Ok(())
     })?;
     let n = out.len();
@@ -501,7 +502,7 @@ pub fn apply_disposal_with(frames: &[Image], opts: &LayerOptions) -> Result<Vec<
     let mut out = Vec::with_capacity(frames.len());
     play(frames, opts, depth, false, |i, stage, canvas, _| {
         if stage == Stage::Disposed {
-            out.push(canvas_frame(&frames[i], canvas)?.with_dispose(Dispose::None));
+            out.push(canvas_frame(&frames[i], canvas, opts.threads())?.with_dispose(Dispose::None));
         }
         Ok(())
     })?;
@@ -639,12 +640,19 @@ enum ChoiceKind {
 /// The disposal choice for the transition from coalesced frame `prev`
 /// to `cur`: what to do with the last planned frame, and the window the
 /// next one needs. `before_last` is the canvas the last planned frame
-/// was drawn onto.
+/// was drawn onto and `dirty` the box of the pixels where `cur` differs
+/// from `prev`.
+///
+/// Every canvas compared here is `prev` or `before_last`, possibly
+/// with a rectangle cleared; `before_last` differs from `prev` only
+/// inside `last_rect` and the cleared rectangles lie inside `dirty` or
+/// `last_rect`, so the comparisons look at those two boxes only.
 fn choose(
     prev: &Raster,
     cur: &Raster,
     before_last: &Base,
     last_rect: Option<Rect>,
+    dirty: Option<Rect>,
     plus: bool,
     threads: usize,
 ) -> (ChoiceKind, Option<Rect>) {
@@ -654,7 +662,8 @@ fn choose(
         uniform: clear_px,
         fill: fill.map(|r| (r, Patch::Colour(clear_px))),
     };
-    let diff = |base: &Base, pred| scan(base, cur, None, pred, threads);
+    let window = Rect::union(dirty, last_rect);
+    let diff = |base: &Base, pred| window.and_then(|w| scan(base, cur, Some(w), pred, threads));
     let clear = diff(&after(None), Pred::Cleared);
     let mut best: Option<(u64, ChoiceKind, Option<Rect>)> = None;
     let mut offer = |cost: u64, kind: ChoiceKind, rect: Option<Rect>| {
@@ -777,7 +786,8 @@ fn optimize_run(frames: &[Image], plus: bool, depth: Depth, threads: usize) -> R
     for (i, f) in frames.iter().enumerate().skip(1) {
         let cur = views.get(i)?;
         let last = plan.len() - 1;
-        if plus && i >= 2 && scan(&Base::of(&prev), &cur, None, Pred::Changed, threads).is_none() {
+        let dirty = scan(&Base::of(&prev), &cur, None, Pred::Changed, threads);
+        if plus && i >= 2 && dirty.is_none() {
             plan[last].delay = add_delay(plan[last].delay, f.delay());
             plan[last].dispose = Some(Dispose::None);
             continue;
@@ -791,7 +801,7 @@ fn optimize_run(frames: &[Image], plus: bool, depth: Depth, threads: usize) -> R
             uniform: clear_px,
             fill: before_last.fill.map(|r| (r, Patch::Colour(clear_px))),
         };
-        let (kind, rect) = choose(&prev, &cur, &base, plan[last].rect, plus, threads);
+        let (kind, rect) = choose(&prev, &cur, &base, plan[last].rect, dirty, plus, threads);
         match kind {
             ChoiceKind::None => {
                 plan[last].dispose = Some(Dispose::None);

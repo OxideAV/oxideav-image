@@ -6,7 +6,8 @@
 //! `cargo bench --bench layers` prints frames per second for each
 //! operation, the median of `LAYERS_BENCH_RUNS` runs (default 3);
 //! `LAYERS_BENCH_FRAMES` / `LAYERS_BENCH_WIDTH` / `LAYERS_BENCH_HEIGHT`
-//! / `LAYERS_BENCH_THREADS` scale it.
+//! / `LAYERS_BENCH_THREADS` scale it, and `LAYERS_BENCH_ONLY=<substring>`
+//! runs only the operations whose label contains it (for a profiler).
 
 use std::time::Instant;
 
@@ -77,6 +78,18 @@ fn animation(w: u32, h: u32, n: usize) -> Vec<Image> {
     frames
 }
 
+/// Time `op` when `label` is selected (always run it once for its
+/// result).
+fn report<T>(label: &str, runs: usize, frames: usize, op: impl FnMut() -> T) -> T {
+    let only = std::env::var("LAYERS_BENCH_ONLY").unwrap_or_default();
+    let runs = if label.contains(&only) { runs } else { 1 };
+    let (fps, out) = median_fps(runs, frames, op);
+    if label.contains(&only) {
+        println!("{label:<32}{fps:9.1} frames/s");
+    }
+    out
+}
+
 fn median_fps<T>(runs: usize, frames: usize, mut op: impl FnMut() -> T) -> (f64, T) {
     let mut secs = Vec::with_capacity(runs);
     let mut last = None;
@@ -102,24 +115,22 @@ fn main() {
     let layer = LayerOptions::new().with_threads(threads);
     println!("{n} frames {w}x{h}, median of {runs}, {threads} thread(s)");
 
-    let (fps, coalesced) = median_fps(runs, n, || layers::coalesce_with(&layered, &layer).unwrap());
-    println!("coalesce                        {fps:9.1} frames/s");
-    let (fps, framed) = median_fps(runs, n, || {
+    let coalesced = report("coalesce", runs, n, || {
+        layers::coalesce_with(&layered, &layer).unwrap()
+    });
+    let framed = report("optimize_frame (coalesced in)", runs, n, || {
         layers::layers(&coalesced, layers::LayerMethod::OptimizeFrame, &layer).unwrap()
     });
-    println!("optimize_frame (coalesced in)   {fps:9.1} frames/s");
-    let (fps, _) = median_fps(runs, n, || {
+    report("optimize_transparency", runs, n, || {
         layers::optimize_transparency_with(&framed, &layer).unwrap()
     });
-    println!("optimize_transparency           {fps:9.1} frames/s");
     drop(framed);
     let exact = OptimizeOptions::new()
         .with_layer_options(layer)
         .with_transparency(true);
-    let (fps, small) = median_fps(runs, n, || {
+    let small = report("optimize_layers (coalesced in)", runs, n, || {
         layers::optimize_layers_with(&coalesced, &exact).unwrap()
     });
-    println!("optimize_layers (coalesced in)  {fps:9.1} frames/s");
     let area: u64 = small
         .iter()
         .map(|f| u64::from(f.width()) * u64::from(f.height()))
@@ -130,10 +141,10 @@ fn main() {
     );
     drop(small);
     drop(coalesced);
-    let (fps, _) = median_fps(runs, n, || layers::optimize_with(&layered, &layer).unwrap());
-    println!("optimize (layered in)           {fps:9.1} frames/s");
-    let (fps, _) = median_fps(runs, n, || {
+    report("optimize (layered in)", runs, n, || {
+        layers::optimize_with(&layered, &layer).unwrap()
+    });
+    report("optimize_layers (layered in)", runs, n, || {
         layers::optimize_layers_with(&layered, &exact).unwrap()
     });
-    println!("optimize_layers (layered in)    {fps:9.1} frames/s");
 }
