@@ -54,6 +54,8 @@ mod save;
 #[cfg(test)]
 mod fixture;
 #[cfg(test)]
+mod layer_exact_tests;
+#[cfg(test)]
 mod layer_tests;
 #[cfg(test)]
 mod meta_tests;
@@ -67,6 +69,7 @@ mod tests;
 pub use error::{Error, ImageError, Result};
 pub use image::Image;
 pub use layer::{Blend, Dispose, Page};
+pub use layers::OptimizeOptions;
 pub use open::{
     ImageFile, OpenOptions, decode_bytes, decode_bytes_with, decode_reader, decode_vec,
     decode_vec_with, open, open_with,

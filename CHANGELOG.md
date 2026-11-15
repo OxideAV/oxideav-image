@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `layers::optimize_layers` / `optimize_layers_with` and
+  `OptimizeOptions` (#5): the exact frame optimiser. Per frame, the
+  bounding box of the pixels that differ from the canvas it is drawn
+  onto, the disposal of the frame before (none / background / previous)
+  chosen for the smallest box, and the frame's blending — an overlay
+  where every pixel of the box is unchanged or shows itself drawn over
+  the canvas, else a replacement. `coalesce` of the result shows the
+  pixels of `coalesce` of the input at every alpha value and depth
+  (property-tested on random lists covering every disposal × blending
+  pair, frames partly or wholly outside the canvas, coloured
+  backgrounds, both background rules). Options: the transparency
+  optimisation, and each of `Dispose::Background`, `Dispose::Previous`
+  and `Blend::Source` can be forbidden for formats that lack it; an
+  animation the remaining tools cannot express is `Unsupported`.
+- `LayerOptions::with_threads` / `with_execution_context`: whole-canvas
+  comparisons run in row bands under a caller-granted budget (serial by
+  default, same output at every budget), and
+  `with_background_rgba_f32` for float canvases.
+- `benches/layers.rs`: frames per second of the layer operations on a
+  100-frame 1920×1080 animation.
+
+### Changed
+
+- The layer operations work at the depth of the deepest frame — 8-bit
+  `Rgba`, 16-bit `Rgba64Le`, float `RgbaF32Le` — and keep the canvas at
+  that depth (it was always 16-bit, narrowed on output; float lists
+  came out 16-bit). A list played frame by frame and the same list
+  played from its coalesced frames now show the same pixels.
+- OVER is defined in exact integer arithmetic rounded to nearest (an
+  8-bit sample `v` stands for `257·v`; float in `f64`); see the
+  `layers` module docs.
+- Speed: a draw touches the drawn rectangle, a disposal the disposed
+  one, `Dispose::Previous` saves that rectangle rather than the
+  canvas, an `Rgba` frame is read in place, and comparisons skip equal
+  row segments. On the bench animation (median of 3, one thread):
+  `coalesce` 277 → 1385 frames/s, `optimize_frame` 78 → 576,
+  `optimize_transparency` 2413 → 3520, `optimize` 57 → 295.
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-image/compare/v0.0.6...v0.0.7) - 2026-11-07
 
 ### Other
