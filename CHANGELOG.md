@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-image/compare/v0.0.7...v0.0.8) - 2026-11-15
+
+### Other
+
+- keep the process-spawning sweep out of Miri builds
+- regroup a seed literal (clippy unusual_byte_groupings)
+- black-box sweep of coalesce / optimize_frame / compare_any / optimize on random layered lists, run when the validator is installed ([#5](https://github.com/OxideAV/oxideav-image/pull/5))
+- :optimize_transparency: a replacement frame becomes the overlay that plays the same, so coalesced lists and opened files are optimised ([#5](https://github.com/OxideAV/oxideav-image/pull/5))
+- Crate docs: the layer model in the overview ([#5](https://github.com/OxideAV/oxideav-image/pull/5))
+- offsets at the ends of the i32 range — merge refuses an unholdable box, trim_bounds saturates, every operation swept ([#5](https://github.com/OxideAV/oxideav-image/pull/5))
+- the layer sequence, depth and OVER, the exact optimiser, layers through the registry, speed ([#5](https://github.com/OxideAV/oxideav-image/pull/5))
+- optimisers compare the changed box only, equal pixel runs skipped a block at a time, banded canvas copies ([#5](https://github.com/OxideAV/oxideav-image/pull/5))
+- Layers through the registry: the image-layer frame record, read on open and written to encoders that declare it ([#5](https://github.com/OxideAV/oxideav-image/pull/5))
+- LayerSequence and list edits — append, repage, trim, delays, selection ([#5](https://github.com/OxideAV/oxideav-image/pull/5))
+- depth-true rectangle engine and the exact frame optimiser ([#5](https://github.com/OxideAV/oxideav-image/pull/5))
+
 ### Added
 
 - `layers::optimize_layers` / `optimize_layers_with` and
