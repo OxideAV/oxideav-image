@@ -77,6 +77,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `optimize` 57 → 812; `optimize_layers` 1041 from coalesced frames,
   2331 from a layered list. README, *Layers*, *Speed*.
 
+### Fixed
+
+- `layers::merge` refuses (`LimitExceeded`) a frame set whose offsets
+  span more than a picture can hold instead of truncating the box, and
+  `trim_bounds` saturates; every layer operation is swept with offsets
+  at both ends of the `i32` range.
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-image/compare/v0.0.6...v0.0.7) - 2026-11-07
 
 ### Other

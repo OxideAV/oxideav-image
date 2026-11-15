@@ -912,3 +912,57 @@ fn background_colour_values_parse_and_print() {
     assert_eq!(format_background([0xffff, 0, 0, 0x8080]), "#ff000080");
     assert_eq!(format_background([1, 0, 0, 0]), "#0001000000000000");
 }
+
+#[test]
+fn offsets_at_the_ends_of_the_range_never_panic() {
+    // Frames placed anywhere an `i32` offset can put them: every
+    // operation either answers or refuses with an error.
+    let ends = [i32::MIN, i32::MIN + 1, -1, 0, 1, 3, i32::MAX - 1, i32::MAX];
+    let mut rng = Rng(0xC0FF_EE00_1234_5678);
+    for _ in 0..cases(60) {
+        let frames: Vec<Image> = (0..rng.range(1, 4))
+            .map(|_| {
+                random_frame(&mut rng, Depth::U8, (5, 4))
+                    .with_page(Page::new(5, 4).with_offset(rng.pick(&ends), rng.pick(&ends)))
+            })
+            .collect();
+        let shown = layers::coalesce(&frames).unwrap();
+        assert!(shown.iter().all(Image::is_full_canvas));
+        let small = layers::optimize_layers(&frames).unwrap();
+        assert_same_pictures(
+            &layers::coalesce(&small).unwrap(),
+            &shown,
+            Depth::U8,
+            "ends",
+        );
+        layers::optimize(&frames).unwrap();
+        layers::optimize_transparency(&frames).unwrap();
+        layers::apply_disposal(&frames).unwrap();
+        layers::compare_any(&frames).unwrap();
+        layers::compare_clear(&frames).unwrap();
+        layers::compare_overlay(&frames).unwrap();
+        layers::flatten(&frames).unwrap();
+        layers::remove_dups(&frames).unwrap();
+        let inside = layers::clip_to_canvas(&frames).unwrap();
+        assert_same_pictures(
+            &layers::coalesce(&inside).unwrap(),
+            &shown,
+            Depth::U8,
+            "clipped",
+        );
+        for f in &inside {
+            let (x, y) = f.offset();
+            assert!(x >= 0 && y >= 0 && x as u32 + f.width() <= 5 && y as u32 + f.height() <= 4);
+        }
+        layers::composite_layers(&frames, &frames, i32::MAX, i32::MIN).unwrap();
+        assert_eq!(layers::trim_bounds(&frames).len(), frames.len());
+        // A canvas that would have to span the offsets is refused, not
+        // allocated.
+        for big in [layers::mosaic(&frames), layers::merge(&frames)] {
+            if let Err(e) = big {
+                assert!(matches!(e, Error::LimitExceeded(_)), "{e}");
+            }
+        }
+        let _ = layers::translate(&frames, i32::MAX, i32::MIN);
+    }
+}

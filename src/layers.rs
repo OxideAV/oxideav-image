@@ -1041,7 +1041,15 @@ pub fn merge_with(frames: &[Image], opts: &LayerOptions) -> Result<Image> {
         .expect("one frame at least");
     let (cw, ch) = frames[0].canvas_size();
     let page = Page::new(cw, ch).with_offset(b.x as i32, b.y as i32);
-    compose_onto(frames, opts, b.w as u32, b.h as u32, b.x, b.y, page)
+    // Offsets span the `i32` range: the box of two far-apart frames can
+    // be wider than any picture.
+    let (Ok(w), Ok(h)) = (u32::try_from(b.w), u32::try_from(b.h)) else {
+        return Err(Error::limit(format!(
+            "merge: the frames span {}x{}, over the layer limit",
+            b.w, b.h
+        )));
+    };
+    compose_onto(frames, opts, w, h, b.x, b.y, page)
 }
 
 fn compose_onto(
@@ -1075,13 +1083,16 @@ pub fn trim_bounds(frames: &[Image]) -> Vec<Image> {
     else {
         return Vec::new();
     };
+    // Offsets span the `i32` range, so a box can exceed what a page
+    // holds: it saturates.
+    let side = |v: i64| u32::try_from(v).unwrap_or(u32::MAX);
+    let shift = |v: i64| i32::try_from(v).unwrap_or(i32::MAX);
     frames
         .iter()
         .map(|f| {
             let r = frame_rect(f);
             f.clone().with_page(
-                Page::new(b.w as u32, b.h as u32)
-                    .with_offset((r.x - b.x) as i32, (r.y - b.y) as i32),
+                Page::new(side(b.w), side(b.h)).with_offset(shift(r.x - b.x), shift(r.y - b.y)),
             )
         })
         .collect()
