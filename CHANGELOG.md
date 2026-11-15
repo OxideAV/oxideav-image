@@ -27,6 +27,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   comparisons run in row bands under a caller-granted budget (serial by
   default, same output at every budget), and
   `with_background_rgba_f32` for float canvases.
+- `layers::LayerSequence` (#5): an animation as one value — frames
+  plus the canvas size, background colour and loop count they share —
+  built from a frame list or an opened file, with the layer operations
+  as methods and `encode` through the registry. The background travels
+  as the `background_color` container metadata entry
+  (`BACKGROUND_COLOR_KEY`, `parse_background`, `format_background`).
+- List edits in `layers` (#5): `append` / `append_with` (horizontal or
+  vertical), `reset_page`, `repage`, `set_canvas`, `translate`, `trim`
+  / `trim_to` (a layer cut to its content, left in place on its
+  canvas), `set_delay`, `set_delay_ticks`, `scale_delays`,
+  `total_delay`, `set_loop_count`, `select`, `reverse`.
 - `benches/layers.rs`: frames per second of the layer operations on a
   100-frame 1920×1080 animation.
 

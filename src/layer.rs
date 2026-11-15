@@ -173,3 +173,52 @@ pub(crate) fn is_layered(frames: &[crate::Image]) -> bool {
             !f.is_full_canvas() || matches!(f.dispose(), Dispose::Background | Dispose::Previous)
         })
 }
+
+/// The container string-metadata key an animation's background colour
+/// travels under (`Demuxer::metadata` on the way in,
+/// `Muxer::set_metadata` on the way out): straight RGBA in
+/// hexadecimal, `#rrggbbaa` at 8 bits a channel or
+/// `#rrrrggggbbbbaaaa` at 16.
+pub const BACKGROUND_COLOR_KEY: &str = "background_color";
+
+/// Read a [`BACKGROUND_COLOR_KEY`] value: `#rrggbb`, `#rrggbbaa` or
+/// `#rrrrggggbbbbaaaa` (the `#` optional, either case), as straight
+/// 16-bit RGBA. `None` for anything else.
+pub fn parse_background(value: &str) -> Option<[u16; 4]> {
+    let hex = value.trim();
+    let hex = hex.strip_prefix('#').unwrap_or(hex);
+    if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let channel = |i: usize, digits: usize| u16::from_str_radix(&hex[i * digits..][..digits], 16);
+    match hex.len() {
+        6 | 8 => {
+            let mut out = [u16::MAX; 4];
+            for (i, o) in out.iter_mut().enumerate().take(hex.len() / 2) {
+                *o = channel(i, 2).ok()? * 257;
+            }
+            Some(out)
+        }
+        16 => {
+            let mut out = [0u16; 4];
+            for (i, o) in out.iter_mut().enumerate() {
+                *o = channel(i, 4).ok()?;
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// Write a [`BACKGROUND_COLOR_KEY`] value: `#rrggbbaa` when every
+/// channel is an 8-bit value widened (`v × 257`), else
+/// `#rrrrggggbbbbaaaa`.
+pub fn format_background(rgba: [u16; 4]) -> String {
+    if rgba.iter().all(|c| c % 257 == 0) {
+        let [r, g, b, a] = rgba.map(|c| c / 257);
+        format!("#{r:02x}{g:02x}{b:02x}{a:02x}")
+    } else {
+        let [r, g, b, a] = rgba;
+        format!("#{r:04x}{g:04x}{b:04x}{a:04x}")
+    }
+}

@@ -70,10 +70,17 @@ use crate::error::{Error, Result};
 use crate::image::Image;
 use crate::layer::{Blend, Dispose, Page};
 
+mod edit;
 mod exact;
 mod raster;
+mod sequence;
 
+pub use edit::{
+    Direction, append, append_with, repage, reset_page, reverse, scale_delays, select, set_canvas,
+    set_delay, set_delay_ticks, set_loop_count, total_delay, translate, trim, trim_to,
+};
 pub use exact::{OptimizeOptions, optimize_layers, optimize_layers_with};
+pub use sequence::LayerSequence;
 
 use raster::{Base, Depth, Patch, Pred, Px, Raster, Rect, scan};
 

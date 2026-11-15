@@ -68,8 +68,8 @@ mod tests;
 
 pub use error::{Error, ImageError, Result};
 pub use image::Image;
-pub use layer::{Blend, Dispose, Page};
-pub use layers::OptimizeOptions;
+pub use layer::{BACKGROUND_COLOR_KEY, Blend, Dispose, Page, format_background, parse_background};
+pub use layers::{LayerSequence, OptimizeOptions};
 pub use open::{
     ImageFile, OpenOptions, decode_bytes, decode_bytes_with, decode_reader, decode_vec,
     decode_vec_with, open, open_with,

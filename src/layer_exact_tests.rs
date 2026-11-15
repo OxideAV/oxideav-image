@@ -4,7 +4,11 @@
 //! or wholly outside the canvas, every alpha value, the three depths,
 //! both background rules and every restriction of the optimiser.
 
-use crate::layers::{self, BackgroundRule, LayerOptions, OptimizeOptions};
+use std::time::Duration;
+
+use crate::layers::{
+    self, BackgroundRule, Direction, LayerOptions, LayerSequence, OptimizeOptions,
+};
 use crate::{Blend, Dispose, Error, Image, Page, PixelFormat};
 
 /// xorshift64*: a deterministic stream for the property tests.
@@ -676,4 +680,227 @@ fn a_change_of_canvas_restarts_the_optimiser() {
     let small = layers::optimize_layers(&frames).unwrap();
     assert_eq!(small[2].canvas_size(), (6, 5));
     assert_eq!(small[3].canvas_size(), (4, 9));
+}
+
+fn solid(w: u32, h: u32, c: [u8; 4]) -> Image {
+    Image::from_rgba8(w, h, c.repeat((w * h) as usize)).unwrap()
+}
+
+#[test]
+fn append_joins_pictures_along_an_axis() {
+    let (r, g) = ([255, 0, 0, 255], [0, 255, 0, 128]);
+    let frames = [
+        solid(2, 3, r).with_page(Page::new(9, 9).with_offset(4, 4)),
+        solid(3, 1, g).with_delay_ticks(3, 100),
+    ];
+    let row = layers::append(&frames, Direction::Horizontal).unwrap();
+    assert_eq!((row.width(), row.height()), (5, 3));
+    assert_eq!(row.page(), Page::default());
+    let px = row.to_rgba8().unwrap();
+    let at = |x: usize, y: usize| px[(y * 5 + x) * 4..][..4].to_vec();
+    assert_eq!(at(1, 2), r);
+    // Copied, not blended: the half-transparent green keeps its alpha.
+    assert_eq!(at(2, 0), g);
+    assert_eq!(at(4, 1), [0, 0, 0, 0]);
+    let column = layers::append_with(
+        &frames,
+        Direction::Vertical,
+        &LayerOptions::new().with_background_rgba8([1, 2, 3, 255]),
+    )
+    .unwrap();
+    assert_eq!((column.width(), column.height()), (3, 4));
+    let px = column.to_rgba8().unwrap();
+    assert_eq!(px[2 * 4..3 * 4], [1, 2, 3, 255]);
+    assert_eq!(px[(3 * 3) * 4..][..4], g);
+    assert!(layers::append(&[], Direction::Horizontal).is_err());
+}
+
+#[test]
+fn pages_are_reset_set_and_moved() {
+    let frames = [
+        solid(2, 2, [1, 1, 1, 255]).with_page(Page::new(8, 6).with_offset(3, -1)),
+        solid(4, 1, [2, 2, 2, 255]),
+    ];
+    let reset = layers::reset_page(&frames);
+    assert!(reset.iter().all(|f| f.page() == Page::default()));
+    assert_eq!(reset[0].canvas_size(), (2, 2));
+    let paged = layers::repage(&frames, Page::new(0, 20).with_offset(1, 2));
+    assert_eq!(paged[0].page(), Page::new(8, 20).with_offset(1, 2));
+    assert_eq!(paged[1].page(), Page::new(0, 20).with_offset(1, 2));
+    let canvas = layers::set_canvas(&frames, 10, 10);
+    assert_eq!(canvas[0].page(), Page::new(10, 10).with_offset(3, -1));
+    assert_eq!(canvas[1].page(), Page::new(10, 10));
+    let moved = layers::translate(&frames, -5, 2).unwrap();
+    assert_eq!(moved[0].page(), Page::new(8, 6).with_offset(-2, 1));
+    assert_eq!(moved[1].page(), Page::new(4, 1).with_offset(-5, 2));
+    assert!(layers::translate(&frames, i32::MAX, 0).is_err());
+}
+
+#[test]
+fn trim_cuts_a_layer_to_its_content_in_place() {
+    // 6×5, content in columns 2..=3, rows 1..=3.
+    let mut px = [[0u8, 0, 0, 0]; 30];
+    for (x, y) in [(2, 1), (3, 3)] {
+        px[y * 6 + x] = [5, 6, 7, 255];
+    }
+    let layer = Image::from_rgba8(6, 5, px.concat())
+        .unwrap()
+        .with_offset(10, 20)
+        .with_blend(Blend::Source)
+        .with_dispose(Dispose::Background)
+        .with_delay_ticks(7, 100);
+    let cut = layers::trim(&layer).unwrap();
+    assert_eq!((cut.width(), cut.height()), (2, 3));
+    assert_eq!(cut.page(), Page::new(6, 5).with_offset(12, 21));
+    assert_eq!(
+        (cut.blend(), cut.dispose(), cut.delay_ticks()),
+        (Blend::Source, Dispose::Background, 7)
+    );
+    assert_eq!(cut.to_rgba8().unwrap()[..4], [5, 6, 7, 255]);
+    // Already tight: unchanged. Empty: one pixel.
+    assert_eq!(layers::trim(&cut).unwrap().page(), cut.page());
+    let empty = layers::trim(&solid(4, 4, [9, 9, 9, 0]).with_offset(2, 2)).unwrap();
+    assert_eq!(
+        (empty.width(), empty.height(), empty.offset()),
+        (1, 1, (2, 2))
+    );
+    // Against a border colour; a palette picture keeps its layout.
+    let mut px = [[255u8, 255, 255, 255]; 12];
+    px[5] = [0, 0, 0, 255];
+    let framed = Image::from_rgba8(4, 3, px.concat()).unwrap();
+    let cut = layers::trim_to(&framed, [0xffff; 4]).unwrap();
+    assert_eq!((cut.width(), cut.height(), cut.offset()), (1, 1, (1, 1)));
+    let indexed =
+        Image::from_indexed(3, 1, vec![0, 1, 0], &[[0, 0, 0, 0], [8, 8, 8, 255]]).unwrap();
+    let cut = layers::trim(&indexed).unwrap();
+    assert_eq!(
+        (cut.format(), cut.width(), cut.offset()),
+        (PixelFormat::Pal8, 1, (1, 0))
+    );
+}
+
+#[test]
+fn delays_loops_selection_and_order() {
+    let frames: Vec<Image> = (0..4u8)
+        .map(|k| solid(1, 1, [k, 0, 0, 255]).with_delay_ticks(u64::from(k) * 3, 100))
+        .collect();
+    assert_eq!(layers::total_delay(&frames), Duration::from_millis(180));
+    let fast = layers::scale_delays(&frames, 1, 3).unwrap();
+    assert_eq!(
+        fast.iter()
+            .map(|f| f.delay().unwrap().as_millis())
+            .collect::<Vec<_>>(),
+        [0, 10, 20, 30]
+    );
+    assert!(layers::scale_delays(&frames, 1, 0).is_err());
+    let even = layers::set_delay(&frames, Some(Duration::from_millis(40)));
+    assert_eq!(layers::total_delay(&even), Duration::from_millis(160));
+    assert!(
+        layers::set_delay(&frames, None)
+            .iter()
+            .all(|f| f.delay().is_none())
+    );
+    let ticks = layers::set_delay_ticks(&frames, 5, 1000);
+    assert_eq!(
+        (ticks[0].delay_ticks(), ticks[0].ticks_per_second()),
+        (5, 1000)
+    );
+    let looped = layers::set_loop_count(&frames, Some(3));
+    assert!(looped.iter().all(|f| f.loop_count() == Some(3)));
+    let first = |list: &[Image]| {
+        list.iter()
+            .map(|f| f.to_rgba8().unwrap()[0])
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        first(&layers::select(&frames, &[3, 0, 0, 2]).unwrap()),
+        [3, 0, 0, 2]
+    );
+    assert!(layers::select(&frames, &[4]).is_err());
+    assert_eq!(first(&layers::reverse(&frames)), [3, 2, 1, 0]);
+    // Duplicates fold with their delays added.
+    let dups = layers::select(&frames, &[1, 1, 2, 2, 2, 3]).unwrap();
+    let folded = layers::remove_dups(&dups).unwrap();
+    assert_eq!(first(&folded), [1, 2, 3]);
+    assert_eq!(
+        folded.iter().map(Image::delay_ticks).collect::<Vec<_>>(),
+        [6, 18, 9]
+    );
+}
+
+#[test]
+fn a_sequence_carries_canvas_background_and_loops() {
+    let frames = vec![
+        solid(4, 3, [255, 0, 0, 255])
+            .with_delay_ticks(10, 100)
+            .with_loop_count(Some(2))
+            .with_container_metadata(vec![("background_color".into(), "#00ff0080".into())]),
+        solid(2, 2, [0, 0, 255, 255])
+            .with_offset(3, 2)
+            .with_dispose(Dispose::Background)
+            .with_delay_ticks(20, 100),
+    ];
+    let seq = LayerSequence::new(frames).unwrap();
+    assert_eq!(
+        (seq.len(), seq.canvas_size(), seq.loop_count()),
+        (2, (4, 3), Some(2))
+    );
+    assert_eq!(seq.background(), [0, 0xffff, 0, 0x8080]);
+    assert_eq!(seq.frames()[1].page(), Page::new(4, 3).with_offset(3, 2));
+    assert_eq!(seq.total_delay(), Duration::from_millis(300));
+    let shown = seq.coalesce().unwrap();
+    assert!(shown.frames().iter().all(Image::is_full_canvas));
+    // The blue square is clipped to the canvas: one pixel of it.
+    assert_eq!(
+        shown.frames()[1].to_rgba8().unwrap()[(2 * 4 + 3) * 4..][..4],
+        [0, 0, 255, 255]
+    );
+    let small = shown.optimize(&OptimizeOptions::new()).unwrap();
+    assert_eq!(
+        (small.frames()[1].width(), small.frames()[1].offset()),
+        (1, (3, 2))
+    );
+    assert_same_pictures(
+        small.coalesce().unwrap().frames(),
+        shown.frames(),
+        Depth::U8,
+        "sequence",
+    );
+    // Flatten paints on the sequence's background.
+    let seq = seq
+        .with_background_rgba8([0, 0, 0, 255])
+        .with_canvas(5, 4)
+        .with_loop_count(Some(0));
+    assert_eq!((seq.canvas_size(), seq.loop_count()), ((5, 4), Some(0)));
+    let flat = seq.flatten().unwrap();
+    assert_eq!((flat.width(), flat.height()), (5, 4));
+    assert_eq!(
+        flat.to_rgba8().unwrap()[(3 * 5 + 4) * 4..][..4],
+        [0, 0, 255, 255]
+    );
+    assert_eq!(flat.to_rgba8().unwrap()[(3 * 5) * 4..][..4], [0, 0, 0, 255]);
+    assert_eq!(seq.reverse().frames()[0].offset(), (3, 2));
+    assert_eq!(seq.select(&[1]).unwrap().len(), 1);
+    assert!(seq.select(&[]).is_err());
+    assert_eq!(
+        seq.scale_delays(2, 1).unwrap().total_delay(),
+        Duration::from_millis(600)
+    );
+    assert!(LayerSequence::new(Vec::new()).is_err());
+}
+
+#[test]
+fn background_colour_values_parse_and_print() {
+    use crate::{format_background, parse_background};
+    assert_eq!(parse_background("#ff000080"), Some([0xffff, 0, 0, 0x8080]));
+    assert_eq!(parse_background("00FF00"), Some([0, 0xffff, 0, 0xffff]));
+    assert_eq!(parse_background(" #0001000200030004 "), Some([1, 2, 3, 4]));
+    for bad in ["", "#12345", "#gg0000", "red", "#+1+2+3+4"] {
+        assert_eq!(parse_background(bad), None, "{bad}");
+    }
+    for c in [[0u16; 4], [0xffff, 0x0101, 0, 0x8080], [1, 2, 3, 4]] {
+        assert_eq!(parse_background(&format_background(c)), Some(c));
+    }
+    assert_eq!(format_background([0xffff, 0, 0, 0x8080]), "#ff000080");
+    assert_eq!(format_background([1, 0, 0, 0]), "#0001000000000000");
 }
