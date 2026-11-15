@@ -32,8 +32,17 @@
 //! let apng = oxideav_image::encode_frames(&ctx, file.frames(), "png", &SaveOptions::default())?;
 //! ```
 //!
-//! Resolution, the pixel-format ladder, the timing rule, limits and the
-//! error table are documented in the README.
+//! Animations are layer sequences: every [`Image`] carries its page
+//! geometry, delay, [`Dispose`] and [`Blend`], and [`layers`] holds the
+//! format-independent operations on a frame list — coalesce, the exact
+//! frame optimiser, compare / deconstruct, flatten / mosaic / merge,
+//! append, page, delay and selection edits — at 8-bit, 16-bit and
+//! float depth ([`layers::LayerSequence`] bundles a list with its
+//! canvas, background and loop count). [`LayerRecord`] is how a layer
+//! travels through the registry.
+//!
+//! Resolution, the pixel-format ladder, the timing rule, the layer
+//! model, limits and the error table are documented in the README.
 //!
 //! `oxideav-meta` resolves only inside the workspace, which is why the
 //! registration step is the caller's: this crate stays publishable and
