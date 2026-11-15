@@ -164,7 +164,7 @@ fn coalesce_and_optimize_frame_match_the_black_box_reader() {
     }
     let dir = std::env::temp_dir().join(format!("oxideav-image-layers-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let mut rng = Rng(0x5EED_0F_1A7E_55);
+    let mut rng = Rng(0x5EED_0F1A_7E55);
     let geometry =
         |frames: &[Seen]| -> Vec<String> { frames.iter().map(|f| f.geometry.clone()).collect() };
     let (mut played, mut optimised, mut compared) = (0, 0, 0);
