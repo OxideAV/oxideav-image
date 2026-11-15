@@ -69,10 +69,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `layers` module docs.
 - Speed: a draw touches the drawn rectangle, a disposal the disposed
   one, `Dispose::Previous` saves that rectangle rather than the
-  canvas, an `Rgba` frame is read in place, and comparisons skip equal
-  row segments. On the bench animation (median of 3, one thread):
-  `coalesce` 277 → 1385 frames/s, `optimize_frame` 78 → 576,
-  `optimize_transparency` 2413 → 3520, `optimize` 57 → 295.
+  canvas, an `Rgba` frame is read in place, comparisons skip equal row
+  segments and equal pixel runs, and the optimisers compare their
+  candidates inside the box of changed pixels. On the bench animation
+  (frames per second, medians, one thread): `coalesce` 277 → 2092,
+  `optimize_frame` 78 → 1652, `optimize_transparency` 2413 → 5828,
+  `optimize` 57 → 812; `optimize_layers` 1041 from coalesced frames,
+  2331 from a layered list. README, *Layers*, *Speed*.
 
 ## [0.0.7](https://github.com/OxideAV/oxideav-image/compare/v0.0.6...v0.0.7) - 2026-11-07
 

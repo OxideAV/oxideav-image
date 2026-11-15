@@ -67,7 +67,8 @@ assert_eq!(indexed.to_rgba8()?[7], 0);           // palette alpha reaches the RG
 | `OpenOptions` | `execution` (`with_execution_context(ctx)` / `with_threads(n)` / `serial()`, see *Execution budget*), `max_frames`, `ext_hint`, `decoder_options`, `max_pixels`, `allow_containers` / `deny_containers` / `allow_codecs` / `deny_codecs`, `strip_metadata` / `strip_blobs` (`without_metadata()`, `with_stripped_blobs(kinds)`), `pixel_format` (`with_pixel_format(f)`: convert every picture after decoding; default keeps the decoder's layout). |
 | `SaveOptions` | `execution` (`with_execution_context(ctx)` / `with_threads(n)` / `serial()`), `loop_count` (`with_loop_count(plays)`, see *Layers*), `quality`, `pixel_format`, `codec`, `options`, `time_base`, `default_delay`, `blobs` (`with_blob(s)`), `strip_metadata` / `strip_blobs` (`without_metadata()`, `with_stripped_blobs(kinds)`), `container_metadata` (`with_container_metadata(pairs)` / `with_container_metadata_entry(k, v)`), `strip_metadata_keys` (`with_stripped_metadata_keys(keys)`), `strict_metadata` (`with_strict_metadata(true)`). |
 | `Page` / `Dispose` / `Blend` | The per-frame layer record (`#[non_exhaustive]`; `Page::new(w, h).with_offset(x, y)`). |
-| `layers::*` | Format-independent layer operations: `coalesce`, `apply_disposal`, `compare_any` / `deconstruct`, `compare_clear`, `compare_overlay`, `optimize`, `optimize_frame`, `optimize_plus`, `optimize_transparency`, `remove_dups`, `remove_zero`, `flatten`, `mosaic`, `merge`, `trim_bounds`, `composite_layers`; `_with` variants take `LayerOptions` (background, `BackgroundRule`); `layers(frames, LayerMethod, &opts)` dispatches. See *Layers*. |
+| `layers::*` | Format-independent layer operations: `coalesce`, `apply_disposal`, `compare_any` / `deconstruct`, `compare_clear`, `compare_overlay`, `optimize`, `optimize_frame`, `optimize_plus`, `optimize_transparency`, `remove_dups`, `remove_zero`, `flatten`, `mosaic`, `merge`, `trim_bounds`, `composite_layers`; the exact optimiser `optimize_layers` (`OptimizeOptions`); list edits `append`, `reset_page`, `repage`, `set_canvas`, `translate`, `trim`, `trim_to`, `clip_to_canvas`, `set_delay`, `set_delay_ticks`, `scale_delays`, `total_delay`, `set_loop_count`, `select`, `reverse`; `LayerSequence` (frames + canvas, background, loop count); `_with` variants take `LayerOptions` (background, `BackgroundRule`, thread budget); `layers(frames, LayerMethod, &opts)` dispatches. See *Layers*. |
+| `LayerRecord`, `encodes_layers`, `Encoded::layered`, `BACKGROUND_COLOR_KEY` | How layers travel through the registry: the per-frame `image-layer` record and the `background_color` metadata key. See *Layers*, *Through the registry*. |
 | `BlobKind` / `MetadataBlob` / `MetadataSupport` | The framework's blob types, re-exported; `MetadataSupport` is what `EncodeTarget::metadata_support()` answers. |
 | `ImageError` (`Error`) | `#[non_exhaustive]`: see *Errors*. |
 
@@ -425,11 +426,12 @@ one-geometry one.
 A *layered* list — more than one picture, some of them sub-rectangles of
 their canvas (a page offset or a canvas larger than the picture) or
 disposing their rectangle (`Dispose::Background` / `Previous`) — is
-one animation, not a set of geometries: `encode_frames` coalesces it
-(*Layers*) and writes every frame as its full canvas, so the file plays
-exactly as the list displays. The framework has no per-frame placement
-record yet, so no encoder or muxer can be handed the small frames
-themselves (see *Layers*, *What the format crates surface*).
+one animation, not a set of geometries. An encoder that declares the
+layer record (*Layers*, *Through the registry*) is handed the frames
+as layers, each with its rectangle, disposal and blending; for any
+other encoder `encode_frames` coalesces the list and writes every frame
+as its full canvas. Either way the file plays exactly as the list
+displays.
 
 ### Timing
 
@@ -479,9 +481,50 @@ unit (GIF: `plays − 1`, one play = no looping block, `0` = forever) as
 the `loop_count` option of the encoder (when its schema declares one)
 and of the muxer's stream.
 
-Every decoder the gateway reaches composites its animation, so an opened
-file's frames are full canvases at `+0+0` with `Blend::Source` (each
-replaces the canvas). Built or edited lists set the record per frame.
+A decoder that composites its animation hands out full canvases: such
+frames are at `+0+0` with `Blend::Source` (each replaces the canvas). A
+decoder that hands out layers attaches the layer record (*Through the
+registry*) and the frames come out as layers. Built or edited lists set
+the record per frame.
+
+#### The sequence
+
+`layers::LayerSequence` is an animation as one value: the frames, and
+what the animation states once — canvas size, background colour
+(straight 16-bit RGBA, transparent black by default) and loop count.
+`LayerSequence::new(frames)` takes the canvas and loop count from the
+first frame; `from_file(&file)` also reads the file's loop count and
+background. Every frame is put on the sequence's canvas. `coalesce`,
+`optimize`, `deconstruct`, `flatten`, `mosaic`, `merge`, `remove_dups`,
+`select`, `reverse`, `scale_delays`, `with_delay` are the operations
+below run with the sequence's background; `encode(ctx, format, opts)`
+writes it.
+
+#### Depth and alpha
+
+An operation works at the depth of its deepest frame: 8-bit `Rgba`,
+16-bit `Rgba64Le` when a frame is deeper than eight bits, float
+`RgbaF32Le` when one is float. The canvas is kept at that depth and
+frames built from it come out in that layout, so a list played frame by
+frame and the same list played from its coalesced frames show the same
+pixels.
+
+Alpha is straight (non-premultiplied). With `M` the full-scale value,
+`s` OVER `d` is: `s` when `s.a = M` or `d.a = 0`; `d` when `s.a = 0`;
+otherwise, with `A = s.a·M + d.a·(M − s.a)`, alpha `A / M` and each
+colour `(s.c·s.a·M + d.c·d.a·(M − s.a)) / A`, in exact integer
+arithmetic rounded to nearest at 16 bits (`M = 65535`). An 8-bit sample
+`v` stands for `257·v` and the result is rounded to the nearest 8-bit
+value. In float the same expressions are evaluated in `f64` with alpha
+clamped to `[0, 1]` (colours are not clamped) and rounded to `f32`.
+`Blend::Source` copies the frame's samples, alpha included. Two pixels
+are *equal* when their samples are identical or both are fully
+transparent: the colour under a zero alpha is never shown and never
+reaches another pixel through OVER.
+`LayerOptions::with_background_rgba_f32` sets a float background the
+16-bit field cannot hold.
+
+#### Operations
 
 The `layers` module works on any such list, ImageMagick's `-layers`
 vocabulary as `Imagick` exposes it. Every rule below was pinned with the
@@ -492,7 +535,8 @@ disposal and pixels of each frame compared on 519 generated animations
 
 | Operation | What it does |
 |---|---|
-| `coalesce` | Plays the list on a canvas the size of the first frame's — a new one at every change of canvas (below) — (background: `LayerOptions::background`, transparent black by default) and returns every displayed canvas, `WxH+0+0`. Output disposal: `Background` where the next frame clears a visible pixel, else `None`; the last repeats the previous. |
+| `coalesce` | Plays the list on a canvas the size of the first frame's — a new one at every change of canvas (below) — (background: `LayerOptions::background`, transparent black by default) and returns every displayed canvas, `WxH+0+0`, as a frame that replaces the canvas (`Blend::Source`): a coalesced list coalesces to itself at every alpha. Disposal label: `Background` where the next frame clears a visible pixel, else `None`; the last repeats the previous. |
+| `optimize_layers` / `optimize_layers_with(frames, &OptimizeOptions)` | The exact optimiser, for any list (layered or coalesced), one output frame per input frame. With `T` the picture a frame must show and `B` the canvas it is drawn onto, the frame is the bounding box of the pixels where `T ≠ B` (one pixel at `+0+0` when none differs). `B` depends on the disposal given to the frame before: the picture it showed (`None`), that picture with the frame's rectangle set to the background (`Background`), or the canvas that frame was drawn onto (`Previous`); the smallest box wins, ties in that order. The frame is an overlay (`Blend::Over`) when every pixel of the box is unchanged or shows itself drawn over `B` (`T` opaque or `B` fully transparent), else a replacement (`Blend::Source`). `coalesce` of the result shows the pixels of `coalesce` of the input, at every alpha and depth. `with_transparency(true)` makes every unchanged pixel of an overlay fully transparent; `with_dispose_background(false)`, `with_dispose_previous(false)`, `with_blend_source(false)` forbid what the target format cannot store — without `Source` a pixel that must lose opacity is erased by growing the rectangle the frame before disposes to the background (the growth counts as cost), and a list no allowed combination can express is `Unsupported`. |
 | `apply_disposal` | The canvas each frame leaves for the next (after its disposal). |
 | `compare_any` (`deconstruct`), `compare_clear`, `compare_overlay` | Frame 0 as is; each later frame cropped to the pixels of its rectangle that differ from the canvas the frames before it leave (each drawn at its offset replacing what it covers, on a transparent canvas, no disposal applied) — all of them / the ones turning transparent / the changed ones that are visible afterwards. A frame with nothing to keep is dropped. |
 | `optimize_frame` | For a coalesced list (full canvas; else `InvalidData` "coalesce first"; each run of one size on its own): the smallest frames, choosing each disposal. Per transition the candidates are `None` (only when nothing visible must be erased), `Previous`, and `Background` with the previous window grown over the pixels to erase; cost = next window's area (+ the growth); ties go None → Previous → Background. An unchanged frame is a 1×1 transparent pixel at `-1-1`. |
@@ -502,6 +546,12 @@ disposal and pixels of each frame compared on 519 generated animations
 | `remove_dups` / `remove_zero` | Fold runs of identical frames (same size, offset, pixels) into the run's last, delays added / drop frames without a delay unless none has one. |
 | `flatten` / `mosaic` / `merge` | One picture: every frame composited at its offset onto the first frame's canvas / that canvas grown right and down to fit every frame / a canvas just covering every frame (the page keeps the first canvas size and records the possibly negative corner). |
 | `trim_bounds` | Offsets shifted so the frames' bounding box starts at `+0+0`; the canvas becomes that box. |
+| `trim(image)` / `trim_to(image, border)` | One layer cut to its content — the box of the pixels that are not fully transparent / that differ from `border` — left where it was on its canvas (the page keeps the canvas, the offset moves), in its own layout where `Image::crop` can. No content: its top-left pixel. |
+| `clip_to_canvas` | Every frame cut to the part inside its canvas; a frame wholly outside becomes one transparent overlay pixel that is not disposed. The list plays the same and every frame fits the canvas. |
+| `append(frames, Direction)` / `append_with` | One picture: the frames' own pixels side by side from the left (`Horizontal`: widths add, tallest height) or stacked from the top (`Vertical`), copied without blending; the rest is the background. |
+| `reset_page` / `repage(frames, page)` / `set_canvas(frames, w, h)` / `translate(frames, dx, dy)` | Page edits: forget every page (each picture its own canvas at `+0+0`) / give every frame a page (a side left at `0` keeps the frame's) / put every frame on a canvas, offsets kept / move every frame on its canvas. Pixels untouched. |
+| `set_delay` / `set_delay_ticks` / `scale_delays(frames, num, den)` / `total_delay` / `set_loop_count` | Timing edits: one delay for every frame / the same in ticks at a rate / every delay × `num / den` (nearest nanosecond) / the sum / the loop count the list carries. |
+| `select(frames, &indices)` / `reverse` | Frames by index in any order (repeats allowed; an index past the end is `InvalidData`) / last to first. A layered list means what it means in its order: select from, and reorder, a coalesced list and optimise afterwards. |
 | `composite_layers(dst, src, dx, dy)` | Pair-wise composition of two lists (a one-frame list pairs with every frame of the other), the source placed relative to the destination frame's offset. |
 
 **A change of canvas** — a frame whose canvas (its page size, or its
@@ -517,11 +567,17 @@ pictures). `flatten`, `mosaic`, `merge` and `composite_layers` make one
 canvas by definition and clip as described. The pinned `magick` lists
 all keep one canvas, so the rule changes none of them.
 
-A pixel counts as *transparent* below half alpha (`< 128` at 8 bits),
-as `magick` does; two pixels are equal when identical or both fully
-transparent. Frames built from a canvas are `Rgba` (`Rgba64Le` when an
-input is deeper than 8 bits); crops keep the source layout (palette
-included) where `Image::crop` can.
+For `coalesce`'s disposal labels, the `compare_*` operations and
+`optimize_frame` / `optimize_plus` / `optimize`, a pixel counts as
+*transparent* below half alpha (`< 128` at 8 bits), as `magick` does;
+`optimize_layers` has no such threshold. Crops keep the source layout
+(palette included) where `Image::crop` can.
+
+Whole-canvas comparisons (the optimisers on coalesced input) and the
+canvas copies `coalesce` hands out run in row bands on the thread
+budget of `LayerOptions::with_threads(n)` /
+`with_execution_context(&ctx)`; serial by default, the same output at
+every budget.
 
 Deliberate departures from `magick` 7.1.2:
 
@@ -568,43 +624,123 @@ well: `remove_dups` and `remove_zero` 250 / 250, every other operation
 as above, `optimize_plus` 236 / 237 (the other is the delay departure
 above).
 
-For semi-transparent content (`0 < alpha < 255`) the optimisers inherit
-`magick`'s 1-bit view: an overlay window is composited again over the
-previous canvas, so such pixels do not replay exactly (neither do
-`magick`'s); and on 4 of the 519 animations (all with pixels below half
+For semi-transparent content (`0 < alpha < 255`) `optimize_frame`,
+`optimize_plus` and `optimize` inherit `magick`'s 1-bit view: an
+overlay window is composited again over the previous canvas, so such
+pixels do not replay exactly (neither do `magick`'s) — use
+`optimize_layers`, which does; and on 4 of the 519 animations (all with pixels below half
 alpha) `optimize_frame` keeps a slightly larger last window than
 `magick`. Opaque and 1-bit-alpha animations (every GIF) replay exactly
 and match `magick` frame for frame (geometry, disposal, 120 dB PSNR).
 
-#### What the format crates surface
+#### Through the registry
 
-Through the registry today, every format crate hands the gateway its
-animation already composited, and its writers take full canvases:
+The gateway reads and writes a layer sequence with the framework's own
+carriers; nothing here is specific to a format.
+
+| Field | Read by `open` from | Written by `encode_frames` / `LayerSequence::encode` to |
+|---|---|---|
+| Canvas size | the stream's `CodecParameters` `width` × `height` | the encoder's and the muxer's stream `width` × `height` |
+| Loop count | `Demuxer::metadata` key `loop_count` (plays, `0` = forever) | the `loop_count` option of the encoder (when its schema declares one) and of the muxer's stream parameters; the key is not repeated in `Muxer::set_metadata` |
+| Background colour | `Demuxer::metadata` key `background_color` (`BACKGROUND_COLOR_KEY`): straight RGBA in hexadecimal, `#rrggbbaa` or `#rrrrggggbbbbaaaa`, `#rrggbb` read as opaque (`parse_background` / `format_background`) | `Muxer::set_metadata` key `background_color`, when the muxer carries it (`Muxer::carries_metadata_key`; else it is listed in `Encoded::metadata_dropped`). `LayerSequence::encode` adds it for a background other than transparent black |
+| Delay | the packet's `duration` in the stream time base (*Timing*) | each packet's `pts` / `dts` / `duration` |
+| Rectangle, disposal, blending | the frame's metadata blob of kind `image-layer` (`LayerRecord`) | a frame blob of kind `image-layer` on every frame, for an encoder whose `CodecCapabilities::embedded_blob_kinds` lists the kind |
+
+`LayerRecord` is 28 bytes, little-endian: version `1`; disposal (`0`
+unspecified, `1` none, `2` background, `3` previous); blending (`0`
+over, `1` source); a zero byte; canvas width and height (`u32`, `0` =
+the stream's); offset x and y (`i32`); the picture's own width and
+height (`u32`).
+
+- **Reading.** A frame with the record is a layer of its stream's
+  canvas: its planes hold the record's `width × height` (checked), and
+  the picture gets the record's page, disposal and blending. The record
+  is consumed — it does not stay among the picture's blobs. The pixel
+  budget counts the layer's own size. A record that does not parse is
+  `InvalidData`. A frame without the record is the whole canvas, as
+  before.
+- **Writing.** For a layered list on one canvas and an encoder that
+  declares the kind, every frame is cut to the canvas
+  (`clip_to_canvas`), converted to the encode layout and sent with its
+  record; the stream is opened at the canvas size. `Encoded::layered()`
+  reports it and `encodes_layers(ctx, format, &opts)` answers
+  beforehand. Any other encoder — and a list spanning several canvases
+  — gets the coalesced canvases. The record is the frame's own layer
+  fields, written whatever the metadata strip rules say.
+
+So coalesce → `optimize_layers` → encode keeps the optimiser's
+rectangles in the file, and the file opens to the same layers. Which
+disposals and blends a format can store is not declared anywhere in the
+framework; restrict `OptimizeOptions` to the target's.
+
+Today no format crate attaches or declares the record, so through the
+real registry every animated format still opens composited and is
+written as full canvases:
 
 | Format | Loop count read / written | Page offset, dispose, blend per frame |
 |---|---|---|
-| GIF (`oxideav-gif`) | read (`loop_count`, NETSCAPE2.0 / ANIMEXTS1.0) / written (`loop_count` encoder + muxer option) | not surfaced: the decoder composites (§23); the muxer writes the GCE the encoder put in each packet (no disposal) |
-| APNG (`oxideav-png`) | read (`acTL` `num_plays`) / not written (`num_plays` fixed at 0) | not surfaced: composited; the muxer writes `fcTL` 0,0 full size, `APNG_DISPOSE_OP_NONE`, `APNG_BLEND_OP_SOURCE` |
+| GIF (`oxideav-gif`) | read (`loop_count`) / written (`loop_count` encoder + muxer option) | not surfaced: the decoder composites; the muxer writes full frames |
+| APNG (`oxideav-png`) | read / not written | not surfaced: composited; full frames written |
 | Animated WebP (`oxideav-webp`) | read / written (`loop_count` muxer option) | not surfaced: composited |
-| JPEG XL (`oxideav-jpegxl`) | read (`num_loops`) / not written | not surfaced |
+| JPEG XL (`oxideav-jpegxl`) | read / not written | not surfaced |
 | HEIF / AVIF sequences | not surfaced | not applicable (samples are whole pictures) |
 
-So `open` gives full-canvas frames and `coalesce` of them is the
-identity. On the GIFs whose decoded frames equal `magick anim.gif
--coalesce` (12 of 18), `optimize` of them matches `magick anim.gif
--layers optimize` in geometry and disposal on every one, and in pixels
-(120 dB PSNR) on 10 — on the other two (one animation, plain and
-pre-optimised) `magick` itself shifts colours while optimising (its
-first frame is 33 dB from its own `-coalesce`). Five differ before any
-layer operation, in how `oxideav-gif` paints what no frame covers
-(transparent; `magick` uses the background colour) and what
-`Background` disposal restores (the background colour, GIF89a
-§23.c.iv; `magick` clears to transparent); one has a frame running off
-the logical screen, which `oxideav-gif` refuses. The small frames
-`optimize` computes are written coalesced. The asks that
-would let frames travel as layers are in the round report (a
-format-independent per-frame placement record in `oxideav-core`, then
-each format crate reading / writing it).
+The per-crate work is in the round report: a decoder mode that emits
+layers with the record, an encoder that declares and writes it, and the
+`background_color` key on demuxers and muxers whose format has one.
+
+On the GIFs whose decoded frames equal `magick anim.gif -coalesce` (12
+of 18), `optimize` of them matches `magick anim.gif -layers optimize`
+in geometry and disposal on every one, and in pixels (120 dB PSNR) on
+10 — on the other two (one animation, plain and pre-optimised) `magick`
+itself shifts colours while optimising (its first frame is 33 dB from
+its own `-coalesce`). Five differ before any layer operation, in how
+`oxideav-gif` paints what no frame covers (transparent; `magick` uses
+the background colour) and what `Background` disposal restores (the
+background colour; `magick` clears to transparent); one has a frame
+running off the logical screen, which `oxideav-gif` refuses.
+
+#### Speed
+
+`cargo bench --bench layers`: a 100-frame 1920×1080 animation — an
+opaque first frame, then 320×240 sprites with a transparent surround
+cycling through the three disposals — frames per second, release
+build, one thread, on a machine shared with other builds (medians; the
+figures move by some 10 % between runs).
+
+| Operation | Before | After | With 4 threads |
+|---|---|---|---|
+| `coalesce` (layered list in) | 277 | 2092 | 2247 |
+| `optimize_frame` (coalesced list in) | 78 | 1652 | 2270 |
+| `optimize_transparency` | 2413 | 5828 | 5703 |
+| `optimize` (layered list in) | 57 | 812 | 901 |
+| `optimize_layers` (coalesced list in) | — | 1041 | 1253 |
+| `optimize_layers` (layered list in) | — | 2331 | 2413 |
+
+Before, every frame was converted to a 16-bit raster, the canvas was
+cloned twice a frame and compared whole for every candidate disposal,
+and pixels were read one at a time. The work went in two passes.
+
+1. The engine: an `Rgba` frame is read in place; a draw touches the
+   drawn rectangle and a disposal the disposed one (`Dispose::Previous`
+   saves that rectangle, not the canvas); a comparison skips equal row
+   segments with a slice comparison. That gave `coalesce` 1385,
+   `optimize_frame` 576, `optimize` 295, `optimize_layers` 103
+   (coalesced in).
+2. A sampled profile of that state: `coalesce` — the copy of the canvas
+   each output frame is, 65 %; OVER on the sprite, 13 %; finding the
+   first and last changed pixel of a row, 10 %. `optimize_frame` — that
+   same search, 46 %; row comparisons, 37 %. `optimize_layers` on
+   coalesced input — the search, 40 %; row comparisons, 28 %; canvas
+   copies, 15 %; clearing disposed canvases, 8 %. The search being the
+   largest stage of both optimisers, they now find the box of changed
+   pixels once per frame and compare every candidate inside it, and
+   the search skips equal runs 32 pixels at a time.
+
+What is left of `coalesce` is the copy of the canvas each output frame
+is, which is why threads add little there: the copies are bound by
+memory bandwidth. Output is the same at every budget. `optimize_layers`
+brings this animation to 4.29 % of its coalesced area.
 
 ### Limits
 
@@ -674,7 +810,18 @@ CMYK, an all-opaque alpha source, an encoder that declares no layouts
 a multi-stream container and into a one-geometry one, the layer model
 and every `layers` operation against geometry, disposal and pixels
 recorded from `magick` (plus replay invariants: an optimised list
-coalesces back to the original animation), loop counts, layered lists
+coalesces back to the original animation), the exact optimiser's
+identity `coalesce ∘ optimize_layers = coalesce` on random animations
+(every disposal × blending pair, frames partly and wholly outside the
+canvas, all alpha values, 8-bit / 16-bit / float, coloured backgrounds
+under both rules, every restriction of the optimiser, thread budgets),
+OVER against its definition in exact rational arithmetic, a mock
+layered format (`OXLY`: container, a codec that declares the layer
+record and one that does not) for the registry round trips — layers
+written and read back byte for byte, coalesce → optimise → write
+keeping the rectangles, canvas / loop count / background carried, a
+malformed record refused, the pixel budget counting layers at their
+own size — the list edits, loop counts, layered lists
 written as displayed, zero delays, mid-stream shape changes (stub
 decoders that emit `Frame::StreamParams` with and without a generation
 bump, while decoding and while draining after `flush`, that only bump
